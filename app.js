@@ -1,0 +1,2707 @@
+// ENTIMOTORS OS — demo local. Todo vive en IndexedDB del navegador: no hay backend.
+// El "sincronizado / sin conexión" de la barra superior es una simulación para
+// mostrar cómo se sentiría el modo híbrido; la versión real empujaría esta
+// misma cola de cambios hacia Supabase cuando vuelva la señal.
+//
+// Los botones de WhatsApp abren la conversación con el mensaje ya escrito —
+// igual que cualquier link wa.me, todavía hace falta que una persona presione
+// "enviar" dentro de WhatsApp. Un envío 100% desatendido (sin que nadie toque
+// nada) requiere WhatsApp Business API con un backend real, no solo el navegador.
+
+const STAGES = [
+  { key: "recibido", label: "Recibido" },
+  { key: "diagnostico", label: "Diagnóstico" },
+  { key: "presupuesto", label: "Presupuesto" },
+  { key: "reparacion", label: "Reparación" },
+  { key: "calidad", label: "Calidad" },
+  { key: "entregado", label: "Entregado" },
+];
+
+// Credenciales de demo en texto plano en el cliente: sirven para probar el flujo
+// de login de la PWA, no son autenticación real. Antes de usar esto en el taller
+// de verdad, esto debe validarse contra un backend (igual que el resto de la app).
+const TEAM = [
+  { user: "wilkin", nombre: "Wilkin", telefono: "97049635", password: "enti2026", rol: "admin" },
+  { user: "mecanico1", nombre: "Mecánico 1", telefono: "", password: "enti2026", rol: "mecanico" },
+  { user: "mecanico2", nombre: "Mecánico 2", telefono: "", password: "enti2026", rol: "mecanico" },
+  // cuenta aparte solo para pruebas — mismo dispositivo y misma base de datos que
+  // "wilkin" (esto no es multi-taller: todos los usuarios ven la misma información
+  // guardada en este dispositivo), rol admin para poder probar todas las secciones.
+  { user: "prueba", nombre: "Usuario de Prueba", telefono: "", password: "prueba2026", rol: "admin" },
+];
+// Secciones que solo el rol "admin" (dueño) puede ver — un mecánico no necesita
+// entrar a la caja, la web o los respaldos para hacer su trabajo diario.
+const VISTAS_SOLO_ADMIN = ["finanzas", "web-cms", "ajustes"];
+
+// Horario del taller para el selector de citas: ajusta estos 3 valores si el
+// taller abre/cierra en otro horario o quieres citas cada X minutos.
+const HORARIO_TALLER = { horaInicio: "08:00", horaFin: "17:00", intervaloMin: 30 };
+
+// Código de administrador para acciones irreversibles (borrar una orden). Igual
+// que las contraseñas de TEAM, es un valor fijo en el cliente para probar el
+// flujo — no reemplaza un permiso real validado por un backend.
+const ADMIN_CODE = "2468";
+
+let db;
+let currentUser = null;
+let currentOrderId = null;
+
+/* ---------------- utilidades ---------------- */
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+function money(n) { return `L. ${(Number(n) || 0).toFixed(2)}`; }
+function fileToDataUrl(file) {
+  return new Promise((resolve) => {
+    const r = new FileReader();
+    r.onload = () => resolve(r.result);
+    r.readAsDataURL(file);
+  });
+}
+function toWaDigits(raw) {
+  const digits = (raw || "").replace(/\D/g, "");
+  if (digits.length < 8) return null;
+  return digits.startsWith("504") ? digits : `504${digits}`;
+}
+function openWhatsApp(phoneRaw, text) {
+  const digits = toWaDigits(phoneRaw);
+  if (!digits) { toast("Falta un teléfono válido para enviar por WhatsApp", "off"); return false; }
+  window.open(`https://wa.me/${digits}?text=${encodeURIComponent(text)}`, "_blank");
+  return true;
+}
+
+/* ---------------- IndexedDB helper mínimo ---------------- */
+function openDb() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open("entimotors_os_demo", 3);
+    req.onupgradeneeded = (e) => {
+      const d = req.result;
+      const t = req.transaction;
+      const oldV = e.oldVersion;
+
+      if (!d.objectStoreNames.contains("clientes")) d.createObjectStore("clientes", { keyPath: "id", autoIncrement: true });
+      if (!d.objectStoreNames.contains("motos")) d.createObjectStore("motos", { keyPath: "id", autoIncrement: true });
+      if (!d.objectStoreNames.contains("citas")) d.createObjectStore("citas", { keyPath: "id", autoIncrement: true });
+
+      const ordenesStore = d.objectStoreNames.contains("ordenes") ? t.objectStore("ordenes") : d.createObjectStore("ordenes", { keyPath: "id", autoIncrement: true });
+      if (!ordenesStore.indexNames.contains("by_estado")) ordenesStore.createIndex("by_estado", "estado");
+
+      const invStore = d.objectStoreNames.contains("inventario") ? t.objectStore("inventario") : d.createObjectStore("inventario", { keyPath: "id", autoIncrement: true });
+      if (!invStore.indexNames.contains("by_codigo")) invStore.createIndex("by_codigo", "codigoBarras");
+
+      if (!d.objectStoreNames.contains("ventas_rapidas")) {
+        const s = d.createObjectStore("ventas_rapidas", { keyPath: "id", autoIncrement: true });
+        s.createIndex("by_fecha", "fechaISO");
+        s.createIndex("by_cliente", "clienteId");
+        s.createIndex("by_metodo", "metodoPago");
+      }
+      if (!d.objectStoreNames.contains("caja_movimientos")) {
+        const s = d.createObjectStore("caja_movimientos", { keyPath: "id", autoIncrement: true });
+        s.createIndex("by_fecha", "fechaISO");
+        s.createIndex("by_tipo", "tipo");
+        s.createIndex("by_categoria", "categoria");
+      }
+      if (!d.objectStoreNames.contains("web_cms")) d.createObjectStore("web_cms", { keyPath: "key" });
+      if (!d.objectStoreNames.contains("categorias_inv")) {
+        const s = d.createObjectStore("categorias_inv", { keyPath: "id", autoIncrement: true });
+        s.createIndex("by_nombre", "nombre");
+      }
+
+      // Los repuestos/órdenes creados con el esquema viejo (v2) no traen los
+      // campos nuevos — se rellenan aquí con valores por defecto dentro de la
+      // misma transacción de actualización, así el resto del código nunca se
+      // topa con "undefined" en un registro antiguo.
+      if (oldV < 3) {
+        invStore.openCursor().onsuccess = (ev) => {
+          const cur = ev.target.result;
+          if (!cur) return;
+          const v = cur.value;
+          if (v.costoCompra === undefined) v.costoCompra = 0;
+          if (v.precioVenta === undefined) v.precioVenta = v.precio || 0;
+          if (v.stockMinimo === undefined) v.stockMinimo = 3;
+          if (v.codigoBarras === undefined) v.codigoBarras = "";
+          if (v.publicarEnWeb === undefined) v.publicarEnWeb = false;
+          if (v.categoriaId === undefined) v.categoriaId = null;
+          cur.update(v);
+          cur.continue();
+        };
+        ordenesStore.openCursor().onsuccess = (ev) => {
+          const cur = ev.target.result;
+          if (!cur) return;
+          const v = cur.value;
+          if (v.metodoPago === undefined) v.metodoPago = null;
+          if (v.margen === undefined) v.margen = null;
+          cur.update(v);
+          cur.continue();
+        };
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+function tx(store, mode = "readonly") { return db.transaction(store, mode).objectStore(store); }
+
+/* ---------------- adaptador de datos ----------------
+   Las 9 secciones del sistema piden y guardan todo a través de DB.*, nunca
+   tocan IndexedDB directo. El día que se conecte una base de datos real
+   (Supabase), solo hay que reescribir estos 5 métodos — el resto de la app
+   no cambia ni una línea.
+   Las transacciones atómicas de varias tablas a la vez (venta rápida, cierre
+   de caja) siguen usando db.transaction([...]) directo donde ya estaban:
+   pasarlas por aquí una fila a la vez les haría perder la atomicidad. */
+const DB = {
+  getAll(store) {
+    return new Promise((resolve, reject) => {
+      const out = [];
+      const req = tx(store).openCursor();
+      req.onsuccess = (e) => {
+        const cur = e.target.result;
+        if (cur) { out.push(cur.value); cur.continue(); } else resolve(out);
+      };
+      req.onerror = () => reject(req.error);
+    });
+  },
+  get(store, id) {
+    return new Promise((resolve, reject) => {
+      const req = tx(store).get(id);
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  },
+  save(store, value) {
+    return new Promise((resolve, reject) => {
+      const req = tx(store, "readwrite").put(value);
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  },
+  delete(store, id) {
+    return new Promise((resolve, reject) => {
+      const req = tx(store, "readwrite").delete(id);
+      req.onsuccess = () => resolve();
+      req.onerror = () => reject(req.error);
+    });
+  },
+  clear(store) {
+    return new Promise((resolve, reject) => {
+      const req = tx(store, "readwrite").clear();
+      req.onsuccess = () => resolve();
+      req.onerror = () => reject(req.error);
+    });
+  },
+};
+const ALL_STORES = ["clientes", "motos", "ordenes", "inventario", "citas", "ventas_rapidas", "caja_movimientos", "web_cms", "categorias_inv"];
+async function updateOrder(id, mutator) {
+  const o = await DB.get("ordenes", id);
+  mutator(o);
+  await DB.save("ordenes", o);
+  markDirty();
+  return o;
+}
+function setStage(ord, key) {
+  ord.estado = key;
+  if (key === "entregado" && !ord.entregadoEn) ord.entregadoEn = Date.now();
+}
+
+/* ---------------- venta rápida (TPV): transacción atómica multi-store ----------------
+   IndexedDB ya garantiza atomicidad dentro de una misma transacción: si cualquier
+   request falla, el navegador aborta TODA la transacción automáticamente (no hay
+   que revertir nada a mano) y t.onerror/t.onabort se disparan en vez de t.oncomplete. */
+function registrarVentaRapida({ items, clienteId, metodoPago, efectivoRecibido }) {
+  return new Promise((resolve, reject) => {
+    if (!items || !items.length) { reject(new Error("El carrito está vacío")); return; }
+
+    const t = db.transaction(["ventas_rapidas", "inventario", "caja_movimientos"], "readwrite");
+    const ventasStore = t.objectStore("ventas_rapidas");
+    const invStore = t.objectStore("inventario");
+    const cajaStore = t.objectStore("caja_movimientos");
+
+    const total = items.reduce((s, it) => s + it.cantidad * it.precio, 0);
+    const fechaISO = new Date().toISOString();
+    let ventaId = null;
+
+    const venta = {
+      items, clienteId: clienteId || null, metodoPago, total,
+      efectivoRecibido: metodoPago === "efectivo" ? Number(efectivoRecibido) || 0 : null,
+      cambio: metodoPago === "efectivo" ? Math.max(0, (Number(efectivoRecibido) || 0) - total) : 0,
+      fechaISO, creadoEn: Date.now(), mecanico: currentUser?.nombre || "",
+    };
+
+    const ventaReq = ventasStore.add(venta);
+    ventaReq.onsuccess = () => {
+      ventaId = ventaReq.result;
+      cajaStore.add({
+        tipo: "ingreso", categoria: "Venta mostrador", monto: total, metodoPago,
+        descripcion: `Venta rápida #${ventaId}`, ventaId, fechaISO, creadoEn: Date.now(),
+      });
+    };
+
+    items.forEach((it) => {
+      if (!it.inventarioId) return; // ítem manual (mano de obra suelta, etc.) sin control de stock
+      const getReq = invStore.get(it.inventarioId);
+      getReq.onsuccess = () => {
+        const rep = getReq.result;
+        if (rep) { rep.cantidad = Math.max(0, rep.cantidad - it.cantidad); invStore.put(rep); }
+      };
+    });
+
+    t.oncomplete = () => resolve({ id: ventaId, total, venta });
+    t.onerror = () => reject(t.error);
+    t.onabort = () => reject(t.error);
+  });
+}
+
+/* ---------------- caja chica: registrar un ingreso de una orden de taller entregada ---------------- */
+function registrarIngresoTaller(orden, total, metodoPago) {
+  return new Promise((resolve, reject) => {
+    const t = db.transaction(["caja_movimientos"], "readwrite");
+    t.objectStore("caja_movimientos").add({
+      tipo: "ingreso", categoria: "Servicio taller", monto: total, metodoPago: metodoPago || "efectivo",
+      descripcion: `Orden de taller #${orden.id}`, ordenId: orden.id,
+      fechaISO: new Date().toISOString(), creadoEn: Date.now(),
+    });
+    t.oncomplete = () => resolve();
+    t.onerror = () => reject(t.error);
+  });
+}
+
+/* ---------------- estado de sincronización (simulado) ---------------- */
+let pending = 0;
+let forcedOffline = false;
+function isOnline() { return !forcedOffline && navigator.onLine; }
+function markDirty() {
+  pending++;
+  renderSyncChip();
+  if (isOnline()) setTimeout(() => { pending = Math.max(0, pending - 1); renderSyncChip(); }, 900);
+}
+function renderSyncChip() {
+  const dot = document.getElementById("syncDot");
+  const label = document.getElementById("syncLabel");
+  if (!isOnline()) {
+    dot.className = "dot off";
+    label.textContent = pending > 0
+      ? `Sin conexión · ${pending} cambio${pending === 1 ? "" : "s"} pendiente${pending === 1 ? "" : "s"}`
+      : "Sin conexión · guardado en este dispositivo";
+  } else if (pending > 0) {
+    dot.className = "dot off";
+    label.textContent = `Sincronizando ${pending}…`;
+  } else {
+    dot.className = "dot on";
+    label.textContent = "En línea · sincronizado";
+  }
+}
+
+/* ---------------- botones que cobran/registran: bloquea doble-tap ----------------
+   en un taller usando esto en pantalla táctil, un toque doble accidental en
+   "Cobrar" o "Registrar" disparaba la acción varias veces (venta duplicada +
+   inventario descontado de más, o un movimiento de caja repetido) porque nada
+   deshabilitaba el botón mientras la primera se procesaba. */
+function alHacerClicUnaVez(btn, handler) {
+  btn.addEventListener("click", async () => {
+    if (btn.disabled) return;
+    btn.disabled = true;
+    try {
+      await handler();
+    } finally {
+      btn.disabled = false;
+    }
+  });
+}
+
+/* ---------------- toasts ---------------- */
+function toast(msg, kind = "on") {
+  const wrap = document.getElementById("toastWrap");
+  const el = document.createElement("div");
+  el.className = "toast";
+  el.innerHTML = `<span class="dot ${kind}"></span>${msg}`;
+  wrap.appendChild(el);
+  setTimeout(() => el.remove(), 3400);
+}
+
+/* ---- confirmación con código de administrador para acciones que no se pueden deshacer ---- */
+let adminCodeCallback = null;
+function requestAdminCode(onConfirm) {
+  adminCodeCallback = onConfirm;
+  document.getElementById("adminCodeInput").value = "";
+  document.getElementById("adminCodeError").textContent = "";
+  document.getElementById("modalAdminCode").classList.add("active");
+  document.getElementById("adminCodeInput").focus();
+}
+document.getElementById("btnCancelarAdminCode").addEventListener("click", () => {
+  document.getElementById("modalAdminCode").classList.remove("active");
+  adminCodeCallback = null;
+});
+document.getElementById("btnConfirmarAdminCode").addEventListener("click", async () => {
+  const code = document.getElementById("adminCodeInput").value.trim();
+  if (code !== ADMIN_CODE) {
+    document.getElementById("adminCodeError").textContent = "Código incorrecto.";
+    return;
+  }
+  document.getElementById("modalAdminCode").classList.remove("active");
+  const cb = adminCodeCallback;
+  adminCodeCallback = null;
+  if (cb) await cb();
+});
+
+/* ================= modales genéricos (reemplazan confirm()/prompt() nativos) ================= */
+function showConfirm(mensaje, { titulo = "Confirmar", textoOk = "Aceptar", textoCancelar = "Cancelar" } = {}) {
+  return new Promise((resolve) => {
+    document.getElementById("confirmTitulo").textContent = titulo;
+    document.getElementById("confirmMensaje").textContent = mensaje;
+    const modal = document.getElementById("modalConfirm");
+    const btnOk = document.getElementById("btnConfirmAceptar");
+    const btnCancel = document.getElementById("btnConfirmCancelar");
+    btnOk.textContent = textoOk;
+    btnCancel.textContent = textoCancelar;
+    const cleanup = (result) => {
+      modal.classList.remove("active");
+      btnOk.removeEventListener("click", onOk);
+      btnCancel.removeEventListener("click", onCancel);
+      resolve(result);
+    };
+    const onOk = () => cleanup(true);
+    const onCancel = () => cleanup(false);
+    btnOk.addEventListener("click", onOk);
+    btnCancel.addEventListener("click", onCancel);
+    modal.classList.add("active");
+  });
+}
+
+function showPrompt(mensaje, { titulo = "Ingresa un valor", valorInicial = "" } = {}) {
+  return new Promise((resolve) => {
+    document.getElementById("promptTitulo").textContent = titulo;
+    document.getElementById("promptLabel").textContent = mensaje;
+    const input = document.getElementById("promptInput");
+    input.value = valorInicial;
+    const modal = document.getElementById("modalPrompt");
+    const btnOk = document.getElementById("btnPromptAceptar");
+    const btnCancel = document.getElementById("btnPromptCancelar");
+    const cleanup = (result) => {
+      modal.classList.remove("active");
+      btnOk.removeEventListener("click", onOk);
+      btnCancel.removeEventListener("click", onCancel);
+      input.removeEventListener("keydown", onKeydown);
+      resolve(result);
+    };
+    const onOk = () => cleanup(input.value.trim() || null);
+    const onCancel = () => cleanup(null);
+    const onKeydown = (e) => { if (e.key === "Enter") onOk(); };
+    btnOk.addEventListener("click", onOk);
+    btnCancel.addEventListener("click", onCancel);
+    input.addEventListener("keydown", onKeydown);
+    modal.classList.add("active");
+    setTimeout(() => input.focus(), 50);
+  });
+}
+
+/* ================= GATE 1: instalación como PWA ================= */
+function isStandalone() {
+  return window.matchMedia("(display-mode: standalone)").matches || window.navigator.standalone === true;
+}
+function devBypassed() { return sessionStorage.getItem("enti_dev_bypass") === "1"; }
+
+let deferredInstallPrompt = null;
+window.addEventListener("beforeinstallprompt", (e) => {
+  e.preventDefault();
+  deferredInstallPrompt = e;
+});
+
+function wireInstallGate() {
+  document.getElementById("btnInstallApp").addEventListener("click", async () => {
+    if (deferredInstallPrompt) {
+      deferredInstallPrompt.prompt();
+      await deferredInstallPrompt.userChoice;
+      deferredInstallPrompt = null;
+    } else {
+      toast("Este navegador no ofrece instalación con un clic aquí — usa el menú ⋮ y busca \"Instalar aplicación\"", "off");
+    }
+  });
+  document.getElementById("devBypassLink").addEventListener("click", (e) => {
+    e.preventDefault();
+    sessionStorage.setItem("enti_dev_bypass", "1");
+    location.reload();
+  });
+}
+
+/* ================= GATE 2: login ================= */
+function readSession() {
+  try { return JSON.parse(localStorage.getItem("enti_session") || "null"); } catch { return null; }
+}
+function wireLoginGate() {
+  document.getElementById("loginForm").addEventListener("submit", (e) => {
+    e.preventDefault();
+    const u = document.getElementById("loginUser").value.trim().toLowerCase();
+    const p = document.getElementById("loginPass").value;
+    const found = TEAM.find(t => t.user === u && t.password === p);
+    const errEl = document.getElementById("loginError");
+    if (!found) { errEl.textContent = "Usuario o contraseña incorrectos."; return; }
+    errEl.textContent = "";
+    const session = { user: found.user, nombre: found.nombre, telefono: found.telefono, rol: found.rol };
+    localStorage.setItem("enti_session", JSON.stringify(session));
+    document.getElementById("gateLogin").classList.remove("active");
+    startApp(session);
+  });
+}
+document.getElementById("btnLogout").addEventListener("click", () => {
+  localStorage.removeItem("enti_session");
+  location.reload();
+});
+
+/* ================= navegación entre vistas ================= */
+function showView(name) {
+  document.querySelectorAll(".view").forEach(v => v.classList.remove("active"));
+  document.getElementById(`view-${name}`).classList.add("active");
+  document.querySelectorAll(".nav-item[data-view]").forEach(b => b.classList.toggle("active", b.dataset.view === name));
+  document.getElementById("fabHome").classList.toggle("fab-hidden", name === "dashboard");
+  closeMobileSidebar();
+}
+
+document.getElementById("fabHome").addEventListener("click", () => {
+  showView("dashboard");
+  renderByView.dashboard();
+});
+
+/* ================= menú hamburguesa (mobile/tablet) ================= */
+function openMobileSidebar() {
+  document.getElementById("sidebar").classList.add("open");
+  document.getElementById("sidebarBackdrop").classList.add("open");
+}
+function closeMobileSidebar() {
+  document.getElementById("sidebar").classList.remove("open");
+  document.getElementById("sidebarBackdrop").classList.remove("open");
+}
+document.getElementById("btnMenuToggle").addEventListener("click", () => {
+  document.getElementById("sidebar").classList.contains("open") ? closeMobileSidebar() : openMobileSidebar();
+});
+document.getElementById("sidebarBackdrop").addEventListener("click", closeMobileSidebar);
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeMobileSidebar(); });
+
+/* ================= cerrar cualquier modal al tocar fuera de él ================= */
+document.querySelectorAll(".modal-bg").forEach(bg => {
+  bg.addEventListener("click", (e) => {
+    if (e.target !== bg) return;
+    const cancelBtn = bg.querySelector(".modal-actions button.ghost");
+    if (cancelBtn) cancelBtn.click(); else bg.classList.remove("active");
+  });
+});
+
+/* ================= buscador global (Ctrl+K) ================= */
+function abrirBuscadorGlobal() {
+  document.getElementById("modalBuscarGlobal").classList.add("active");
+  const input = document.getElementById("buscarGlobalInput");
+  input.value = "";
+  document.getElementById("buscarGlobalResultados").innerHTML = "";
+  setTimeout(() => input.focus(), 50);
+}
+function cerrarBuscadorGlobal() { document.getElementById("modalBuscarGlobal").classList.remove("active"); }
+
+document.getElementById("btnBuscarGlobal").addEventListener("click", abrirBuscadorGlobal);
+document.getElementById("btnCerrarBuscarGlobal").addEventListener("click", cerrarBuscadorGlobal);
+document.addEventListener("keydown", (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") { e.preventDefault(); abrirBuscadorGlobal(); }
+});
+
+document.getElementById("buscarGlobalInput").addEventListener("input", async (e) => {
+  const q = e.target.value.trim().toLowerCase();
+  const box = document.getElementById("buscarGlobalResultados");
+  if (!q) { box.innerHTML = ""; return; }
+
+  const [clientes, motos, ordenes, inventario] = await Promise.all([DB.getAll("clientes"), DB.getAll("motos"), DB.getAll("ordenes"), DB.getAll("inventario")]);
+  const resultados = [];
+
+  clientes.filter(c => c.nombre.toLowerCase().includes(q) || (c.telefono || "").includes(q)).forEach(c => {
+    const moto = motos.find(m => m.clienteId === c.id);
+    resultados.push({
+      ic: "👤", tipo: "Cliente", titulo: c.nombre,
+      sub: moto ? `${moto.marca} ${moto.modelo} · ${moto.placa || "sin placa"}` : "sin moto registrada",
+      onClick: () => { cerrarBuscadorGlobal(); showView("clientes"); renderClientes(); openClienteDetalle(c.id); },
+    });
+  });
+  motos.filter(m => (m.placa || "").toLowerCase().includes(q) && !(m.clienteId && clientes.find(c => c.id === m.clienteId && c.nombre.toLowerCase().includes(q)))).forEach(m => {
+    const cliente = clientes.find(c => c.id === m.clienteId);
+    resultados.push({
+      ic: "🏍️", tipo: "Moto", titulo: `${m.marca} ${m.modelo} — ${m.placa || "sin placa"}`, sub: cliente?.nombre || "sin cliente asociado",
+      onClick: () => { cerrarBuscadorGlobal(); showView("clientes"); renderClientes(); if (cliente) openClienteDetalle(cliente.id); },
+    });
+  });
+  ordenes.filter(o => (o.falla || "").toLowerCase().includes(q)).forEach(o => {
+    const cliente = clientes.find(c => c.id === o.clienteId);
+    resultados.push({
+      ic: "🧾", tipo: "Orden", titulo: `Orden #${o.id} — ${STAGES.find(s => s.key === o.estado)?.label || o.estado}`, sub: cliente?.nombre || "",
+      onClick: () => { cerrarBuscadorGlobal(); showView("ordenes"); openOrder(o.id); },
+    });
+  });
+  inventario.filter(r => r.nombre.toLowerCase().includes(q) || (r.codigoBarras || "").toLowerCase().includes(q)).forEach(r => {
+    resultados.push({
+      ic: "📦", tipo: "Repuesto", titulo: r.nombre, sub: `${r.cantidad} en stock · ${money(r.precio)}`,
+      onClick: () => { cerrarBuscadorGlobal(); showView("inventario"); renderInventario(); openRepuestoDetalle(r.id); },
+    });
+  });
+
+  box.innerHTML = resultados.length
+    ? resultados.slice(0, 20).map((r, i) => `
+      <div class="search-result-row" data-i="${i}">
+        <span class="ic">${r.ic}</span>
+        <div class="txt"><b>${esc(r.titulo)}</b><span class="sub">${esc(r.tipo)}${r.sub ? " · " + esc(r.sub) : ""}</span></div>
+      </div>`).join("")
+    : `<div class="empty" style="padding:1rem 0;">Sin resultados</div>`;
+  box.querySelectorAll(".search-result-row").forEach((el, i) => el.addEventListener("click", () => resultados[i].onClick()));
+});
+
+/* ================= centro de notificaciones ================= */
+async function renderNotificaciones() {
+  const [citasAll, motos, inventario] = await Promise.all([DB.getAll("citas"), DB.getAll("motos"), DB.getAll("inventario")]);
+  const avisos = [];
+
+  citasAll.filter(c => citaWhenInfo(c).diffDays === 0).forEach(c => {
+    avisos.push({ ic: "📅", titulo: "Cita hoy", sub: c.motivo || "Sin motivo especificado", onClick: () => { showView("citas"); renderCitasList(); } });
+  });
+  motos.filter(m => ["due", "soon"].includes(mantStatus(m).cls)).forEach(m => {
+    avisos.push({ ic: "🛠️", titulo: `Mantenimiento: ${m.marca} ${m.modelo}`, sub: mantStatus(m).cls === "due" ? "Vencido" : "Por vencer", onClick: () => { showView("clientes"); renderClientes(); } });
+  });
+  inventario.filter(r => r.cantidad <= (r.stockMinimo ?? 3)).forEach(r => {
+    avisos.push({ ic: "📦", titulo: `Stock bajo: ${r.nombre}`, sub: `Quedan ${r.cantidad}`, onClick: () => { showView("inventario"); renderInventario(); } });
+  });
+
+  const badge = document.getElementById("notifBadge");
+  if (avisos.length) { badge.style.display = "flex"; badge.textContent = avisos.length; } else { badge.style.display = "none"; }
+
+  document.getElementById("notifLista").innerHTML = avisos.length
+    ? avisos.map((a, i) => `<div class="notif-row" data-i="${i}"><span class="ic">${a.ic}</span><div class="txt"><b>${esc(a.titulo)}</b><span>${esc(a.sub)}</span></div></div>`).join("")
+    : `<div class="notif-row" style="cursor:default;"><div class="txt"><span>Todo al día — sin avisos pendientes.</span></div></div>`;
+  document.getElementById("notifLista").querySelectorAll(".notif-row[data-i]").forEach((el, i) => {
+    el.addEventListener("click", () => { avisos[i].onClick(); document.getElementById("notifPanel").classList.remove("open"); });
+  });
+}
+
+document.getElementById("btnNotificaciones").addEventListener("click", async () => {
+  const panel = document.getElementById("notifPanel");
+  if (panel.classList.contains("open")) { panel.classList.remove("open"); return; }
+  await renderNotificaciones();
+  panel.classList.add("open");
+});
+document.addEventListener("click", (e) => {
+  const wrap = document.getElementById("notifPanel").closest(".topbar-icon-wrap");
+  if (!wrap.contains(e.target)) document.getElementById("notifPanel").classList.remove("open");
+});
+
+document.getElementById("btnCuenta")?.addEventListener("click", () => {
+  document.getElementById("accountPanel").classList.toggle("open");
+});
+document.addEventListener("click", (e) => {
+  const wrap = document.getElementById("accountWrap");
+  if (wrap && !wrap.contains(e.target)) document.getElementById("accountPanel").classList.remove("open");
+});
+const renderByView = {
+  dashboard: () => renderDashboard(),
+  ordenes: () => renderOrdersList(),
+  citas: () => renderCitasList(),
+  clientes: () => renderClientes(),
+  inventario: () => renderInventario(),
+  pos: () => renderPOS(),
+  finanzas: () => renderFinanzas(),
+  "web-cms": () => renderWebCMS(),
+  ajustes: () => renderAjustes(),
+};
+document.querySelectorAll(".nav-item[data-view]").forEach(btn => {
+  btn.addEventListener("click", () => {
+    showView(btn.dataset.view);
+    renderByView[btn.dataset.view]?.();
+  });
+});
+
+// botones de "acceso rápido" en la página principal: mismos 8 destinos que el
+// menú hamburguesa, mismo despacho de render.
+document.querySelectorAll(".qa-btn[data-view]").forEach(btn => {
+  btn.addEventListener("click", () => {
+    showView(btn.dataset.view);
+    renderByView[btn.dataset.view]?.();
+  });
+});
+
+/* ================= widgets compartidos (mini-tarjetas clicables) ================= */
+function sameMonth(a, b) { return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth(); }
+function countMantenimientos(motos) { return motos.filter(m => ["due", "soon"].includes(mantStatus(m).cls)).length; }
+
+// items: { ic, val, lbl, active?, goto? (navega a otra vista) | onClick? (ej. aplicar un filtro en la misma vista) }
+function renderWidgetRow(containerId, items) {
+  const el = document.getElementById(containerId);
+  if (!el) return;
+  el.innerHTML = items.map((m, i) => `
+    <button type="button" class="widget-mini ${m.active ? "active" : ""}" data-i="${i}"><span class="ic">${m.ic}</span><span class="val">${m.val}</span><span class="lbl">${esc(m.lbl)}</span></button>
+  `).join("");
+  el.querySelectorAll(".widget-mini").forEach((btn, i) => {
+    const item = items[i];
+    if (item.goto) {
+      btn.addEventListener("click", () => {
+        showView(item.goto);
+        document.querySelectorAll(".nav-item[data-view]").forEach(b => b.classList.toggle("active", b.dataset.view === item.goto));
+        renderByView[item.goto]?.();
+      });
+    } else if (item.onClick) {
+      btn.addEventListener("click", item.onClick);
+    }
+  });
+}
+
+/* ================= DASHBOARD ================= */
+async function renderDashboard() {
+  const [ordenes, motos, clientes, inventario, citas] = await Promise.all([
+    DB.getAll("ordenes"), DB.getAll("motos"), DB.getAll("clientes"), DB.getAll("inventario"), DB.getAll("citas"),
+  ]);
+
+  const activas = ordenes.filter(o => o.estado !== "entregado").length;
+  const hoyStr = new Date().toISOString().slice(0, 10);
+  const citasHoy = citas.filter(c => c.fecha === hoyStr).length;
+  const mantenimientos = countMantenimientos(motos);
+  const repuestosBajos = inventario.filter(r => r.cantidad <= 3).length;
+
+  const now = new Date();
+  const ingresosMes = ordenes
+    .filter(o => o.estado === "entregado" && o.entregadoEn && sameMonth(new Date(o.entregadoEn), now))
+    .reduce((s, o) => s + (o.items || []).reduce((ss, it) => ss + it.cantidad * it.precio, 0), 0);
+
+  renderWidgetRow("widgetRow", [
+    { ic: "🧾", val: activas, lbl: "Órdenes activas", goto: "ordenes" },
+    { ic: "📅", val: citasHoy, lbl: "Citas hoy", goto: "citas" },
+    { ic: "🛠️", val: mantenimientos, lbl: "Mantenimientos", goto: "clientes" },
+    { ic: "📦", val: repuestosBajos, lbl: "Stock bajo", goto: "inventario" },
+    { ic: "👥", val: clientes.length, lbl: "Clientes", goto: "clientes" },
+  ]);
+
+  const stageColor = { recibido: "var(--text-faint)", diagnostico: "var(--amber)", presupuesto: "var(--amber)", reparacion: "var(--red)", calidad: "var(--red)", entregado: "var(--green)" };
+  const porEtapa = STAGES.map(s => ({ ...s, count: ordenes.filter(o => o.estado === s.key).length }));
+  const totalOrdenes = ordenes.length || 1;
+
+  document.getElementById("widgetGrid").innerHTML = `
+    <div class="widget-card tint-green">
+      <span class="eyebrow">Ingresos del mes</span>
+      <span class="big">${money(ingresosMes)}</span>
+      <span class="sub">De órdenes entregadas en ${esc(now.toLocaleDateString("es-HN", { month: "long" }))}</span>
+    </div>
+    <div class="widget-card span-2">
+      <span class="eyebrow" style="color:var(--text-faint);">Órdenes por etapa</span>
+      <div class="seg-bar">${porEtapa.map(s => `<span title="${esc(s.label)}: ${s.count}" style="width:${(s.count / totalOrdenes) * 100}%; background:${stageColor[s.key]};"></span>`).join("")}</div>
+      <div class="seg-legend">${porEtapa.map(s => `<span><span class="dot" style="background:${stageColor[s.key]}"></span>${esc(s.label)} <b>${s.count}</b></span>`).join("")}</div>
+    </div>
+    <button type="button" class="widget-card ${mantenimientos > 0 ? "tint-amber" : ""}" id="cardMantenimientos" style="text-align:left; font-family:inherit; cursor:pointer;">
+      <span class="eyebrow">Mantenimientos</span>
+      <span class="big">${mantenimientos}</span>
+      <span class="sub">Vencidos o por vencer en 7 días</span>
+    </button>
+  `;
+  document.getElementById("cardMantenimientos").addEventListener("click", () => {
+    showView("clientes");
+    document.querySelectorAll(".nav-item[data-view]").forEach(b => b.classList.toggle("active", b.dataset.view === "clientes"));
+  });
+
+  // Estadísticas del sitio web: no hay analítica real conectada todavía
+  // (ni Google Analytics ni una tabla de visitas en el backend), así que
+  // esto son números de ejemplo fijos, solo para mostrar cómo se vería.
+  const webStats = { hoy: 47, mes: 1284, top: "Catálogo", topPct: 38, semana: [12, 18, 15, 22, 19, 25, 31] };
+  const maxV = Math.max(...webStats.semana);
+  document.getElementById("webWidgetGrid").innerHTML = `
+    <div class="widget-card">
+      <span class="eyebrow" style="color:var(--text-faint);">Visitas hoy</span>
+      <span class="big">${webStats.hoy}</span>
+      <span class="sub">Dato de ejemplo</span>
+    </div>
+    <div class="widget-card">
+      <span class="eyebrow" style="color:var(--text-faint);">Visitas este mes</span>
+      <span class="big">${webStats.mes.toLocaleString("es-HN")}</span>
+      <span class="sub">Página más vista: ${esc(webStats.top)} (${webStats.topPct}%)</span>
+    </div>
+    <div class="widget-card span-2">
+      <span class="eyebrow" style="color:var(--text-faint);">Últimos 7 días</span>
+      <div class="sparkline">${webStats.semana.map((v, i) => `<span class="bar ${i === webStats.semana.length - 1 ? "now" : ""}" style="height:${Math.max((v / maxV) * 100, 6)}%" title="Día ${i + 1}: ${v} visitas"></span>`).join("")}</div>
+      <span class="sub">Hoy: ${webStats.semana[webStats.semana.length - 1]} visitas (ejemplo)</span>
+    </div>
+  `;
+}
+
+/* ---------------- gráficos del dashboard (Chart.js) ---------------- */
+let chartInstances = {};
+function chartColors() {
+  const dark = !document.documentElement.classList.contains("light") && window.matchMedia("(prefers-color-scheme: dark)").matches;
+  return { grid: dark ? "rgba(255,255,255,0.08)" : "rgba(0,0,0,0.08)", text: dark ? "#a8a8a8" : "#555" };
+}
+
+async function renderFinanzasCharts() {
+  if (typeof Chart === "undefined") return; // sin internet la primera vez, la librería no llegó a cargar
+
+  const [movs, ventas, ordenes, inv] = await Promise.all([DB.getAll("caja_movimientos"), DB.getAll("ventas_rapidas"), DB.getAll("ordenes"), DB.getAll("inventario")]);
+  const { grid, text } = chartColors();
+  Chart.defaults.color = text;
+  Chart.defaults.borderColor = grid;
+
+  document.getElementById("finanzasChartsFlag").style.display = (movs.length || ventas.length) ? "none" : "block";
+
+  // 1) Ingresos vs Gastos, últimos 7 días
+  const dias = Array.from({ length: 7 }, (_, i) => { const d = new Date(); d.setDate(d.getDate() - (6 - i)); return d.toISOString().slice(0, 10); });
+  const ingresosPorDia = dias.map(d => movs.filter(m => m.tipo === "ingreso" && m.fechaISO.slice(0, 10) === d).reduce((s, m) => s + m.monto, 0));
+  const gastosPorDia = dias.map(d => movs.filter(m => m.tipo === "egreso" && m.fechaISO.slice(0, 10) === d).reduce((s, m) => s + m.monto, 0));
+
+  chartInstances.ingresosGastos?.destroy();
+  chartInstances.ingresosGastos = new Chart(document.getElementById("chartIngresosGastos"), {
+    type: "line",
+    data: {
+      labels: dias.map(d => new Date(d + "T00:00").toLocaleDateString("es-HN", { day: "2-digit", month: "2-digit" })),
+      datasets: [
+        { label: "Ingresos", data: ingresosPorDia, borderColor: "#34d399", backgroundColor: "rgba(52,211,153,0.15)", tension: 0.3, fill: true },
+        { label: "Gastos", data: gastosPorDia, borderColor: "#ef4444", backgroundColor: "rgba(239,68,68,0.15)", tension: 0.3, fill: true },
+      ],
+    },
+    options: { responsive: true, scales: { x: { grid: { display: false } }, y: { grid: { color: grid }, beginAtZero: true } } },
+  });
+
+  // 2) Origen de ingresos: mano de obra taller vs ventas TPV
+  const totalTaller = movs.filter(m => m.categoria === "Servicio taller").reduce((s, m) => s + m.monto, 0);
+  const totalTPV = movs.filter(m => m.categoria === "Venta mostrador").reduce((s, m) => s + m.monto, 0);
+  chartInstances.origenIngresos?.destroy();
+  chartInstances.origenIngresos = new Chart(document.getElementById("chartOrigenIngresos"), {
+    type: "doughnut",
+    data: {
+      labels: ["Taller (mano de obra)", "TPV (mostrador)"],
+      datasets: [{ data: [totalTaller, totalTPV], backgroundColor: ["#ef4444", "#f5a524"] }],
+    },
+    options: { responsive: true, plugins: { legend: { position: "bottom" } } },
+  });
+
+  // 3) Top 5 repuestos con mayor rotación (unidades vendidas por TPV)
+  const rotacion = {};
+  ventas.forEach(v => v.items.forEach(it => {
+    if (!it.inventarioId) return;
+    rotacion[it.inventarioId] = (rotacion[it.inventarioId] || 0) + it.cantidad;
+  }));
+  const top5 = Object.entries(rotacion)
+    .map(([id, cant]) => ({ nombre: inv.find(r => r.id === Number(id))?.nombre || `#${id}`, cant }))
+    .sort((a, b) => b.cant - a.cant).slice(0, 5);
+
+  chartInstances.topRepuestos?.destroy();
+  chartInstances.topRepuestos = new Chart(document.getElementById("chartTopRepuestos"), {
+    type: "bar",
+    data: { labels: top5.map(x => x.nombre), datasets: [{ label: "Unidades vendidas", data: top5.map(x => x.cant), backgroundColor: "#ef4444" }] },
+    options: { indexAxis: "y", responsive: true, plugins: { legend: { display: false } }, scales: { x: { beginAtZero: true, grid: { color: grid } }, y: { grid: { display: false } } } },
+  });
+}
+
+/* ================= ÓRDENES ================= */
+let ordenesFiltro = null; // null (todas) | "activas" | "entregadas"
+
+async function renderOrdersList() {
+  const [ordenesAll, motos, clientes] = await Promise.all([DB.getAll("ordenes"), DB.getAll("motos"), DB.getAll("clientes")]);
+
+  const entregadasMes = ordenesAll.filter(o => o.estado === "entregado" && o.entregadoEn && sameMonth(new Date(o.entregadoEn), new Date()));
+  const activas = ordenesAll.filter(o => o.estado !== "entregado");
+
+  renderWidgetRow("ordenesWidgetRow", [
+    { ic: "🧾", val: activas.length, lbl: "Activas", active: ordenesFiltro === "activas", onClick: () => { ordenesFiltro = ordenesFiltro === "activas" ? null : "activas"; renderOrdersList(); } },
+    { ic: "✅", val: entregadasMes.length, lbl: "Entregadas este mes", active: ordenesFiltro === "entregadas", onClick: () => { ordenesFiltro = ordenesFiltro === "entregadas" ? null : "entregadas"; renderOrdersList(); } },
+    { ic: "📋", val: ordenesAll.length, lbl: "Total", active: ordenesFiltro === null, onClick: () => { ordenesFiltro = null; renderOrdersList(); } },
+  ]);
+
+  let ordenes = ordenesAll;
+  if (ordenesFiltro === "activas") ordenes = activas;
+  else if (ordenesFiltro === "entregadas") ordenes = entregadasMes;
+
+  const list = document.getElementById("ordersList");
+  if (!ordenes.length) {
+    list.innerHTML = ordenesAll.length
+      ? `<div class="empty">Ninguna orden coincide con este filtro.</div>`
+      : `<div class="empty">Todavía no hay órdenes.<br><button class="btn primary small" id="btnEmptyNuevaOrden" style="margin-top:0.8rem;">+ Crear la primera</button></div>`;
+    document.getElementById("btnEmptyNuevaOrden")?.addEventListener("click", () => document.getElementById("btnNuevaOrden").click());
+    return;
+  }
+  ordenes = [...ordenes].sort((a, b) => b.id - a.id);
+  list.innerHTML = ordenes.map(o => {
+    const moto = motos.find(m => m.id === o.motoId);
+    const cliente = clientes.find(c => c.id === o.clienteId);
+    const total = (o.items || []).reduce((s, it) => s + it.cantidad * it.precio, 0);
+    const foto = (o.fotos || [])[0];
+    return `
+      <div class="order-row" data-id="${o.id}">
+        ${foto ? `<img class="order-thumb" src="${foto}">` : `<div class="order-thumb">🏍️</div>`}
+        <span class="pill ${o.estado}">${STAGES.find(s => s.key === o.estado)?.label ?? o.estado}${o.finalizada ? " ✓" : ""}</span>
+        <div class="order-info">
+          <div class="moto">${esc(moto ? `${moto.marca} ${moto.modelo}` : "Moto")} <span class="cliente">— ${esc(cliente?.nombre ?? "cliente")}</span></div>
+          <div class="meta">placa ${esc(moto?.placa || "s/p")} · orden #${o.id}</div>
+        </div>
+        <span class="amount">${money(total)}</span>
+        <span class="meta mech">${esc(o.mecanico ?? "")}</span>
+        <button type="button" class="btn ghost small danger" data-del="${o.id}" title="Eliminar orden" aria-label="Eliminar orden">🗑</button>
+      </div>`;
+  }).join("");
+  list.querySelectorAll(".order-row").forEach(row => {
+    row.addEventListener("click", (e) => {
+      if (e.target.closest("[data-del]")) return;
+      openOrder(Number(row.dataset.id));
+    });
+  });
+  list.querySelectorAll("[data-del]").forEach(btn => {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      requestAdminCode(async () => {
+        await DB.delete("ordenes", Number(btn.dataset.del));
+        markDirty();
+        toast("Orden eliminada");
+        renderOrdersList();
+        renderDashboard();
+      });
+    });
+  });
+}
+
+async function openOrder(id) {
+  currentOrderId = id;
+  const o = await DB.get("ordenes", id);
+  const moto = await DB.get("motos", o.motoId);
+  const cliente = await DB.get("clientes", o.clienteId);
+
+  document.getElementById("detalleTitulo").textContent = `Orden #${o.id} — ${moto.marca} ${moto.modelo}`;
+  document.getElementById("detalleSub").textContent = `${cliente.nombre} · ${cliente.telefono || "sin teléfono"} · placa ${moto.placa || "s/p"} · asignada a ${o.mecanico}`;
+  document.getElementById("detalleFalla").textContent = o.falla || "(sin descripción)";
+  document.getElementById("inputKm").value = moto.km ?? "";
+  document.getElementById("inputKm").previousElementSibling.textContent = o.estado === "entregado" ? "Kilometraje de salida" : "Kilometraje actual";
+
+  document.getElementById("detalleFotos").innerHTML = (o.fotos || []).map(src => `<img src="${src}">`).join("");
+
+  renderStageTracker(o.estado, o.finalizada);
+  await renderStageContent(o);
+  updateActionBar(o);
+
+  showView("detalle");
+}
+
+function updateActionBar(o) {
+  const isLast = o.estado === STAGES[STAGES.length - 1].key;
+  const btnAvanzar = document.getElementById("btnAvanzar");
+  const btnRetroceder = document.getElementById("btnRetroceder");
+  const btnFactura = document.getElementById("btnImprimirFactura");
+  const badge = document.getElementById("finalizadoBadge");
+
+  btnFactura.style.display = isLast ? "inline-flex" : "none";
+
+  if (o.finalizada) {
+    btnAvanzar.style.display = "none";
+    btnRetroceder.style.display = "none";
+    badge.style.display = "inline-flex";
+    badge.textContent = `✓ Trabajo finalizado el ${new Date(o.finalizadoEn).toLocaleDateString()}`;
+  } else {
+    badge.style.display = "none";
+    btnRetroceder.style.display = "inline-flex";
+    btnAvanzar.style.display = "inline-flex";
+    btnAvanzar.textContent = isLast ? "Finalizar trabajo y guardar registro" : "Avanzar a la siguiente etapa →";
+  }
+}
+
+function renderStageTracker(estado, finalizada) {
+  const idx = STAGES.findIndex(s => s.key === estado);
+  document.getElementById("stageTracker").innerHTML = STAGES.map((s, i) => {
+    const cls = i < idx ? "done" : i === idx ? "current" : "";
+    return `<button class="stage ${cls}" data-i="${i}"><div class="idx">${String(i + 1).padStart(2, "0")}</div><h4>${s.label}</h4></button>`;
+  }).join("");
+  document.querySelectorAll(".stage").forEach(btn => {
+    btn.addEventListener("click", async () => {
+      if (finalizada) { toast("Este trabajo ya está finalizado", "off"); return; }
+      const i = Number(btn.dataset.i);
+      const o = await updateOrder(currentOrderId, ord => setStage(ord, STAGES[i].key));
+      toast(`Etapa: ${STAGES[i].label}`);
+      openOrder(o.id);
+    });
+  });
+}
+
+async function renderStageContent(o) {
+  const el = document.getElementById("stageContent");
+
+  if (o.estado === "recibido") {
+    el.innerHTML = `<div class="card"><p style="color:var(--text-muted); margin:0;">Moto recibida. Cuando el mecánico la revise, avanza a <b>Diagnóstico</b> (o toca esa etapa arriba).</p></div>`;
+
+  } else if (o.estado === "diagnostico") {
+    el.innerHTML = `
+      <div class="card">
+        <h4 class="font-display" style="font-size:0.95rem; margin-bottom:0.6rem;">Diagnóstico</h4>
+        <label>Notas del mecánico</label>
+        <textarea id="diagNotas" rows="3">${esc(o.diagnostico?.notas || "")}</textarea>
+        <label>Tiempo estimado (horas)</label>
+        <input type="number" id="diagHoras" style="max-width:160px;" value="${o.diagnostico?.horas ?? ""}">
+      </div>`;
+    document.getElementById("diagNotas").addEventListener("change", (e) => updateOrder(o.id, ord => { ord.diagnostico = { ...(ord.diagnostico || {}), notas: e.target.value }; }));
+    document.getElementById("diagHoras").addEventListener("change", (e) => updateOrder(o.id, ord => { ord.diagnostico = { ...(ord.diagnostico || {}), horas: Number(e.target.value) || 0 }; }));
+
+  } else if (o.estado === "presupuesto") {
+    await renderPresupuestoStage(o);
+
+  } else if (o.estado === "reparacion") {
+    el.innerHTML = `
+      <div class="card">
+        <h4 class="font-display" style="font-size:0.95rem; margin-bottom:0.6rem;">Reparación en curso</h4>
+        <label>Notas de avance</label>
+        <textarea id="repNotas" rows="3" placeholder="Qué se ha hecho, qué falta...">${esc(o.reparacionNotas || "")}</textarea>
+      </div>`;
+    document.getElementById("repNotas").addEventListener("change", (e) => updateOrder(o.id, ord => { ord.reparacionNotas = e.target.value; }));
+
+  } else if (o.estado === "calidad") {
+    const chk = o.calidadChecklist || {};
+    const items = [
+      ["pruebaManejo", "Prueba de manejo"],
+      ["fugas", "Sin fugas de aceite/combustible"],
+      ["torque", "Torque de piezas verificado"],
+      ["limpieza", "Moto limpia y lista para entregar"],
+    ];
+    el.innerHTML = `
+      <div class="card">
+        <h4 class="font-display" style="font-size:0.95rem; margin-bottom:0.4rem;">Control de calidad</h4>
+        <div class="checklist">
+          ${items.map(([key, label]) => `
+            <label><input type="checkbox" data-key="${key}" ${chk[key] ? "checked" : ""}> ${label}</label>
+          `).join("")}
+        </div>
+      </div>`;
+    el.querySelectorAll("input[type=checkbox]").forEach(cb => {
+      cb.addEventListener("change", (e) => updateOrder(o.id, ord => {
+        ord.calidadChecklist = { ...(ord.calidadChecklist || {}), [e.target.dataset.key]: e.target.checked };
+      }));
+    });
+
+  } else if (o.estado === "entregado") {
+    const total = (o.items || []).reduce((s, it) => s + it.cantidad * it.precio, 0);
+    el.innerHTML = `
+      <div class="card">
+        <h4 class="font-display" style="font-size:0.95rem; margin-bottom:0.4rem;">Entregada</h4>
+        <p style="color:var(--text-muted); margin-bottom:0.6rem;">Total cobrado: <b style="color:var(--text);">${money(total)}</b>. Imprime la factura con el botón de abajo antes de despedir al cliente.</p>
+        <label>Método de pago</label>
+        <select id="entregaMetodoPago" style="max-width:220px;">
+          <option value="efectivo" ${o.metodoPago === "efectivo" || !o.metodoPago ? "selected" : ""}>Efectivo</option>
+          <option value="transferencia" ${o.metodoPago === "transferencia" ? "selected" : ""}>Transferencia</option>
+          <option value="tarjeta" ${o.metodoPago === "tarjeta" ? "selected" : ""}>Tarjeta</option>
+        </select>
+      </div>`;
+    document.getElementById("entregaMetodoPago").addEventListener("change", (e) => {
+      updateOrder(o.id, ord => { ord.metodoPago = e.target.value; });
+    });
+  }
+}
+
+async function renderPresupuestoStage(o) {
+  const inv = await DB.getAll("inventario");
+  const items = o.items || [];
+  const el = document.getElementById("stageContent");
+  el.innerHTML = `
+    <div class="card">
+      <h4 class="font-display" style="font-size:0.95rem; margin-bottom:0.6rem;">Presupuesto</h4>
+      <table id="tablaItems">
+        <thead><tr><th>Ítem</th><th class="num">Cant.</th><th class="num">Precio</th><th class="num">Subtotal</th><th></th></tr></thead>
+        <tbody id="itemsBody"></tbody>
+      </table>
+      <div style="display:flex; justify-content:space-between; margin-top:0.6rem; font-weight:600;">
+        <span>Total</span><span id="itemsTotal" style="font-variant-numeric:tabular-nums;">${money(items.reduce((s, it) => s + it.cantidad * it.precio, 0))}</span>
+      </div>
+      <button class="btn small" id="btnAgregarItem" style="margin-top:0.7rem;">+ Agregar repuesto / mano de obra</button>
+
+      <div id="aprobacionBox" style="margin-top:1rem; padding-top:1rem; border-top:1px solid var(--line);">
+        <p class="hint" style="margin-top:0;">El cliente puede aprobar por WhatsApp (se le escribe a su número), o directo aquí si está en el local.</p>
+        <div style="display:flex; gap:0.5rem; flex-wrap:wrap;">
+          <button class="btn wa" id="btnEnviarWA">Enviar presupuesto por WhatsApp</button>
+          <button class="btn primary" id="btnAprobarLocal">Aprobar en el local</button>
+        </div>
+        <p id="aprobacionEstado" style="margin-top:0.6rem; font-size:0.85rem;"></p>
+      </div>
+    </div>`;
+
+  document.getElementById("itemsBody").innerHTML = items.length ? items.map((it, i) => `
+    <tr>
+      <td>${esc(it.nombre)}</td><td class="num">${it.cantidad}</td><td class="num">${money(it.precio)}</td><td class="num">${money(it.cantidad * it.precio)}</td>
+      <td class="num"><button type="button" class="btn ghost small danger" data-quitar="${i}" title="Quitar ítem" aria-label="Quitar ítem">🗑</button></td>
+    </tr>
+  `).join("") : `<tr><td colspan="5" style="color:var(--text-faint);">Sin ítems todavía</td></tr>`;
+
+  document.getElementById("itemsBody").querySelectorAll("[data-quitar]").forEach(btn => {
+    btn.addEventListener("click", async () => {
+      const idx = Number(btn.dataset.quitar);
+      const ord = await DB.get("ordenes", o.id);
+      const [removido] = (ord.items || []).splice(idx, 1);
+      if (removido?.origenInventarioId) {
+        const rep = await DB.get("inventario", removido.origenInventarioId);
+        if (rep) { rep.cantidad += removido.cantidad; await DB.save("inventario", rep); }
+      }
+      await DB.save("ordenes", ord);
+      markDirty();
+      toast(removido?.origenInventarioId ? "Ítem quitado y stock devuelto al inventario" : "Ítem quitado");
+      renderPresupuestoStage(ord);
+    });
+  });
+
+  renderAprobacionEstado(o);
+
+  document.getElementById("btnAgregarItem").addEventListener("click", async () => {
+    const invNow = await DB.getAll("inventario");
+    document.getElementById("itemInventarioSelect").innerHTML = invNow.map(r => `<option value="${r.id}">${esc(r.nombre)} (quedan ${r.cantidad})</option>`).join("") || `<option value="">Inventario vacío</option>`;
+    document.getElementById("itemNombre").value = "";
+    document.getElementById("itemCantidad").value = 1;
+    document.getElementById("itemPrecio").value = "";
+    document.getElementById("itemOrigen").value = "manual";
+    toggleItemOrigen();
+    document.getElementById("modalItem").classList.add("active");
+  });
+
+  document.getElementById("btnEnviarWA").addEventListener("click", async () => {
+    const ord = await DB.get("ordenes", o.id);
+    const moto = await DB.get("motos", ord.motoId);
+    const cliente = await DB.get("clientes", ord.clienteId);
+    const total = (ord.items || []).reduce((s, it) => s + it.cantidad * it.precio, 0);
+    const lineas = (ord.items || []).map(it => `- ${it.nombre} x${it.cantidad}: ${money(it.cantidad * it.precio)}`).join("\n");
+    const texto = `Hola ${cliente.nombre}, este es el presupuesto para tu ${moto.marca} ${moto.modelo} (orden #${ord.id}):\n\n${lineas}\n\nTotal: ${money(total)}\n\n¿Lo aprobamos para empezar la reparación?`;
+    const sent = openWhatsApp(cliente.telefono, texto);
+    if (!sent) return;
+    await updateOrder(o.id, x => { x.aprobacion = { via: "whatsapp", en: Date.now() }; });
+    renderAprobacionEstado(await DB.get("ordenes", o.id));
+    toast(`Presupuesto enviado por WhatsApp a ${cliente.nombre}`);
+  });
+
+  document.getElementById("btnAprobarLocal").addEventListener("click", async () => {
+    const ord = await updateOrder(o.id, x => { x.aprobacion = { via: "local", en: Date.now() }; });
+    renderAprobacionEstado(ord);
+    toast("Aprobado en el local");
+  });
+}
+
+function renderAprobacionEstado(o) {
+  const el = document.getElementById("aprobacionEstado");
+  if (!el) return;
+  if (o.aprobacion) {
+    el.textContent = o.aprobacion.via === "whatsapp"
+      ? `Enviado por WhatsApp el ${new Date(o.aprobacion.en).toLocaleString()} — pendiente de confirmación del cliente.`
+      : `Aprobado en el local el ${new Date(o.aprobacion.en).toLocaleString()}.`;
+  } else {
+    el.textContent = "Sin enviar todavía.";
+  }
+}
+
+/* ---- autocompletado genérico: buscar cliente por nombre o placa ---- */
+function wireAutocompleteCliente(inputEl, listEl, onPick) {
+  let items = [];
+  async function search(q) {
+    if (!q) { listEl.classList.remove("open"); listEl.innerHTML = ""; return; }
+    const [clientes, motos] = await Promise.all([DB.getAll("clientes"), DB.getAll("motos")]);
+    const ql = q.toLowerCase();
+    items = clientes
+      .map(c => ({ cliente: c, moto: motos.find(m => m.clienteId === c.id) }))
+      .filter(({ cliente, moto }) => cliente.nombre.toLowerCase().includes(ql) || (moto?.placa || "").toLowerCase().includes(ql))
+      .slice(0, 8);
+    listEl.innerHTML = items.length
+      ? items.map((it, i) => `
+        <div class="autocomplete-item" data-i="${i}">
+          <b>${esc(it.cliente.nombre)}</b>
+          <span class="sub">${it.moto ? esc(it.moto.placa || "sin placa") + " · " + esc(`${it.moto.marca} ${it.moto.modelo}`.trim()) : "sin moto registrada"}${it.cliente.telefono ? " · " + esc(it.cliente.telefono) : ""}</span>
+        </div>`).join("")
+      : `<div class="autocomplete-item empty">Sin coincidencias — se creará como cliente nuevo</div>`;
+    listEl.classList.add("open");
+    listEl.querySelectorAll(".autocomplete-item[data-i]").forEach(el => {
+      el.addEventListener("mousedown", (e) => {
+        e.preventDefault(); // evita que el blur del input cierre la lista antes del click
+        const it = items[Number(el.dataset.i)];
+        onPick(it.cliente, it.moto);
+        listEl.classList.remove("open");
+        inputEl.value = it.cliente.nombre;
+      });
+    });
+  }
+  inputEl.addEventListener("input", (e) => search(e.target.value.trim()));
+  inputEl.addEventListener("focus", (e) => { if (e.target.value.trim()) search(e.target.value.trim()); });
+  inputEl.addEventListener("blur", () => setTimeout(() => listEl.classList.remove("open"), 150));
+}
+
+/* ---- crear orden ---- */
+let ordenClienteSel = null; // { clienteId, motoId|null } cuando se elige un cliente existente
+
+function renderOrdenClienteChip() {
+  const wrap = document.getElementById("ordenClienteChipWrap");
+  wrap.innerHTML = ordenClienteSel
+    ? `<span class="selected-chip">Cliente existente seleccionado <button type="button" id="btnQuitarOrdenClienteSel" title="Quitar selección" aria-label="Quitar cliente seleccionado">✕</button></span>`
+    : "";
+  document.getElementById("btnQuitarOrdenClienteSel")?.addEventListener("click", () => {
+    ordenClienteSel = null;
+    document.getElementById("ordenBuscarCliente").value = "";
+    renderOrdenClienteChip();
+  });
+}
+
+wireAutocompleteCliente(document.getElementById("ordenBuscarCliente"), document.getElementById("ordenBuscarClienteList"), (cliente, moto) => {
+  ordenClienteSel = { clienteId: cliente.id, motoId: moto?.id || null };
+  document.getElementById("ordenNombre").value = cliente.nombre;
+  document.getElementById("ordenTelefono").value = cliente.telefono || "";
+  document.getElementById("ordenPlaca").value = moto?.placa || "";
+  document.getElementById("ordenMarca").value = moto?.marca || "";
+  document.getElementById("ordenModelo").value = moto?.modelo || "";
+  document.getElementById("ordenKm").value = moto?.km || 0;
+  renderOrdenClienteChip();
+});
+document.getElementById("ordenBuscarCliente").addEventListener("input", () => { ordenClienteSel = null; renderOrdenClienteChip(); });
+
+document.getElementById("btnNuevaOrden").addEventListener("click", async () => {
+  ordenClienteSel = null;
+  document.getElementById("ordenBuscarCliente").value = "";
+  renderOrdenClienteChip();
+  ["ordenNombre", "ordenTelefono", "ordenPlaca", "ordenMarca", "ordenModelo", "ordenKm", "ordenFalla"].forEach(id => document.getElementById(id).value = "");
+  document.getElementById("ordenFoto").value = "";
+  document.getElementById("modalOrden").classList.add("active");
+});
+document.getElementById("btnCancelarOrden").addEventListener("click", () => document.getElementById("modalOrden").classList.remove("active"));
+
+alHacerClicUnaVez(document.getElementById("btnCrearOrden"), async () => {
+  let clienteId, motoId;
+
+  if (ordenClienteSel?.clienteId) {
+    clienteId = ordenClienteSel.clienteId;
+    motoId = ordenClienteSel.motoId;
+    const datosMoto = {
+      marca: document.getElementById("ordenMarca").value.trim() || "—",
+      modelo: document.getElementById("ordenModelo").value.trim() || "",
+      placa: document.getElementById("ordenPlaca").value.trim(),
+      km: Number(document.getElementById("ordenKm").value) || 0,
+    };
+    if (motoId) {
+      // el cliente ya existía: aprovechamos para actualizar su km/datos con lo que se acaba de escribir
+      const moto = await DB.get("motos", motoId);
+      await DB.save("motos", { ...moto, ...datosMoto });
+      markDirty();
+    } else {
+      motoId = await DB.save("motos", { clienteId, ...datosMoto });
+      markDirty();
+    }
+  } else {
+    const nombre = document.getElementById("ordenNombre").value.trim();
+    const telefono = document.getElementById("ordenTelefono").value.trim();
+    if (!nombre) { toast("Falta el nombre del cliente", "off"); return; }
+    if (!(await checkDuplicateBeforeCreate(nombre, telefono))) return;
+    clienteId = await DB.save("clientes", { nombre, telefono });
+    markDirty();
+    motoId = await DB.save("motos", {
+      clienteId,
+      marca: document.getElementById("ordenMarca").value.trim() || "—",
+      modelo: document.getElementById("ordenModelo").value.trim() || "",
+      placa: document.getElementById("ordenPlaca").value.trim(),
+      km: Number(document.getElementById("ordenKm").value) || 0,
+    });
+    markDirty();
+  }
+
+  const fotoFile = document.getElementById("ordenFoto").files[0];
+  const fotos = fotoFile ? [await fileToDataUrl(fotoFile)] : [];
+
+  const id = await DB.save("ordenes", {
+    clienteId, motoId, estado: "recibido",
+    falla: document.getElementById("ordenFalla").value.trim(),
+    items: [], fotos, aprobacion: null,
+    diagnostico: null, reparacionNotas: "", calidadChecklist: null,
+    mecanico: currentUser?.nombre || "—",
+    creadoEn: Date.now(),
+  });
+  markDirty();
+  document.getElementById("modalOrden").classList.remove("active");
+  toast("Orden creada");
+  await renderOrdersList();
+  openOrder(id);
+});
+
+document.getElementById("btnVolverOrdenes").addEventListener("click", async () => {
+  await renderOrdersList();
+  showView("ordenes");
+});
+
+/* ---- avanzar / retroceder etapa ---- */
+document.getElementById("btnAvanzar").addEventListener("click", async () => {
+  const o = await DB.get("ordenes", currentOrderId);
+  const idx = STAGES.findIndex(s => s.key === o.estado);
+  if (idx >= STAGES.length - 1) {
+    const total = (o.items || []).reduce((s, it) => s + it.cantidad * it.precio, 0);
+    let costo = 0;
+    const inv = await DB.getAll("inventario");
+    (o.items || []).forEach(it => {
+      if (!it.origenInventarioId) return;
+      const rep = inv.find(r => r.id === it.origenInventarioId);
+      if (rep) costo += (rep.costoCompra || 0) * it.cantidad;
+    });
+    const margen = total > 0 ? ((total - costo) / total) * 100 : null;
+    const ord = await updateOrder(o.id, x => { x.finalizada = true; x.finalizadoEn = Date.now(); x.margen = margen; });
+    if (total > 0) await registrarIngresoTaller(ord, total, ord.metodoPago || "efectivo");
+    toast("Trabajo finalizado y guardado como registro");
+    renderOrdersList();
+    renderDashboard();
+    openOrder(ord.id);
+    return;
+  }
+  await updateOrder(o.id, ord => setStage(ord, STAGES[idx + 1].key));
+  toast(`Etapa: ${STAGES[idx + 1].label}`);
+  openOrder(o.id);
+});
+document.getElementById("btnRetroceder").addEventListener("click", async () => {
+  const o = await DB.get("ordenes", currentOrderId);
+  const idx = STAGES.findIndex(s => s.key === o.estado);
+  if (idx <= 0) return;
+  await updateOrder(o.id, ord => { ord.estado = STAGES[idx - 1].key; });
+  openOrder(o.id);
+});
+
+/* ---- km ---- */
+document.getElementById("inputKm").addEventListener("change", async (e) => {
+  const o = await DB.get("ordenes", currentOrderId);
+  const moto = await DB.get("motos", o.motoId);
+  moto.km = Number(e.target.value) || moto.km;
+  await DB.save("motos", moto);
+  markDirty();
+  toast("Kilometraje actualizado");
+});
+
+/* ---- fotos ---- */
+document.getElementById("inputFotos").addEventListener("change", async (e) => {
+  const files = Array.from(e.target.files || []);
+  if (!files.length) return;
+  const urls = await Promise.all(files.map(fileToDataUrl));
+  const o = await updateOrder(currentOrderId, ord => { ord.fotos = (ord.fotos || []).concat(urls); });
+  e.target.value = "";
+  openOrder(o.id);
+});
+
+/* ---- ítems de presupuesto (modal) ---- */
+document.getElementById("btnCancelarItem").addEventListener("click", () => document.getElementById("modalItem").classList.remove("active"));
+document.getElementById("itemOrigen").addEventListener("change", toggleItemOrigen);
+function toggleItemOrigen() {
+  const fromInv = document.getElementById("itemOrigen").value === "inventario";
+  document.getElementById("itemManualFields").style.display = fromInv ? "none" : "block";
+  document.getElementById("itemInventarioFields").style.display = fromInv ? "block" : "none";
+}
+
+alHacerClicUnaVez(document.getElementById("btnGuardarItem"), async () => {
+  const cantidad = Number(document.getElementById("itemCantidad").value) || 1;
+  const precio = Number(document.getElementById("itemPrecio").value) || 0;
+  const fromInv = document.getElementById("itemOrigen").value === "inventario";
+  let nombre;
+  let origenInventarioId = null;
+
+  // una cantidad negativa aquí, si venía de inventario, terminaba SUMANDO
+  // stock en vez de restarlo (rep.cantidad -= cantidad con cantidad negativo).
+  if (cantidad <= 0) { toast("La cantidad debe ser mayor a cero", "off"); return; }
+  if (precio < 0) { toast("El precio no puede ser negativo", "off"); return; }
+
+  if (fromInv) {
+    const repId = Number(document.getElementById("itemInventarioSelect").value);
+    const rep = await DB.get("inventario", repId);
+    if (!rep) { toast("Elige un repuesto", "off"); return; }
+    if (rep.cantidad < cantidad) { toast(`Solo quedan ${rep.cantidad} en inventario`, "off"); return; }
+    nombre = rep.nombre;
+    origenInventarioId = repId;
+    rep.cantidad -= cantidad;
+    await DB.save("inventario", rep);
+    markDirty();
+  } else {
+    nombre = document.getElementById("itemNombre").value.trim();
+    if (!nombre) { toast("Falta el nombre del ítem", "off"); return; }
+  }
+
+  const o = await updateOrder(currentOrderId, ord => { ord.items = (ord.items || []).concat([{ nombre, cantidad, precio, origenInventarioId }]); });
+  document.getElementById("modalItem").classList.remove("active");
+  openOrder(o.id);
+});
+
+/* ---- imprimir factura ---- */
+document.getElementById("btnImprimirFactura").addEventListener("click", async () => {
+  const o = await DB.get("ordenes", currentOrderId);
+  const moto = await DB.get("motos", o.motoId);
+  const cliente = await DB.get("clientes", o.clienteId);
+  const items = o.items || [];
+  const total = items.reduce((s, it) => s + it.cantidad * it.precio, 0);
+
+  document.getElementById("facOrdenId").textContent = o.id;
+  document.getElementById("facFecha").textContent = new Date().toLocaleDateString();
+  document.getElementById("facCliente").textContent = cliente.nombre;
+  document.getElementById("facTelefono").textContent = cliente.telefono || "—";
+  document.getElementById("facMoto").textContent = `${moto.marca} ${moto.modelo} · placa ${moto.placa || "s/p"} · ${moto.km || 0} km`;
+  document.getElementById("facItems").innerHTML = items.length
+    ? items.map(it => `<tr><td>${esc(it.nombre)}</td><td class="num">${it.cantidad}</td><td class="num">${money(it.precio)}</td><td class="num">${money(it.cantidad * it.precio)}</td></tr>`).join("")
+    : `<tr><td colspan="4">Sin ítems</td></tr>`;
+  document.getElementById("facTotal").textContent = money(total);
+
+  window.print();
+});
+
+/* ================= CITAS ================= */
+function generarSlotsDelDia() {
+  const [hIni, mIni] = HORARIO_TALLER.horaInicio.split(":").map(Number);
+  const [hFin, mFin] = HORARIO_TALLER.horaFin.split(":").map(Number);
+  const slots = [];
+  let mins = hIni * 60 + mIni;
+  const finMins = hFin * 60 + mFin;
+  while (mins < finMins) {
+    const h = String(Math.floor(mins / 60)).padStart(2, "0");
+    const m = String(mins % 60).padStart(2, "0");
+    slots.push(`${h}:${m}`);
+    mins += HORARIO_TALLER.intervaloMin;
+  }
+  return slots;
+}
+
+// solo se ofrecen horas libres para ese mecánico ese día, así ya no se puede
+// ni seleccionar un horario que otro cliente ya apartó.
+async function slotsDisponibles(fecha, mecanico) {
+  const todos = generarSlotsDelDia();
+  if (!fecha || !mecanico) return todos;
+  const citas = await DB.getAll("citas");
+  const ocupadas = new Set(citas.filter(c => c.fecha === fecha && c.mecanico === mecanico).map(c => c.hora));
+  return todos.filter(h => !ocupadas.has(h));
+}
+
+async function refreshCitaHoraOptions() {
+  const sel = document.getElementById("citaHora");
+  const valorPrevio = sel.value;
+  const fecha = document.getElementById("citaFecha").value;
+  const mecanico = document.getElementById("citaMecanico").value;
+  if (!fecha) {
+    sel.innerHTML = `<option value="">Elige una fecha primero</option>`;
+    return;
+  }
+  const libres = await slotsDisponibles(fecha, mecanico);
+  sel.innerHTML = libres.length
+    ? libres.map(h => `<option value="${h}">${h}</option>`).join("")
+    : `<option value="">Sin horarios disponibles ese día — elige otra fecha</option>`;
+  if (libres.includes(valorPrevio)) sel.value = valorPrevio;
+}
+document.getElementById("citaFecha").addEventListener("change", refreshCitaHoraOptions);
+document.getElementById("citaMecanico").addEventListener("change", refreshCitaHoraOptions);
+
+async function checkCitaConflicto(fecha, hora, mecanico) {
+  if (!mecanico) return true;
+  const citas = await DB.getAll("citas");
+  const choque = citas.find(c => c.fecha === fecha && c.hora === hora && c.mecanico === mecanico);
+  if (!choque) return true;
+  return showConfirm(
+    `${mecanico} ya tiene otra cita agendada el ${fecha} a las ${hora}. ¿Agendar esta de todas formas?`,
+    { titulo: "Choque de horario", textoOk: "Agendar de todas formas" }
+  );
+}
+function citaWhenInfo(cita) {
+  const now = new Date();
+  const dt = new Date(`${cita.fecha}T${cita.hora || "00:00"}`);
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const citaDay = new Date(dt.getFullYear(), dt.getMonth(), dt.getDate());
+  const diffDays = Math.round((citaDay - today) / 86400000);
+  let label;
+  if (diffDays < 0) label = "Pasada";
+  else if (diffDays === 0) label = "Hoy";
+  else if (diffDays === 1) label = "Mañana";
+  else label = dt.toLocaleDateString();
+  return { diffDays, label, dt };
+}
+
+let citasFiltro = null; // null | "hoy" | "semana" | "sinRecordatorio"
+
+async function renderCitasList() {
+  const [citasAll, clientes] = await Promise.all([DB.getAll("citas"), DB.getAll("clientes")]);
+
+  const hoy = citasAll.filter(c => citaWhenInfo(c).diffDays === 0);
+  const semana = citasAll.filter(c => { const d = citaWhenInfo(c).diffDays; return d >= 0 && d <= 6; });
+  const sinRecordatorio = citasAll.filter(c => !c.recordatorioEnviado && citaWhenInfo(c).diffDays >= 0);
+
+  renderWidgetRow("citasWidgetRow", [
+    { ic: "📅", val: hoy.length, lbl: "Hoy", active: citasFiltro === "hoy", onClick: () => { citasFiltro = citasFiltro === "hoy" ? null : "hoy"; renderCitasList(); } },
+    { ic: "🗓️", val: semana.length, lbl: "Esta semana", active: citasFiltro === "semana", onClick: () => { citasFiltro = citasFiltro === "semana" ? null : "semana"; renderCitasList(); } },
+    { ic: "💬", val: sinRecordatorio.length, lbl: "Sin recordatorio", active: citasFiltro === "sinRecordatorio", onClick: () => { citasFiltro = citasFiltro === "sinRecordatorio" ? null : "sinRecordatorio"; renderCitasList(); } },
+  ]);
+
+  let citas = citasAll;
+  if (citasFiltro === "hoy") citas = hoy;
+  else if (citasFiltro === "semana") citas = semana;
+  else if (citasFiltro === "sinRecordatorio") citas = sinRecordatorio;
+
+  const list = document.getElementById("citasList");
+  if (!citas.length) {
+    list.innerHTML = citasAll.length
+      ? `<div class="empty">Ninguna cita coincide con este filtro.</div>`
+      : `<div class="empty">Sin citas todavía.<br><button class="btn primary small" id="btnEmptyNuevaCita" style="margin-top:0.8rem;">+ Crear la primera</button></div>`;
+    document.getElementById("btnEmptyNuevaCita")?.addEventListener("click", () => document.getElementById("btnNuevaCita").click());
+    updateCitasBadge(0);
+    return;
+  }
+  citas = [...citas].sort((a, b) => `${a.fecha}${a.hora}`.localeCompare(`${b.fecha}${b.hora}`));
+  list.innerHTML = citas.map(c => {
+    const cliente = clientes.find(cl => cl.id === c.clienteId);
+    const nombre = cliente?.nombre || c.nombreTmp || "Cliente";
+    const telefono = cliente?.telefono || c.telefonoTmp || "";
+    const { label, dt } = citaWhenInfo(c);
+    return `
+      <div class="cita-row" data-id="${c.id}">
+        <div class="cita-when"><div class="d">${label}</div><div class="t">${dt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</div></div>
+        <div class="cita-info">
+          <div class="who">${esc(nombre)} ${c.origen === "web" ? '<span class="mant-badge soon">Desde la web</span>' : ""}</div>
+          <div class="meta">${esc(c.motivo || "Sin motivo especificado")} · mecánico: ${esc(c.mecanico)}</div>
+        </div>
+        <button class="btn wa small" data-action="recordar" data-id="${c.id}" data-tel="${esc(telefono)}" data-nombre="${esc(nombre)}">${c.recordatorioEnviado ? "Recordatorio enviado ✓" : "Enviar recordatorio"}</button>
+        <button type="button" class="btn ghost small danger" data-action="eliminar" data-id="${c.id}" data-tel="${esc(telefono)}" data-nombre="${esc(nombre)}" title="Eliminar cita" aria-label="Eliminar cita">🗑</button>
+      </div>`;
+  }).join("");
+
+  list.querySelectorAll('[data-action="recordar"]').forEach(btn => {
+    btn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      const id = Number(btn.dataset.id);
+      const c = await DB.get("citas", id);
+      const { label, dt } = citaWhenInfo(c);
+      const texto = `Hola ${btn.dataset.nombre}, te recordamos tu cita en ENTIMOTORS el ${label === "Hoy" || label === "Mañana" ? label.toLowerCase() : dt.toLocaleDateString()} a las ${dt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}. ¡Te esperamos!`;
+      const sent = openWhatsApp(btn.dataset.tel, texto);
+      if (!sent) return;
+      await DB.save("citas", { ...c, recordatorioEnviado: true });
+      markDirty();
+      renderCitasList();
+    });
+  });
+
+  list.querySelectorAll('[data-action="eliminar"]').forEach(btn => {
+    btn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      const id = Number(btn.dataset.id);
+      const c = await DB.get("citas", id);
+      const { label, dt } = citaWhenInfo(c);
+      const texto = `Hola ${btn.dataset.nombre}, tu cita en ENTIMOTORS del ${label === "Hoy" || label === "Mañana" ? label.toLowerCase() : dt.toLocaleDateString()} a las ${dt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })} fue cancelada. Escríbenos para reprogramarla.`;
+      if (btn.dataset.tel) openWhatsApp(btn.dataset.tel, texto);
+      await DB.delete("citas", id);
+      markDirty();
+      toast("Cita eliminada" + (btn.dataset.tel ? " y aviso de cancelación abierto en WhatsApp" : ""));
+      renderCitasList();
+    });
+  });
+
+  const dueSoon = citasAll.filter(c => !c.recordatorioEnviado && citaWhenInfo(c).diffDays <= 1 && citaWhenInfo(c).diffDays >= 0).length;
+  updateCitasBadge(dueSoon);
+}
+
+function updateCitasBadge(n) {
+  const b = document.getElementById("citasBadge");
+  if (n > 0) { b.style.display = "inline-block"; b.textContent = n; } else { b.style.display = "none"; }
+}
+
+let citaClienteSel = null; // clienteId cuando se elige un cliente existente
+
+function renderCitaClienteChip() {
+  const wrap = document.getElementById("citaClienteChipWrap");
+  wrap.innerHTML = citaClienteSel
+    ? `<span class="selected-chip">Cliente existente seleccionado <button type="button" id="btnQuitarCitaClienteSel" title="Quitar selección" aria-label="Quitar cliente seleccionado">✕</button></span>`
+    : "";
+  document.getElementById("btnQuitarCitaClienteSel")?.addEventListener("click", () => {
+    citaClienteSel = null;
+    document.getElementById("citaBuscarCliente").value = "";
+    renderCitaClienteChip();
+  });
+}
+
+wireAutocompleteCliente(document.getElementById("citaBuscarCliente"), document.getElementById("citaBuscarClienteList"), (cliente) => {
+  citaClienteSel = cliente.id;
+  document.getElementById("citaNombre").value = cliente.nombre;
+  document.getElementById("citaTelefono").value = cliente.telefono || "";
+  renderCitaClienteChip();
+});
+document.getElementById("citaBuscarCliente").addEventListener("input", () => { citaClienteSel = null; renderCitaClienteChip(); });
+
+async function refreshCitaClienteSelect() {
+  document.getElementById("citaMecanico").innerHTML = TEAM.map(t => `<option value="${esc(t.nombre)}">${esc(t.nombre)}</option>`).join("");
+}
+
+document.getElementById("btnNuevaCita").addEventListener("click", async () => {
+  await refreshCitaClienteSelect();
+  citaClienteSel = null;
+  document.getElementById("citaBuscarCliente").value = "";
+  renderCitaClienteChip();
+  ["citaNombre", "citaTelefono", "citaFecha", "citaMotivo"].forEach(id => document.getElementById(id).value = "");
+  document.getElementById("citaFecha").min = new Date().toISOString().slice(0, 10); // evita agendar por error en una fecha ya pasada
+  await refreshCitaHoraOptions();
+  document.getElementById("modalCita").classList.add("active");
+});
+document.getElementById("btnCancelarCita").addEventListener("click", () => document.getElementById("modalCita").classList.remove("active"));
+
+alHacerClicUnaVez(document.getElementById("btnGuardarCita"), async () => {
+  const fecha = document.getElementById("citaFecha").value;
+  const hora = document.getElementById("citaHora").value;
+  const motivo = document.getElementById("citaMotivo").value.trim();
+  const mecanico = document.getElementById("citaMecanico").value;
+  if (!fecha) { toast("Elige una fecha", "off"); return; }
+  if (!hora) { toast("Elige una hora disponible", "off"); return; }
+
+  let clienteId = null, nombreTmp = "", telefonoTmp = "";
+  if (citaClienteSel) {
+    clienteId = citaClienteSel;
+  } else {
+    nombreTmp = document.getElementById("citaNombre").value.trim();
+    telefonoTmp = document.getElementById("citaTelefono").value.trim();
+    if (!nombreTmp) { toast("Falta el nombre del cliente", "off"); return; }
+  }
+
+  if (!(await checkCitaConflicto(fecha, hora, mecanico))) return;
+
+  const id = await DB.save("citas", { clienteId, nombreTmp, telefonoTmp, fecha, hora, motivo, mecanico, origen: "interna", recordatorioEnviado: false, creadoEn: Date.now() });
+  markDirty();
+  document.getElementById("modalCita").classList.remove("active");
+  toast("Cita guardada");
+
+  const mecanicoInfo = TEAM.find(t => t.nombre === mecanico);
+  const nombreCliente = clienteId ? (await DB.get("clientes", clienteId)).nombre : nombreTmp;
+  const texto = `Nueva cita asignada: ${nombreCliente} el ${new Date(`${fecha}T${hora}`).toLocaleDateString()} a las ${hora}. Motivo: ${motivo || "sin especificar"}.`;
+  if (mecanicoInfo?.telefono) {
+    openWhatsApp(mecanicoInfo.telefono, texto);
+  } else {
+    toast(`${mecanico} no tiene teléfono configurado en TEAM (app.js) — no se pudo abrir el aviso por WhatsApp`, "off");
+  }
+
+  renderCitasList();
+});
+
+/* ================= CLIENTES ================= */
+function mantStatus(moto) {
+  if (!moto?.mantenimiento?.fecha) return { cls: "none", label: "Sin programar" };
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const fecha = new Date(`${moto.mantenimiento.fecha}T00:00:00`);
+  const diffDays = Math.round((fecha - today) / 86400000);
+  if (diffDays < 0) return { cls: "due", label: `Venció (${fecha.toLocaleDateString()})` };
+  if (diffDays === 0) return { cls: "due", label: "Hoy" };
+  if (diffDays <= 7) return { cls: "soon", label: `En ${diffDays}d` };
+  return { cls: "ok", label: fecha.toLocaleDateString() };
+}
+
+/* ---- clientes duplicados: mismo nombre + mismo teléfono ---- */
+function dupKey(nombre, telefono) {
+  return `${(nombre || "").trim().toLowerCase()}|${(telefono || "").replace(/\D/g, "")}`;
+}
+function findDuplicateGroups(clientes) {
+  const groups = {};
+  for (const c of clientes) {
+    const k = dupKey(c.nombre, c.telefono);
+    if (!k.replace("|", "")) continue;
+    (groups[k] = groups[k] || []).push(c);
+  }
+  return Object.values(groups).filter(g => g.length > 1).map(g => g.sort((a, b) => a.id - b.id));
+}
+async function checkDuplicateBeforeCreate(nombre, telefono) {
+  if (!telefono) return true;
+  const clientes = await DB.getAll("clientes");
+  const key = dupKey(nombre, telefono);
+  const match = clientes.find(c => dupKey(c.nombre, c.telefono) === key);
+  if (!match) return true;
+  return showConfirm(`Ya existe un cliente "${match.nombre}" con ese mismo nombre y teléfono. ¿Crear un registro nuevo de todas formas? (Cancelar para elegir el existente en su lugar)`, { titulo: "Posible cliente duplicado", textoOk: "Crear de todas formas" });
+}
+async function mergeClientes(duplicateId, keepId) {
+  const [motos, ordenes, citas] = await Promise.all([DB.getAll("motos"), DB.getAll("ordenes"), DB.getAll("citas")]);
+  for (const m of motos.filter(x => x.clienteId === duplicateId)) { m.clienteId = keepId; await DB.save("motos", m); }
+  for (const o of ordenes.filter(x => x.clienteId === duplicateId)) { o.clienteId = keepId; await DB.save("ordenes", o); }
+  for (const c of citas.filter(x => x.clienteId === duplicateId)) { c.clienteId = keepId; await DB.save("citas", c); }
+  await DB.delete("clientes", duplicateId);
+  markDirty();
+}
+
+let clientesFiltro = null; // null | "motos" | "mantenimiento"
+
+async function renderClientes() {
+  const [clientesAll, motos] = await Promise.all([DB.getAll("clientes"), DB.getAll("motos")]);
+  const dupGroups = findDuplicateGroups(clientesAll);
+  const dupOf = {}; // clienteId -> id del registro que se conserva
+  dupGroups.forEach(g => g.slice(1).forEach(c => { dupOf[c.id] = g[0].id; }));
+
+  const conMoto = clientesAll.filter(c => motos.some(m => m.clienteId === c.id));
+  const conMantenimiento = clientesAll.filter(c => motos.some(m => m.clienteId === c.id && ["due", "soon"].includes(mantStatus(m).cls)));
+
+  renderWidgetRow("clientesWidgetRow", [
+    { ic: "👥", val: clientesAll.length, lbl: "Clientes", active: clientesFiltro === null, onClick: () => { clientesFiltro = null; renderClientes(); } },
+    { ic: "🏍️", val: motos.length, lbl: "Motos", active: clientesFiltro === "motos", onClick: () => { clientesFiltro = clientesFiltro === "motos" ? null : "motos"; renderClientes(); } },
+    { ic: "🛠️", val: countMantenimientos(motos), lbl: "Mantenimiento próximo", active: clientesFiltro === "mantenimiento", onClick: () => { clientesFiltro = clientesFiltro === "mantenimiento" ? null : "mantenimiento"; renderClientes(); } },
+  ]);
+
+  let clientes = clientesAll;
+  if (clientesFiltro === "motos") clientes = conMoto;
+  else if (clientesFiltro === "mantenimiento") clientes = conMantenimiento;
+
+  const body = document.getElementById("clientesBody");
+  document.getElementById("clientesEmpty").style.display = clientesAll.length ? "none" : "block";
+  if (clientesFiltro && !clientes.length) {
+    body.innerHTML = `<tr><td colspan="8" style="color:var(--text-faint); text-align:center; padding:1.5rem 0;">Ningún cliente coincide con este filtro.</td></tr>`;
+    return;
+  }
+  body.innerHTML = clientes.map(c => {
+    const m = motos.find(mm => mm.clienteId === c.id);
+    const st = mantStatus(m);
+    const isDup = dupOf[c.id] != null;
+    return `<tr class="cliente-row" data-id="${c.id}" style="cursor:pointer;">
+      <td>${m?.foto ? `<img class="thumb-sm" src="${m.foto}">` : ""}</td>
+      <td>${esc(c.nombre)} ${isDup ? '<span class="mant-badge due">Posible duplicado</span>' : ""}</td>
+      <td>${esc(c.telefono || "—")}</td>
+      <td>${m && (m.marca || m.modelo) ? esc((m.marca + " " + m.modelo).trim()) : "—"}</td>
+      <td>${esc(m?.placa || "—")}</td>
+      <td class="num">${m?.km ?? "—"}</td>
+      <td><span class="mant-badge ${st.cls}">${st.label}${m?.mantenimiento?.tipo ? ` · ${esc(m.mantenimiento.tipo)}` : ""}</span></td>
+      <td style="display:flex; gap:0.35rem; flex-wrap:wrap;">
+        ${m?.mantenimiento?.fecha ? `<button class="btn wa small" data-action="recordar-mant" data-moto="${m.id}" data-cliente="${c.id}">${m.mantenimiento.recordatorioEnviado ? "Enviado ✓" : "Recordar"}</button>` : ""}
+        ${isDup ? `<button class="btn small" data-action="unir" data-id="${c.id}" data-keep="${dupOf[c.id]}">Unir</button>` : ""}
+        <button type="button" class="btn ghost small danger" data-action="eliminar-cliente" data-id="${c.id}" title="Eliminar cliente" aria-label="Eliminar cliente">🗑</button>
+      </td>
+    </tr>`;
+  }).join("");
+
+  body.querySelectorAll('[data-action="recordar-mant"]').forEach(btn => {
+    btn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      const moto = await DB.get("motos", Number(btn.dataset.moto));
+      const cliente = await DB.get("clientes", Number(btn.dataset.cliente));
+      const fecha = new Date(`${moto.mantenimiento.fecha}T00:00:00`).toLocaleDateString();
+      const texto = `Hola ${cliente.nombre}, tu ${moto.marca} ${moto.modelo} tiene programado "${moto.mantenimiento.tipo || "mantenimiento"}" para el ${fecha}. ¿Agendamos tu cita?`;
+      const sent = openWhatsApp(cliente.telefono, texto);
+      if (!sent) return;
+      moto.mantenimiento.recordatorioEnviado = true;
+      await DB.save("motos", moto);
+      markDirty();
+      renderClientes();
+    });
+  });
+
+  body.querySelectorAll('[data-action="unir"]').forEach(btn => {
+    btn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      await mergeClientes(Number(btn.dataset.id), Number(btn.dataset.keep));
+      toast("Clientes unidos");
+      renderClientes();
+    });
+  });
+
+  body.querySelectorAll('[data-action="eliminar-cliente"]').forEach(btn => {
+    btn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      const id = Number(btn.dataset.id);
+      const tieneOrdenes = (await DB.getAll("ordenes")).some(o => o.clienteId === id);
+      const aviso = tieneOrdenes ? "Este cliente tiene órdenes registradas — se conservarán, pero quedarán sin cliente asociado. " : "";
+      if (!(await showConfirm(`${aviso}¿Eliminar este cliente y sus motos?`, { titulo: "Eliminar cliente", textoOk: "Eliminar" }))) return;
+      const motosDelCliente = (await DB.getAll("motos")).filter(m => m.clienteId === id);
+      for (const m of motosDelCliente) await DB.delete("motos", m.id);
+      await DB.delete("clientes", id);
+      markDirty();
+      toast("Cliente eliminado");
+      renderClientes();
+    });
+  });
+
+  body.querySelectorAll(".cliente-row").forEach(row => {
+    row.addEventListener("click", (e) => {
+      if (e.target.closest("button")) return;
+      openClienteDetalle(Number(row.dataset.id));
+    });
+  });
+}
+
+async function openClienteDetalle(id) {
+  const cliente = await DB.get("clientes", id);
+  if (!cliente) return;
+  const [motos, ordenes, citas] = await Promise.all([DB.getAll("motos"), DB.getAll("ordenes"), DB.getAll("citas")]);
+  const susMotos = motos.filter(m => m.clienteId === id);
+  const susOrdenes = ordenes.filter(o => o.clienteId === id).sort((a, b) => b.id - a.id);
+  const susCitas = citas.filter(c => c.clienteId === id);
+
+  document.getElementById("clienteDetalleTitulo").textContent = cliente.nombre;
+  document.getElementById("clienteDetalleSub").textContent = cliente.telefono || "Sin teléfono registrado";
+
+  document.getElementById("clienteDetalleMotos").innerHTML = susMotos.length ? susMotos.map(m => `
+    <div class="card" style="margin-bottom:0.6rem; display:flex; gap:0.8rem; align-items:center; flex-wrap:wrap;">
+      ${m.foto ? `<img class="thumb-sm" src="${m.foto}" style="width:44px;height:44px;">` : ""}
+      <div style="flex:1 1 160px;">
+        <b>${esc(m.marca)} ${esc(m.modelo)}</b> · placa ${esc(m.placa || "s/p")} · ${m.km || 0} km
+        <div class="mant-badge ${mantStatus(m).cls}" style="display:inline-block; margin-top:0.3rem;">${mantStatus(m).label}</div>
+      </div>
+      <button type="button" class="btn small seguir-mant-btn" data-moto-id="${m.id}">Dar seguimiento</button>
+    </div>`).join("") : `<p class="hint" style="margin:0;">Sin motos registradas.</p>`;
+  document.querySelectorAll("#clienteDetalleMotos .seguir-mant-btn").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const moto = susMotos.find(m => m.id === Number(btn.dataset.motoId));
+      abrirNuevaOrdenParaMoto(cliente, moto);
+    });
+  });
+
+  document.getElementById("clienteDetalleOrdenes").innerHTML = susOrdenes.length ? susOrdenes.map(o => {
+    const total = (o.items || []).reduce((s, it) => s + it.cantidad * it.precio, 0);
+    return `<div class="order-row" data-id="${o.id}" style="cursor:pointer;">
+      <span class="pill ${o.estado}">${STAGES.find(s => s.key === o.estado)?.label ?? o.estado}</span>
+      <div class="order-info"><div class="moto">Orden #${o.id}</div><div class="meta">${new Date(o.creadoEn).toLocaleDateString()}</div></div>
+      <span class="amount">${money(total)}</span>
+    </div>`;
+  }).join("") : `<p class="hint" style="margin:0;">Sin órdenes todavía.</p>`;
+  document.querySelectorAll("#clienteDetalleOrdenes .order-row").forEach(row => {
+    row.addEventListener("click", () => {
+      document.getElementById("modalClienteDetalle").classList.remove("active");
+      openOrder(Number(row.dataset.id));
+      showView("detalle");
+    });
+  });
+
+  document.getElementById("clienteDetalleCitas").innerHTML = susCitas.length
+    ? susCitas.map(c => `<div class="hint cita-mini-row" data-id="${c.id}" style="margin:0 0 0.3rem; cursor:pointer; text-decoration:underline; text-underline-offset:2px;">${c.fecha} ${c.hora} — ${esc(c.motivo || "sin motivo")}</div>`).join("")
+    : `<p class="hint" style="margin:0;">Sin citas registradas.</p>`;
+  document.querySelectorAll("#clienteDetalleCitas .cita-mini-row").forEach(row => {
+    row.addEventListener("click", () => irACitaDesdeClienteDetalle(Number(row.dataset.id)));
+  });
+
+  document.getElementById("modalClienteDetalle").classList.add("active");
+}
+
+function abrirNuevaOrdenParaMoto(cliente, moto) {
+  document.getElementById("modalClienteDetalle").classList.remove("active");
+  document.getElementById("btnNuevaOrden").click();
+  ordenClienteSel = { clienteId: cliente.id, motoId: moto?.id || null };
+  document.getElementById("ordenBuscarCliente").value = cliente.nombre;
+  document.getElementById("ordenNombre").value = cliente.nombre;
+  document.getElementById("ordenTelefono").value = cliente.telefono || "";
+  document.getElementById("ordenPlaca").value = moto?.placa || "";
+  document.getElementById("ordenMarca").value = moto?.marca || "";
+  document.getElementById("ordenModelo").value = moto?.modelo || "";
+  document.getElementById("ordenKm").value = moto?.km || 0;
+  renderOrdenClienteChip();
+}
+
+async function irACitaDesdeClienteDetalle(citaId) {
+  document.getElementById("modalClienteDetalle").classList.remove("active");
+  citasFiltro = null;
+  showView("citas");
+  await renderCitasList();
+  const row = document.querySelector(`.cita-row[data-id="${citaId}"]`);
+  if (!row) { toast("Esa cita ya no existe", "off"); return; }
+  row.scrollIntoView({ behavior: "smooth", block: "center" });
+  row.classList.add("flash-highlight");
+  setTimeout(() => row.classList.remove("flash-highlight"), 1800);
+}
+
+document.getElementById("btnNuevoCliente").addEventListener("click", () => {
+  ["clienteNombre", "clienteTelefono", "clienteMarca", "clienteModelo", "clienteCilindraje", "clientePlaca", "clienteKm", "clienteMantFecha", "clienteMantTipo"].forEach(id => document.getElementById(id).value = "");
+  document.getElementById("clienteFoto").value = "";
+  document.getElementById("modalCliente").classList.add("active");
+});
+document.getElementById("btnEmptyNuevoCliente").addEventListener("click", () => document.getElementById("btnNuevoCliente").click());
+document.getElementById("btnCancelarCliente").addEventListener("click", () => document.getElementById("modalCliente").classList.remove("active"));
+document.getElementById("btnCerrarClienteDetalle").addEventListener("click", () => document.getElementById("modalClienteDetalle").classList.remove("active"));
+alHacerClicUnaVez(document.getElementById("btnGuardarCliente"), async () => {
+  const nombre = document.getElementById("clienteNombre").value.trim();
+  const telefono = document.getElementById("clienteTelefono").value.trim();
+  if (!nombre) { toast("Falta el nombre", "off"); return; }
+  if (!(await checkDuplicateBeforeCreate(nombre, telefono))) return;
+  const clienteId = await DB.save("clientes", { nombre, telefono });
+  markDirty();
+
+  const fotoFile = document.getElementById("clienteFoto").files[0];
+  const foto = fotoFile ? await fileToDataUrl(fotoFile) : null;
+  const mantFecha = document.getElementById("clienteMantFecha").value;
+
+  await DB.save("motos", {
+    clienteId,
+    marca: document.getElementById("clienteMarca").value.trim(),
+    modelo: document.getElementById("clienteModelo").value.trim(),
+    cilindraje: document.getElementById("clienteCilindraje").value.trim(),
+    placa: document.getElementById("clientePlaca").value.trim(),
+    km: Number(document.getElementById("clienteKm").value) || 0,
+    foto,
+    mantenimiento: mantFecha ? { fecha: mantFecha, tipo: document.getElementById("clienteMantTipo").value.trim(), recordatorioEnviado: false } : null,
+  });
+  markDirty();
+  document.getElementById("modalCliente").classList.remove("active");
+  toast("Cliente y moto guardados");
+  renderClientes();
+});
+
+/* ================= INVENTARIO ================= */
+let inventarioFiltro = null; // null | "stockBajo"
+
+async function renderInventario() {
+  const invAll = await DB.getAll("inventario");
+  const stockBajo = invAll.filter(r => r.cantidad <= (r.stockMinimo ?? 3));
+  const valorTotal = invAll.reduce((s, r) => s + r.cantidad * r.precio, 0);
+
+  renderWidgetRow("inventarioWidgetRow", [
+    { ic: "📦", val: invAll.length, lbl: "Repuestos", active: inventarioFiltro === null, onClick: () => { inventarioFiltro = null; renderInventario(); } },
+    { ic: "⚠️", val: stockBajo.length, lbl: "Stock bajo", active: inventarioFiltro === "stockBajo", onClick: () => { inventarioFiltro = inventarioFiltro === "stockBajo" ? null : "stockBajo"; renderInventario(); } },
+    { ic: "💰", val: money(valorTotal), lbl: "Valor en inventario" },
+  ]);
+
+  const inv = inventarioFiltro === "stockBajo" ? stockBajo : invAll;
+
+  const body = document.getElementById("inventarioBody");
+  document.getElementById("inventarioEmpty").style.display = invAll.length ? "none" : "block";
+  if (inventarioFiltro && !inv.length) {
+    body.innerHTML = `<tr><td colspan="5" style="color:var(--text-faint); text-align:center; padding:1.5rem 0;">Ningún repuesto coincide con este filtro.</td></tr>`;
+    return;
+  }
+  body.innerHTML = inv.map(r => `
+    <tr class="rep-row" data-id="${r.id}">
+      <td style="display:flex; align-items:center; gap:0.5rem; cursor:pointer;">${r.foto ? `<img class="thumb-sm" src="${r.foto}">` : ""}${esc(r.nombre)}</td>
+      <td style="cursor:pointer;">${esc(r.modelo || "Todos")}</td>
+      <td class="num" style="cursor:pointer;">${r.cantidad}</td>
+      <td class="num" style="cursor:pointer;">${money(r.precio)}</td>
+      <td><label style="display:flex; align-items:center; gap:0.4rem; cursor:pointer; margin:0;"><input type="checkbox" class="chk-publicar" data-id="${r.id}" ${r.publicarEnWeb ? "checked" : ""} style="width:1.05rem; height:1.05rem; margin:0; accent-color:var(--red);"></label></td>
+    </tr>`).join("");
+
+  body.querySelectorAll(".rep-row td:not(:last-child)").forEach(td => {
+    td.addEventListener("click", () => openRepuestoDetalle(Number(td.closest("tr").dataset.id)));
+  });
+  body.querySelectorAll(".chk-publicar").forEach(chk => {
+    chk.addEventListener("click", (e) => e.stopPropagation());
+    chk.addEventListener("change", async () => {
+      const r = await DB.get("inventario", Number(chk.dataset.id));
+      r.publicarEnWeb = chk.checked;
+      await DB.save("inventario", r);
+      markDirty();
+      toast(chk.checked ? `"${r.nombre}" ahora se muestra en la web` : `"${r.nombre}" ya no se muestra en la web`);
+    });
+  });
+}
+
+async function refreshCategoriaSelect(selected) {
+  const cats = await DB.getAll("categorias_inv");
+  const sel = document.getElementById("repuestoCategoria");
+  sel.innerHTML = `<option value="">Sin categoría</option>` + cats.map(c => `<option value="${c.id}">${esc(c.nombre)}</option>`).join("");
+  sel.value = selected ?? "";
+}
+
+let repDetalleActualId = null;
+async function openRepuestoDetalle(id) {
+  const r = await DB.get("inventario", id);
+  if (!r) return;
+  repDetalleActualId = id;
+  document.getElementById("repDetalleNombre").textContent = r.nombre;
+  document.getElementById("repDetalleModelo").textContent = `Modelo compatible: ${r.modelo || "Todos"}`;
+  document.getElementById("repDetalleCantidad").textContent = r.cantidad;
+  document.getElementById("repDetallePrecio").textContent = money(r.precio);
+  document.getElementById("repDetalleFotoWrap").innerHTML = r.foto ? `<img src="${r.foto}" style="width:100%; max-height:220px; object-fit:cover; border-radius:0.6rem; border:1px solid var(--border);">` : "";
+  document.getElementById("modalRepuestoDetalle").classList.add("active");
+}
+document.getElementById("btnCerrarRepuestoDetalle").addEventListener("click", () => document.getElementById("modalRepuestoDetalle").classList.remove("active"));
+document.getElementById("btnEditarRepuesto").addEventListener("click", async () => {
+  const r = await DB.get("inventario", repDetalleActualId);
+  if (!r) return;
+  repuestoEditId = r.id;
+  document.getElementById("repuestoNombre").value = r.nombre || "";
+  document.getElementById("repuestoModelo").value = r.modelo || "";
+  document.getElementById("repuestoCantidad").value = r.cantidad || 0;
+  document.getElementById("repuestoPrecio").value = r.precio || 0;
+  document.getElementById("repuestoCosto").value = r.costoCompra || 0;
+  document.getElementById("repuestoStockMinimo").value = r.stockMinimo ?? 3;
+  document.getElementById("repuestoCodigoBarras").value = r.codigoBarras || "";
+  document.getElementById("repuestoPublicarWeb").checked = !!r.publicarEnWeb;
+  document.getElementById("repuestoFoto").value = "";
+  await refreshCategoriaSelect(r.categoriaId);
+  document.getElementById("modalRepuestoDetalle").classList.remove("active");
+  document.getElementById("modalRepuesto").classList.add("active");
+});
+
+let repuestoEditId = null;
+document.getElementById("btnNuevoRepuesto").addEventListener("click", async () => {
+  repuestoEditId = null;
+  ["repuestoNombre", "repuestoModelo", "repuestoPrecio", "repuestoCodigoBarras"].forEach(id => document.getElementById(id).value = "");
+  document.getElementById("repuestoCantidad").value = 1;
+  document.getElementById("repuestoCosto").value = 0;
+  document.getElementById("repuestoStockMinimo").value = 3;
+  document.getElementById("repuestoPublicarWeb").checked = false;
+  document.getElementById("repuestoFoto").value = "";
+  await refreshCategoriaSelect();
+  document.getElementById("modalRepuesto").classList.add("active");
+});
+document.getElementById("btnEmptyNuevoRepuesto").addEventListener("click", () => document.getElementById("btnNuevoRepuesto").click());
+document.getElementById("btnCancelarRepuesto").addEventListener("click", () => document.getElementById("modalRepuesto").classList.remove("active"));
+
+document.getElementById("btnNuevaCategoriaInv").addEventListener("click", async () => {
+  const nombre = await showPrompt("Nombre de la categoría", { titulo: "Nueva categoría" });
+  if (!nombre) return;
+  const id = await DB.save("categorias_inv", { nombre });
+  markDirty();
+  await refreshCategoriaSelect(id);
+});
+
+alHacerClicUnaVez(document.getElementById("btnGuardarRepuesto"), async () => {
+  const nombre = document.getElementById("repuestoNombre").value.trim();
+  if (!nombre) { toast("Falta el nombre del repuesto", "off"); return; }
+  const fotoFile = document.getElementById("repuestoFoto").files[0];
+  const foto = fotoFile ? await fileToDataUrl(fotoFile) : (repuestoEditId ? (await DB.get("inventario", repuestoEditId))?.foto : null);
+  const precio = Number(document.getElementById("repuestoPrecio").value) || 0;
+  const cantidad = Number(document.getElementById("repuestoCantidad").value) || 0;
+  const costoCompra = Number(document.getElementById("repuestoCosto").value) || 0;
+  const stockMinimo = Number(document.getElementById("repuestoStockMinimo").value) || 0;
+  if (precio < 0 || cantidad < 0 || costoCompra < 0 || stockMinimo < 0) {
+    toast("El precio, la cantidad, el costo y el stock mínimo no pueden ser negativos", "off");
+    return;
+  }
+  const registro = {
+    nombre,
+    modelo: document.getElementById("repuestoModelo").value.trim(),
+    cantidad,
+    precio,
+    precioVenta: precio,
+    costoCompra,
+    stockMinimo,
+    codigoBarras: document.getElementById("repuestoCodigoBarras").value.trim(),
+    categoriaId: document.getElementById("repuestoCategoria").value ? Number(document.getElementById("repuestoCategoria").value) : null,
+    publicarEnWeb: document.getElementById("repuestoPublicarWeb").checked,
+    foto,
+  };
+  if (repuestoEditId) registro.id = repuestoEditId;
+  await DB.save("inventario", registro);
+  markDirty();
+  document.getElementById("modalRepuesto").classList.remove("active");
+  toast(repuestoEditId ? "Repuesto actualizado" : "Repuesto agregado");
+  repuestoEditId = null;
+  renderInventario();
+});
+
+document.getElementById("btnExportarCSV").addEventListener("click", async () => {
+  const inv = await DB.getAll("inventario");
+  if (!inv.length) { toast("El inventario está vacío", "off"); return; }
+  const csv = ["nombre,cantidad,precio,modelo", ...inv.map(r => [r.nombre, r.cantidad, r.precio, r.modelo || ""].map(v => `"${String(v).replace(/"/g, '""')}"`).join(","))].join("\n");
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `inventario_entimotors_${new Date().toISOString().slice(0, 10)}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+  toast("CSV exportado");
+});
+
+document.getElementById("csvInput").addEventListener("change", async (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const text = await file.text();
+  const rows = text.split(/\r?\n/).map(r => r.trim()).filter(Boolean);
+  let count = 0;
+  for (const row of rows) {
+    const [nombre, cantidad, precio, modelo] = row.split(",").map(s => (s || "").trim());
+    if (!nombre || nombre.toLowerCase() === "nombre") continue;
+    await DB.save("inventario", { nombre, modelo: modelo || "", cantidad: Number(cantidad) || 0, precio: Number(precio) || 0 });
+    count++;
+  }
+  markDirty();
+  e.target.value = "";
+  toast(`${count} repuestos importados del CSV`);
+  renderInventario();
+});
+
+/* ================= VENTA RÁPIDA (TPV) ================= */
+let posCarrito = []; // { inventarioId|null, nombre, cantidad, precio, stockDisponible }
+let posCategoriaFiltro = null;
+let posBusqueda = "";
+
+async function refreshPosClienteSelect() {
+  const clientes = await DB.getAll("clientes");
+  const sel = document.getElementById("posCliente");
+  const actual = sel.value;
+  sel.innerHTML = `<option value="">Cliente de mostrador</option>` + clientes.map(c => `<option value="${c.id}">${esc(c.nombre)}</option>`).join("");
+  sel.value = actual;
+}
+
+async function renderPOS() {
+  const [inv, cats] = await Promise.all([DB.getAll("inventario"), DB.getAll("categorias_inv")]);
+  await refreshPosClienteSelect();
+
+  document.getElementById("posCategorias").innerHTML = [{ id: null, nombre: "Todas" }, ...cats].map(c => `
+    <button type="button" class="cat-chip ${posCategoriaFiltro === c.id ? "active" : ""}" data-cat="${c.id ?? ""}">${esc(c.nombre)}</button>
+  `).join("");
+  document.getElementById("posCategorias").querySelectorAll(".cat-chip").forEach(btn => {
+    btn.addEventListener("click", () => {
+      posCategoriaFiltro = btn.dataset.cat === "" ? null : Number(btn.dataset.cat);
+      renderPOS();
+    });
+  });
+
+  const q = posBusqueda.trim().toLowerCase();
+  const productos = inv.filter(r => {
+    if (posCategoriaFiltro !== null && r.categoriaId !== posCategoriaFiltro) return false;
+    if (!q) return true;
+    return r.nombre.toLowerCase().includes(q) || (r.codigoBarras || "").toLowerCase().includes(q);
+  });
+
+  const grid = document.getElementById("posGrid");
+  grid.innerHTML = productos.length ? productos.map(r => `
+    <button type="button" class="pos-prod" data-id="${r.id}" ${r.cantidad <= 0 ? "disabled" : ""}>
+      ${r.foto ? `<img src="${r.foto}">` : `<div style="height:70px; display:flex; align-items:center; justify-content:center; background:var(--panel-strong); border-radius:0.4rem; font-size:1.6rem;">🔧</div>`}
+      <span class="nom">${esc(r.nombre)}</span>
+      <span class="pr">${money(r.precio)}</span>
+      <span class="st">${r.cantidad > 0 ? `${r.cantidad} en stock` : "Sin stock"}</span>
+    </button>`).join("") : `<div class="empty">Ningún repuesto coincide con la búsqueda.</div>`;
+
+  grid.querySelectorAll(".pos-prod").forEach(btn => {
+    btn.addEventListener("click", () => agregarAlCarritoPOS(Number(btn.dataset.id)));
+  });
+
+  renderPosCarrito();
+}
+
+async function agregarAlCarritoPOS(inventarioId) {
+  const r = await DB.get("inventario", inventarioId);
+  if (!r || r.cantidad <= 0) return;
+  const existente = posCarrito.find(it => it.inventarioId === inventarioId);
+  const enCarrito = existente ? existente.cantidad : 0;
+  if (enCarrito + 1 > r.cantidad) { toast(`Solo hay ${r.cantidad} en stock de "${r.nombre}"`, "off"); return; }
+  if (existente) existente.cantidad++;
+  else posCarrito.push({ inventarioId, nombre: r.nombre, cantidad: 1, precio: r.precio, stockDisponible: r.cantidad });
+  renderPosCarrito();
+}
+
+function renderPosCarrito() {
+  const el = document.getElementById("posCarrito");
+  if (!posCarrito.length) {
+    el.innerHTML = `<div class="empty" style="padding:1rem 0;">Toca un producto para agregarlo</div>`;
+  } else {
+    el.innerHTML = posCarrito.map((it, i) => `
+      <div class="pos-cart-item">
+        <span class="nom">${esc(it.nombre)}</span>
+        <div class="pos-qty">
+          <button type="button" data-menos="${i}" aria-label="Restar cantidad">−</button>
+          <span>${it.cantidad}</span>
+          <button type="button" data-mas="${i}" aria-label="Sumar cantidad">+</button>
+        </div>
+        <span style="width:70px; text-align:right;">${money(it.cantidad * it.precio)}</span>
+        <button type="button" class="btn ghost small danger" data-quitar="${i}" title="Quitar" aria-label="Quitar del carrito">🗑</button>
+      </div>`).join("");
+    el.querySelectorAll("[data-mas]").forEach(b => b.addEventListener("click", () => {
+      const it = posCarrito[Number(b.dataset.mas)];
+      if (it.inventarioId && it.cantidad + 1 > it.stockDisponible) { toast(`Solo hay ${it.stockDisponible} en stock`, "off"); return; }
+      it.cantidad++; renderPosCarrito();
+    }));
+    el.querySelectorAll("[data-menos]").forEach(b => b.addEventListener("click", () => {
+      const it = posCarrito[Number(b.dataset.menos)];
+      it.cantidad--; if (it.cantidad <= 0) posCarrito.splice(Number(b.dataset.menos), 1);
+      renderPosCarrito();
+    }));
+    el.querySelectorAll("[data-quitar]").forEach(b => b.addEventListener("click", () => {
+      posCarrito.splice(Number(b.dataset.quitar), 1); renderPosCarrito();
+    }));
+  }
+
+  const total = posCarrito.reduce((s, it) => s + it.cantidad * it.precio, 0);
+  document.getElementById("posTotal").textContent = money(total);
+  actualizarCambioPOS();
+}
+
+function actualizarCambioPOS() {
+  const total = posCarrito.reduce((s, it) => s + it.cantidad * it.precio, 0);
+  const metodo = document.getElementById("posMetodo").value;
+  document.getElementById("posEfectivoBox").style.display = metodo === "efectivo" ? "block" : "none";
+  const recibido = Number(document.getElementById("posEfectivoRecibido").value) || 0;
+  document.getElementById("posCambio").textContent = money(Math.max(0, recibido - total));
+}
+
+document.getElementById("posBuscar").addEventListener("input", (e) => { posBusqueda = e.target.value; renderPOS(); });
+document.getElementById("posMetodo").addEventListener("change", actualizarCambioPOS);
+document.getElementById("posEfectivoRecibido").addEventListener("input", actualizarCambioPOS);
+
+alHacerClicUnaVez(document.getElementById("btnCobrar"), async () => {
+  if (!posCarrito.length) { toast("El carrito está vacío", "off"); return; }
+  const metodoPago = document.getElementById("posMetodo").value;
+  const efectivoRecibido = Number(document.getElementById("posEfectivoRecibido").value) || 0;
+  const total = posCarrito.reduce((s, it) => s + it.cantidad * it.precio, 0);
+  if (metodoPago === "efectivo" && efectivoRecibido < total) { toast("El efectivo recibido es menor que el total", "off"); return; }
+  const clienteId = document.getElementById("posCliente").value ? Number(document.getElementById("posCliente").value) : null;
+
+  try {
+    const { id, venta } = await registrarVentaRapida({
+      items: posCarrito.map(it => ({ inventarioId: it.inventarioId, nombre: it.nombre, cantidad: it.cantidad, precio: it.precio })),
+      clienteId, metodoPago, efectivoRecibido,
+    });
+    markDirty();
+    imprimirTicketPOS(id, venta);
+    toast(`Venta #${id} registrada por ${money(total)}`);
+    posCarrito = [];
+    document.getElementById("posEfectivoRecibido").value = "";
+    renderPOS();
+    renderDashboard();
+  } catch (err) {
+    toast("No se pudo registrar la venta: " + err.message, "off");
+  }
+});
+
+function imprimirTicketPOS(ventaId, venta) {
+  document.getElementById("ticketFecha").textContent = new Date(venta.fechaISO).toLocaleString("es-HN");
+  document.getElementById("ticketItems").innerHTML = venta.items.map(it => `
+    <div class="ticket-item-row"><span>${esc(it.nombre)} x${it.cantidad}</span><span>${money(it.cantidad * it.precio)}</span></div>
+  `).join("");
+  document.getElementById("ticketTotal").textContent = money(venta.total);
+  document.getElementById("ticketMetodo").textContent = { efectivo: "Efectivo", transferencia: "Transferencia", tarjeta: "Tarjeta" }[venta.metodoPago] || venta.metodoPago;
+  document.getElementById("ticketCambioRow").style.display = venta.metodoPago === "efectivo" ? "flex" : "none";
+  document.getElementById("ticketCambio").textContent = money(venta.cambio || 0);
+  document.body.classList.add("print-ticket");
+  window.print();
+  setTimeout(() => document.body.classList.remove("print-ticket"), 300);
+}
+
+/* ================= FINANZAS Y CAJA CHICA ================= */
+async function renderFinanzas() {
+  const movs = await DB.getAll("caja_movimientos");
+  const desdeEl = document.getElementById("finDesde");
+  const hastaEl = document.getElementById("finHasta");
+  if (!desdeEl.value) {
+    const d = new Date(); d.setDate(d.getDate() - 30);
+    desdeEl.value = d.toISOString().slice(0, 10);
+  }
+  if (!hastaEl.value) hastaEl.value = new Date().toISOString().slice(0, 10);
+
+  const desde = desdeEl.value, hasta = hastaEl.value, tipoFiltro = document.getElementById("finTipoFiltro").value;
+  const filtrados = movs.filter(m => {
+    const dia = m.fechaISO.slice(0, 10);
+    if (dia < desde || dia > hasta) return false;
+    if (tipoFiltro && m.tipo !== tipoFiltro) return false;
+    return true;
+  }).sort((a, b) => b.fechaISO.localeCompare(a.fechaISO));
+
+  const ingresos = filtrados.filter(m => m.tipo === "ingreso").reduce((s, m) => s + m.monto, 0);
+  const egresos = filtrados.filter(m => m.tipo === "egreso").reduce((s, m) => s + m.monto, 0);
+
+  // Costo estimado: costoCompra de los repuestos vendidos por TPV en el rango filtrado.
+  const ventas = (await DB.getAll("ventas_rapidas")).filter(v => { const d = v.fechaISO.slice(0, 10); return d >= desde && d <= hasta; });
+  let costoVentas = 0;
+  const inv = await DB.getAll("inventario");
+  ventas.forEach(v => v.items.forEach(it => {
+    if (!it.inventarioId) return;
+    const rep = inv.find(r => r.id === it.inventarioId);
+    if (rep) costoVentas += (rep.costoCompra || 0) * it.cantidad;
+  }));
+  const costosTotal = egresos + costoVentas;
+  const utilidad = ingresos - costosTotal;
+  const margen = ingresos > 0 ? (utilidad / ingresos) * 100 : 0;
+
+  document.getElementById("finanzasResumen").innerHTML = `
+    <div class="widget-card tint-green"><span class="eyebrow">Ingresos totales</span><span class="big">${money(ingresos)}</span><span class="sub">En el rango filtrado</span></div>
+    <div class="widget-card tint-red"><span class="eyebrow">Costos</span><span class="big">${money(costosTotal)}</span><span class="sub">Egresos + costo de repuestos vendidos</span></div>
+    <div class="widget-card ${utilidad >= 0 ? "tint-green" : "tint-red"}"><span class="eyebrow">Utilidad neta</span><span class="big">${money(utilidad)}</span><span class="sub">Ingresos − costos</span></div>
+    <div class="widget-card"><span class="eyebrow" style="color:var(--text-faint);">Margen promedio</span><span class="big">${margen.toFixed(1)}%</span><span class="sub">Utilidad / ingresos</span></div>
+  `;
+
+  const body = document.getElementById("movimientosBody");
+  document.getElementById("movimientosEmpty").style.display = filtrados.length ? "none" : "block";
+  body.innerHTML = filtrados.map(m => `
+    <tr>
+      <td>${new Date(m.fechaISO).toLocaleDateString("es-HN")}</td>
+      <td><span class="pill ${m.tipo === "ingreso" ? "entregado" : "reparacion"}">${m.tipo === "ingreso" ? "Ingreso" : "Egreso"}</span></td>
+      <td>${esc(m.categoria)}</td>
+      <td>${esc(m.descripcion || "")}</td>
+      <td class="num">${money(m.monto)}</td>
+      <td class="num"><button type="button" class="btn ghost small danger" data-eliminar-movi="${m.id}" title="Eliminar" aria-label="Eliminar movimiento">🗑</button></td>
+    </tr>`).join("");
+  body.querySelectorAll("[data-eliminar-movi]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      requestAdminCode(async () => {
+        await DB.delete("caja_movimientos", Number(btn.dataset.eliminarMovi));
+        markDirty();
+        toast("Movimiento eliminado");
+        renderFinanzas();
+        renderDashboard();
+      });
+    });
+  });
+
+  await renderFinanzasCharts();
+}
+
+document.getElementById("btnFiltrarFinanzas").addEventListener("click", renderFinanzas);
+alHacerClicUnaVez(document.getElementById("btnGuardarMovimiento"), async () => {
+  const monto = Number(document.getElementById("moviMonto").value) || 0;
+  if (monto <= 0) { toast("El monto debe ser mayor a cero", "off"); return; }
+  await DB.save("caja_movimientos", {
+    tipo: document.getElementById("moviTipo").value,
+    categoria: document.getElementById("moviCategoria").value,
+    monto,
+    descripcion: document.getElementById("moviDescripcion").value.trim(),
+    fechaISO: new Date().toISOString(), creadoEn: Date.now(),
+  });
+  markDirty();
+  document.getElementById("moviMonto").value = "";
+  document.getElementById("moviDescripcion").value = "";
+  toast("Movimiento registrado");
+  renderFinanzas();
+  renderDashboard();
+});
+
+document.getElementById("btnImprimirCierre").addEventListener("click", async () => {
+  const hoyStr = new Date().toISOString().slice(0, 10);
+  const movsHoy = (await DB.getAll("caja_movimientos")).filter(m => m.fechaISO.slice(0, 10) === hoyStr).sort((a, b) => a.fechaISO.localeCompare(b.fechaISO));
+
+  if (!movsHoy.length) { toast("No hay movimientos registrados hoy todavía", "off"); return; }
+
+  document.getElementById("cierreFecha").textContent = new Date().toLocaleDateString("es-HN", { day: "2-digit", month: "long", year: "numeric" });
+  document.getElementById("cierreItems").innerHTML = movsHoy.map(m => `
+    <tr>
+      <td>${new Date(m.fechaISO).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</td>
+      <td>${m.tipo === "ingreso" ? "Ingreso" : "Egreso"}</td>
+      <td>${esc(m.categoria)}</td>
+      <td class="num">${money(m.monto)}</td>
+    </tr>`).join("");
+
+  const ingresos = movsHoy.filter(m => m.tipo === "ingreso").reduce((s, m) => s + m.monto, 0);
+  const egresos = movsHoy.filter(m => m.tipo === "egreso").reduce((s, m) => s + m.monto, 0);
+  document.getElementById("cierreIngresos").textContent = money(ingresos);
+  document.getElementById("cierreEgresos").textContent = money(egresos);
+  document.getElementById("cierreNeto").textContent = money(ingresos - egresos);
+
+  const metodos = ["efectivo", "transferencia", "tarjeta"];
+  document.getElementById("cierrePorMetodo").innerHTML = metodos.map(met => {
+    const total = movsHoy.filter(m => m.tipo === "ingreso" && m.metodoPago === met).reduce((s, m) => s + m.monto, 0);
+    return `<div style="display:flex; justify-content:space-between; font-size:0.9rem;"><span>${met[0].toUpperCase() + met.slice(1)}</span><span>${money(total)}</span></div>`;
+  }).join("");
+
+  document.body.classList.add("print-cierre");
+  window.print();
+  setTimeout(() => document.body.classList.remove("print-cierre"), 300);
+});
+
+/* ================= GESTOR DE LA WEB (CMS local) ================= */
+async function renderWebCMS() {
+  const [hero, promos, servicios, citasAll, clientes] = await Promise.all([
+    DB.get("web_cms", "landing_hero"), DB.get("web_cms", "promociones"), DB.get("web_cms", "servicios_catalogo"),
+    DB.getAll("citas"), DB.getAll("clientes"),
+  ]);
+  document.getElementById("cmsHeroTitulo").value = hero?.titulo || "";
+  document.getElementById("cmsHeroSubtitulo").value = hero?.subtitulo || "";
+  document.getElementById("cmsPromos").value = (promos?.items || []).join("\n");
+  document.getElementById("cmsServicios").value = (servicios?.items || []).join("\n");
+
+  const citasWeb = citasAll.filter(c => c.origen === "web");
+  const list = document.getElementById("citasWebList");
+  if (!citasWeb.length) {
+    list.innerHTML = `<div class="empty">No hay citas agendadas desde la página web todavía.</div>`;
+  } else {
+    citasWeb.sort((a, b) => `${a.fecha}${a.hora}`.localeCompare(`${b.fecha}${b.hora}`));
+    list.innerHTML = citasWeb.map(c => {
+      const cliente = clientes.find(cl => cl.id === c.clienteId);
+      const nombre = cliente?.nombre || c.nombreTmp || "Cliente web";
+      const telefono = cliente?.telefono || c.telefonoTmp || "";
+      const { label, dt } = citaWhenInfo(c);
+      return `
+        <div class="cms-row">
+          <div class="who">
+            <b>${esc(nombre)}</b> · ${label}, ${dt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+            <div class="hint" style="margin:0;">${esc(c.motivo || "Sin motivo especificado")}</div>
+          </div>
+          ${c.confirmada ? `<span class="mant-badge ok">Confirmada</span>` : `<button class="btn wa small" data-confirmar="${c.id}" data-tel="${esc(telefono)}" data-nombre="${esc(nombre)}">Confirmar por WhatsApp</button>`}
+        </div>`;
+    }).join("");
+    list.querySelectorAll("[data-confirmar]").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        const c = await DB.get("citas", Number(btn.dataset.confirmar));
+        const { label, dt } = citaWhenInfo(c);
+        const texto = `Hola ${btn.dataset.nombre}, confirmamos tu cita en ENTIMOTORS el ${label === "Hoy" || label === "Mañana" ? label.toLowerCase() : dt.toLocaleDateString()} a las ${dt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}. ¡Te esperamos!`;
+        const sent = openWhatsApp(btn.dataset.tel, texto);
+        if (!sent) return;
+        await DB.save("citas", { ...c, confirmada: true });
+        markDirty();
+        renderWebCMS();
+      });
+    });
+  }
+  updateCitasWebBadge(citasWeb.filter(c => !c.confirmada).length);
+}
+
+function updateCitasWebBadge(n) {
+  const b = document.getElementById("citasWebBadge");
+  if (n > 0) { b.style.display = "inline-block"; b.textContent = n; } else { b.style.display = "none"; }
+}
+
+document.getElementById("btnGuardarCMS").addEventListener("click", async () => {
+  await DB.save("web_cms", { key: "landing_hero", titulo: document.getElementById("cmsHeroTitulo").value.trim(), subtitulo: document.getElementById("cmsHeroSubtitulo").value.trim() });
+  await DB.save("web_cms", { key: "promociones", items: document.getElementById("cmsPromos").value.split("\n").map(s => s.trim()).filter(Boolean) });
+  await DB.save("web_cms", { key: "servicios_catalogo", items: document.getElementById("cmsServicios").value.split("\n").map(s => s.trim()).filter(Boolean) });
+  markDirty();
+  toast("Contenido guardado (local — publicarlo en entimotors.com real requiere el backend del sitio)");
+});
+
+/* ================= AJUSTES: respaldo, restauración, reset, permisos ================= */
+function aplicarPermisosPorRol() {
+  const esAdmin = currentUser?.rol === "admin";
+  document.querySelectorAll(".nav-item[data-view]").forEach(btn => {
+    if (VISTAS_SOLO_ADMIN.includes(btn.dataset.view)) btn.style.display = esAdmin ? "" : "none";
+  });
+  // si un mecánico quedó parado en una vista restringida (por ejemplo, sesión
+  // anterior era de admin en este mismo dispositivo), lo regresamos al dashboard
+  if (!esAdmin && VISTAS_SOLO_ADMIN.some(v => document.getElementById(`view-${v}`)?.classList.contains("active"))) {
+    showView("dashboard");
+    renderDashboard();
+  }
+}
+
+async function renderAjustes() {
+  const modo = localStorage.getItem("enti_modo_datos") === "demo" ? "con datos de ejemplo" : "en blanco";
+  const conteos = await Promise.all(ALL_STORES.map(s => DB.getAll(s).then(r => r.length)));
+  const totalRegistros = conteos.reduce((a, b) => a + b, 0);
+  document.getElementById("ajustesInfo").innerHTML = `
+    Usuario: <b>${esc(currentUser?.nombre || "—")}</b> (${currentUser?.rol === "admin" ? "administrador" : "mecánico"})<br>
+    Este dispositivo arrancó ${modo} · ${totalRegistros} registros guardados en total.
+  `;
+
+  // Lee la versión directo del nombre de la caché activa (la pone sw.js al
+  // instalarse) en vez de duplicar el número aquí — así esto SIEMPRE refleja
+  // la versión real que quedó corriendo en este dispositivo, aunque se haya
+  // atascado en una vieja por el navegador.
+  if ("caches" in window) {
+    const keys = await caches.keys();
+    const activa = keys.find((k) => k.startsWith("entimotors-v"));
+    document.getElementById("ajustesVersion").textContent = activa ? activa.replace("entimotors-v", "") : "sin Service Worker";
+  }
+}
+
+document.getElementById("btnForzarActualizacion").addEventListener("click", async () => {
+  toast("Buscando la última versión…");
+  try {
+    if ("serviceWorker" in navigator) {
+      const regs = await navigator.serviceWorker.getRegistrations();
+      await Promise.all(regs.map((r) => r.unregister()));
+    }
+    if ("caches" in window) {
+      const keys = await caches.keys();
+      await Promise.all(keys.map((k) => caches.delete(k)));
+    }
+  } catch (e) {}
+  // ?_= con la hora actual evita que el propio navegador (no el Service
+  // Worker, que ya se acaba de borrar) conteste esto con algo guardado en su
+  // caché HTTP normal.
+  location.href = location.pathname + "?_=" + Date.now();
+});
+
+document.getElementById("btnRespaldarDatos").addEventListener("click", async () => {
+  const data = {};
+  for (const store of ALL_STORES) data[store] = await DB.getAll(store);
+  const respaldo = { version: 1, exportadoEn: new Date().toISOString(), data };
+  const blob = new Blob([JSON.stringify(respaldo, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `entimotors_respaldo_${new Date().toISOString().slice(0, 10)}.json`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+  toast("Respaldo descargado");
+});
+
+document.getElementById("inputRestaurar").addEventListener("change", async (e) => {
+  const file = e.target.files[0];
+  e.target.value = "";
+  if (!file) return;
+  let respaldo;
+  try {
+    respaldo = JSON.parse(await file.text());
+  } catch {
+    toast("Ese archivo no es un respaldo válido", "off");
+    return;
+  }
+  if (!respaldo?.data) { toast("Ese archivo no es un respaldo válido", "off"); return; }
+
+  const ok = await showConfirm(
+    "Esto reemplaza TODOS los datos actuales de este dispositivo por los del archivo. Lo que tengas ahora que no esté en el respaldo se perderá.",
+    { titulo: "Restaurar respaldo", textoOk: "Restaurar" }
+  );
+  if (!ok) return;
+
+  requestAdminCode(async () => {
+    for (const store of ALL_STORES) {
+      await DB.clear(store);
+      for (const registro of respaldo.data[store] || []) await DB.save(store, registro);
+    }
+    markDirty();
+    localStorage.setItem("enti_modo_datos", "blanco"); // ya hay datos reales del respaldo, no debe volver a sembrar demo
+    toast("Datos restaurados");
+    await continuarArranque(null);
+  });
+});
+
+document.getElementById("btnEmpezarDeCero").addEventListener("click", async () => {
+  const ok = await showConfirm(
+    "Esto borra TODA la información guardada en este dispositivo: clientes, órdenes, ventas, caja, inventario, todo. No se puede deshacer.",
+    { titulo: "Borrar todo y empezar de cero", textoOk: "Borrar todo" }
+  );
+  if (!ok) return;
+
+  requestAdminCode(async () => {
+    for (const store of ALL_STORES) await DB.clear(store);
+    localStorage.removeItem("enti_modo_datos");
+    markDirty();
+    toast("Todo borrado — elige cómo quieres empezar");
+    document.getElementById("shell").classList.remove("active");
+    document.getElementById("gateModo").classList.add("active");
+  });
+});
+
+/* ================= datos de prueba adicionales (inventario, clientes, citas) =================
+   Aditivo, no borra nada: revisa por nombre antes de crear, así se puede tocar el
+   botón varias veces sin duplicar. Solo agrega datos EN ESTE dispositivo — no hay
+   sincronización entre dispositivos, así que si se quiere la misma demo en el
+   celular hay que tocar el botón desde el celular también. */
+alHacerClicUnaVez(document.getElementById("btnCargarDatosPrueba"), async () => {
+  const catsExistentes = await DB.getAll("categorias_inv");
+  async function idDeCategoria(nombre) {
+    const encontrada = catsExistentes.find(c => c.nombre === nombre);
+    if (encontrada) return encontrada.id;
+    const id = await DB.save("categorias_inv", { nombre });
+    catsExistentes.push({ nombre, id });
+    return id;
+  }
+  const idFrenos = await idDeCategoria("Frenos");
+  const idAceites = await idDeCategoria("Aceites y lubricantes");
+  const idElectrico = await idDeCategoria("Eléctrico");
+  const idLlantas = await idDeCategoria("Llantas");
+  const idTransmision = await idDeCategoria("Transmisión");
+  const idAccesorios = await idDeCategoria("Accesorios");
+
+  const inventarioExistente = await DB.getAll("inventario");
+  const nombresInventario = new Set(inventarioExistente.map(r => r.nombre));
+  const nuevosRepuestos = [
+    { nombre: "Pastillas de freno traseras", cantidad: 10, precio: 280, costoCompra: 170, stockMinimo: 3, categoriaId: idFrenos },
+    { nombre: "Líquido de frenos DOT 4", cantidad: 12, precio: 140, costoCompra: 85, stockMinimo: 4, categoriaId: idFrenos },
+    { nombre: "Bujía NGK", cantidad: 25, precio: 95, costoCompra: 55, stockMinimo: 8, categoriaId: idAceites },
+    { nombre: "Filtro de aceite", cantidad: 20, precio: 90, costoCompra: 50, stockMinimo: 6, categoriaId: idAceites },
+    { nombre: "Filtro de aire", cantidad: 15, precio: 150, costoCompra: 90, stockMinimo: 5, categoriaId: idAceites },
+    { nombre: "Batería 12V 4Ah", cantidad: 6, precio: 850, costoCompra: 600, stockMinimo: 2, categoriaId: idElectrico },
+    { nombre: "Foco delantero H4", cantidad: 14, precio: 120, costoCompra: 70, stockMinimo: 4, categoriaId: idElectrico },
+    { nombre: "Bocina 12V", cantidad: 10, precio: 130, costoCompra: 75, stockMinimo: 3, categoriaId: idElectrico },
+    { nombre: "Llanta trasera 90/90-18", cantidad: 8, precio: 1450, costoCompra: 1050, stockMinimo: 2, categoriaId: idLlantas },
+    { nombre: "Llanta delantera 80/90-17", cantidad: 8, precio: 1200, costoCompra: 850, stockMinimo: 2, categoriaId: idLlantas },
+    { nombre: "Cámara de aire rin 18", cantidad: 12, precio: 180, costoCompra: 100, stockMinimo: 4, categoriaId: idLlantas },
+    { nombre: "Cadena 428H", cantidad: 9, precio: 650, costoCompra: 450, stockMinimo: 2, categoriaId: idTransmision },
+    { nombre: "Kit piñón y catalina", cantidad: 7, precio: 950, costoCompra: 680, stockMinimo: 2, categoriaId: idTransmision },
+    { nombre: "Cable de embrague", cantidad: 15, precio: 180, costoCompra: 100, stockMinimo: 5, categoriaId: idTransmision },
+    { nombre: "Cable de acelerador", cantidad: 15, precio: 160, costoCompra: 90, stockMinimo: 5, categoriaId: idTransmision },
+    { nombre: "Espejo retrovisor (par)", cantidad: 10, precio: 240, costoCompra: 140, stockMinimo: 3, categoriaId: idAccesorios },
+    { nombre: "Manigueta de freno", cantidad: 12, precio: 190, costoCompra: 110, stockMinimo: 4, categoriaId: idAccesorios },
+  ];
+  let repuestosAgregados = 0;
+  for (const r of nuevosRepuestos) {
+    if (nombresInventario.has(r.nombre)) continue;
+    await DB.save("inventario", { ...r, modelo: "Universal", precioVenta: r.precio, codigoBarras: "", publicarEnWeb: false, foto: null });
+    repuestosAgregados++;
+  }
+
+  const clientesExistentes = await DB.getAll("clientes");
+  const nombresClientes = new Set(clientesExistentes.map(c => c.nombre));
+  const nuevosClientes = [
+    { cliente: { nombre: "Ana Gómez", telefono: "9911-2233" }, moto: { marca: "Bajaj", modelo: "Pulsar 180", cilindraje: "180cc", placa: "HAM-2210", km: 8200 } },
+    { cliente: { nombre: "Roberto Cruz", telefono: "9822-4455" }, moto: { marca: "Suzuki", modelo: "AX100", cilindraje: "100cc", placa: "PAG-1187", km: 15300 } },
+    { cliente: { nombre: "Fernanda López", telefono: "9733-6677" }, moto: { marca: "Honda", modelo: "XR150L", cilindraje: "150cc", placa: "HAX-9042", km: 4100 } },
+  ];
+  let clientesAgregados = 0;
+  for (const item of nuevosClientes) {
+    if (nombresClientes.has(item.cliente.nombre)) continue;
+    const clienteId = await DB.save("clientes", item.cliente);
+    await DB.save("motos", { clienteId, ...item.moto, foto: null, mantenimiento: null });
+    clientesAgregados++;
+  }
+
+  const citasExistentes = await DB.getAll("citas");
+  let citasAgregadas = 0;
+  if (!citasExistentes.some(c => c.motivo === "Revisión general (prueba)")) {
+    const en3dias = new Date(Date.now() + 3 * 86400000).toISOString().slice(0, 10);
+    const en5dias = new Date(Date.now() + 5 * 86400000).toISOString().slice(0, 10);
+    await DB.save("citas", { clienteId: null, nombreTmp: "Ana Gómez", telefonoTmp: "9911-2233", fecha: en3dias, hora: "09:00", motivo: "Revisión general (prueba)", mecanico: "Wilkin", origen: "interna", recordatorioEnviado: false, creadoEn: Date.now() });
+    await DB.save("citas", { clienteId: null, nombreTmp: "Roberto Cruz", telefonoTmp: "9822-4455", fecha: en5dias, hora: "10:30", motivo: "Cambio de aceite (prueba)", mecanico: "Mecánico 1", origen: "interna", recordatorioEnviado: false, creadoEn: Date.now() });
+    citasAgregadas = 2;
+  }
+
+  markDirty();
+  toast(`Listo: ${repuestosAgregados} repuestos, ${clientesAgregados} clientes y ${citasAgregadas} citas de prueba agregados`);
+  await renderInventario();
+  await renderClientes();
+  await renderCitasList();
+  await renderDashboard();
+});
+
+/* ================= conexión: real + simulada ================= */
+document.getElementById("offlineToggle").addEventListener("click", () => {
+  forcedOffline = !forcedOffline;
+  document.getElementById("offlineToggle").textContent = forcedOffline ? "Volver a estar en línea" : "Simular sin conexión";
+  renderSyncChip();
+  toast(forcedOffline ? "Modo sin conexión activado" : "Conexión restaurada — sincronizando cambios pendientes");
+  if (!forcedOffline && pending > 0) setTimeout(() => { pending = 0; renderSyncChip(); toast("Todo sincronizado"); }, 1200);
+});
+window.addEventListener("online", renderSyncChip);
+window.addEventListener("offline", renderSyncChip);
+
+/* ================= datos de ejemplo (solo la primera vez) ================= */
+async function seedIfEmpty() {
+  const clientes = await DB.getAll("clientes");
+  if (clientes.length) return;
+  const c1 = await DB.save("clientes", { nombre: "Carlos Reyes", telefono: "9704-1122" });
+  const prontoMant = new Date(); prontoMant.setDate(prontoMant.getDate() + 3);
+  await DB.save("motos", {
+    clienteId: c1, marca: "Honda", modelo: "CB190R", cilindraje: "190cc", placa: "HAX-4471", km: 8200, foto: null,
+    mantenimiento: { fecha: prontoMant.toISOString().slice(0, 10), tipo: "Cambio de aceite", recordatorioEnviado: false },
+  });
+  const c2 = await DB.save("clientes", { nombre: "Marlon Zúniga", telefono: "9988-3344" });
+  await DB.save("motos", { clienteId: c2, marca: "Suzuki", modelo: "GN125", cilindraje: "125cc", placa: "PAO-0912", km: 21500, foto: null, mantenimiento: null });
+
+  const catRepuestos = await DB.save("categorias_inv", { nombre: "Repuestos" });
+  const catAceites = await DB.save("categorias_inv", { nombre: "Aceites y lubricantes" });
+  const catFrenos = await DB.save("categorias_inv", { nombre: "Frenos" });
+  await DB.save("categorias_inv", { nombre: "Accesorios" });
+
+  await DB.save("inventario", { nombre: "Kit de arrastre", modelo: "CB190R", cantidad: 4, precio: 1450, precioVenta: 1450, costoCompra: 950, stockMinimo: 2, codigoBarras: "750100000012", categoriaId: catRepuestos, publicarEnWeb: true });
+  await DB.save("inventario", { nombre: "Aceite 20W-50 (litro)", modelo: "Todos", cantidad: 30, precio: 180, precioVenta: 180, costoCompra: 110, stockMinimo: 8, codigoBarras: "750100000029", categoriaId: catAceites, publicarEnWeb: true });
+  await DB.save("inventario", { nombre: "Pastillas de freno delanteras", modelo: "GN125", cantidad: 6, precio: 320, precioVenta: 320, costoCompra: 190, stockMinimo: 3, codigoBarras: "750100000036", categoriaId: catFrenos, publicarEnWeb: false });
+
+  const motos = await DB.getAll("motos");
+  await DB.save("ordenes", {
+    clienteId: c1, motoId: motos.find(m => m.clienteId === c1).id, estado: "presupuesto",
+    falla: "Ruido metálico en la cadena y cuesta que agarre marcha.",
+    items: [{ nombre: "Kit de arrastre", cantidad: 1, precio: 1450 }, { nombre: "Mano de obra", cantidad: 1, precio: 350 }],
+    fotos: [], aprobacion: null, diagnostico: { notas: "Kit de arrastre desgastado, cambio recomendado.", horas: 2 },
+    reparacionNotas: "", calidadChecklist: null, mecanico: "Wilkin", creadoEn: Date.now(),
+  });
+  await DB.save("ordenes", {
+    clienteId: c2, motoId: motos.find(m => m.clienteId === c2).id, estado: "recibido",
+    falla: "Frenos chillan al frenar.",
+    items: [], fotos: [], aprobacion: null, diagnostico: null, reparacionNotas: "", calidadChecklist: null,
+    mecanico: "Mecánico 1", creadoEn: Date.now(),
+  });
+
+  const c3 = await DB.save("clientes", { nombre: "Deysi Martínez", telefono: "9811-5566" });
+  await DB.save("motos", { clienteId: c3, marca: "Yamaha", modelo: "FZ150", cilindraje: "150cc", placa: "MDC-2201", km: 5400, foto: null, mantenimiento: null });
+  const motoC3 = await DB.get("motos", (await DB.getAll("motos")).find(m => m.clienteId === c3).id);
+  await DB.save("ordenes", {
+    clienteId: c3, motoId: motoC3.id, estado: "entregado",
+    falla: "Mantenimiento de rutina.",
+    items: [{ nombre: "Aceite 20W-50 (litro)", cantidad: 1, precio: 180 }, { nombre: "Mano de obra", cantidad: 1, precio: 150 }],
+    fotos: [], aprobacion: { via: "local", en: Date.now() }, diagnostico: { notas: "Todo en orden.", horas: 1 },
+    reparacionNotas: "Cambio de aceite realizado.", calidadChecklist: { pruebaManejo: true, fugas: true, torque: true, limpieza: true },
+    mecanico: "Wilkin", creadoEn: Date.now(), entregadoEn: Date.now(),
+  });
+
+  const pasado = new Date(); pasado.setDate(pasado.getDate() + 1);
+  await DB.save("citas", { clienteId: c2, nombreTmp: "", telefonoTmp: "", fecha: pasado.toISOString().slice(0, 10), hora: "10:00", motivo: "Revisión de frenos", mecanico: "Wilkin", origen: "interna", recordatorioEnviado: false, creadoEn: Date.now() });
+
+  // Ejemplo de cómo se vería una cita agendada por un visitante desde la página
+  // pública — hoy no existe ese formulario en entimotors.com, esto es solo para
+  // mostrar la etiqueta "Desde la web". Conectarlo de verdad requiere un
+  // formulario público + una tabla compartida en el backend, no solo este demo.
+  const enTresDias = new Date(); enTresDias.setDate(enTresDias.getDate() + 3);
+  await DB.save("citas", { clienteId: null, nombreTmp: "Héctor Padilla", telefonoTmp: "9600-7788", fecha: enTresDias.toISOString().slice(0, 10), hora: "14:30", motivo: "Cotización de kit de arrastre", mecanico: "Wilkin", origen: "web", recordatorioEnviado: false, creadoEn: Date.now() });
+
+  // Movimientos de caja y una venta de mostrador de ejemplo, para que el
+  // dashboard y Finanzas no arranquen en cero — así se ve cómo se llenan los
+  // gráficos apenas hay actividad real.
+  const inv = await DB.getAll("inventario");
+  const aceite = inv.find(r => r.nombre.startsWith("Aceite"));
+  const haceDos = new Date(); haceDos.setDate(haceDos.getDate() - 2);
+  await DB.save("caja_movimientos", { tipo: "ingreso", categoria: "Servicio taller", monto: 330, metodoPago: "efectivo", descripcion: "Orden de taller #entregada", fechaISO: haceDos.toISOString(), creadoEn: haceDos.getTime() });
+  await DB.save("caja_movimientos", { tipo: "egreso", categoria: "Compra de repuestos", monto: 900, metodoPago: "efectivo", descripcion: "Reposición de aceite y pastillas", fechaISO: haceDos.toISOString(), creadoEn: haceDos.getTime() });
+  if (aceite) {
+    const ventaDemo = { items: [{ inventarioId: aceite.id, nombre: aceite.nombre, cantidad: 2, precio: aceite.precio }], clienteId: null, metodoPago: "efectivo", total: aceite.precio * 2, efectivoRecibido: aceite.precio * 2, cambio: 0, fechaISO: new Date().toISOString(), creadoEn: Date.now(), mecanico: "Wilkin" };
+    const ventaId = await DB.save("ventas_rapidas", ventaDemo);
+    await DB.save("caja_movimientos", { tipo: "ingreso", categoria: "Venta mostrador", monto: ventaDemo.total, metodoPago: "efectivo", descripcion: `Venta rápida #${ventaId}`, ventaId, fechaISO: ventaDemo.fechaISO, creadoEn: Date.now() });
+  }
+
+  await DB.save("web_cms", { key: "landing_hero", titulo: "Tu moto en las mejores manos", subtitulo: "Repuestos, mantenimiento y reparación de motocicletas en Honduras" });
+  await DB.save("web_cms", { key: "promociones", items: ["10% de descuento en cambio de aceite este mes"] });
+  await DB.save("web_cms", { key: "servicios_catalogo", items: ["Diagnóstico general", "Cambio de aceite", "Frenos", "Kit de arrastre"] });
+}
+
+/* ================= arranque de la app (tras pasar los dos gates) ================= */
+async function startApp(session) {
+  currentUser = session;
+  document.getElementById("loggedUserName").textContent = session.nombre;
+  document.getElementById("loggedUserRole").textContent = session.user;
+
+  db = await openDb();
+
+  const clientesExistentes = await DB.getAll("clientes");
+  const modo = localStorage.getItem("enti_modo_datos");
+  if (!clientesExistentes.length && !modo) {
+    // base vacía y todavía no se eligió cómo arrancar: preguntamos antes de mostrar nada del sistema
+    document.getElementById("gateModo").classList.add("active");
+    return;
+  }
+
+  document.getElementById("shell").classList.add("active");
+  await continuarArranque(modo);
+}
+
+async function elegirModoDatos(modo) {
+  localStorage.setItem("enti_modo_datos", modo);
+  document.getElementById("gateModo").classList.remove("active");
+  document.getElementById("shell").classList.add("active");
+  await continuarArranque(modo);
+}
+document.getElementById("btnModoDemo").addEventListener("click", () => elegirModoDatos("demo"));
+document.getElementById("btnModoBlanco").addEventListener("click", () => elegirModoDatos("blanco"));
+
+async function continuarArranque(modo) {
+  if (modo === "demo") await seedIfEmpty();
+  aplicarPermisosPorRol();
+  await renderOrdersList();
+  await renderClientes();
+  await renderInventario();
+  await renderCitasList();
+  await renderPOS();
+  await renderFinanzas();
+  await renderWebCMS();
+  await renderAjustes();
+  await renderDashboard();
+  await renderNotificaciones();
+  renderSyncChip();
+  document.getElementById("fabHome").classList.add("fab-hidden"); // arranca siempre en la página principal
+
+  wireServiceWorkerUpdates();
+}
+
+/* ================= actualización del Service Worker ================= */
+function wireServiceWorkerUpdates() {
+  if (!("serviceWorker" in navigator)) return;
+
+  // sw.js llama a skipWaiting()/clients.claim() sin pedir permiso, así que en
+  // cuanto el nuevo Service Worker toma control recargamos solo — nadie tiene
+  // que darle a "Actualizar" ni refrescar la página a mano.
+  let recargando = false;
+  navigator.serviceWorker.addEventListener("controllerchange", () => {
+    if (recargando) return;
+    recargando = true;
+    location.reload();
+  });
+
+  // updateViaCache:"none" evita que el propio navegador (no el Service Worker)
+  // conteste con una copia guardada de sw.js cuando el navegador va a revisar
+  // si cambió — sin esto, algunos navegadores pueden tardar en darse cuenta
+  // de que hay una versión nueva aunque forcemos reg.update() más abajo.
+  navigator.serviceWorker.register("./sw.js", { updateViaCache: "none" }).then((reg) => {
+    reg.addEventListener("updatefound", () => {
+      const nuevo = reg.installing;
+      if (!nuevo) return;
+      nuevo.addEventListener("statechange", () => {
+        // "installed" + ya había un controller = hay una versión nueva esperando,
+        // no es la primera instalación del Service Worker.
+        if (nuevo.state === "installed" && navigator.serviceWorker.controller) {
+          document.getElementById("updateBanner").style.display = "flex";
+        }
+      });
+    });
+
+    // Por spec, el navegador solo revisa si sw.js cambió una vez cada 24h por su
+    // cuenta — con la app cambiando varias veces al día eso deja a la gente
+    // atascada en una versión vieja aunque el auto-reload de arriba esté bien.
+    // Forzamos la revisión nosotros: al abrir la app y cada vez que vuelve a
+    // primer plano (típico en celular: la app queda abierta de fondo días).
+    reg.update();
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "visible") reg.update();
+    });
+  }).catch(() => {});
+}
+
+/* ================= boot: gate de instalación -> gate de login -> app ================= */
+(function boot() {
+  if (!isStandalone() && !devBypassed()) {
+    wireInstallGate();
+    return; // se queda mostrando #gateInstall (ya viene "active" en el HTML)
+  }
+  document.getElementById("gateInstall").classList.remove("active");
+
+  const session = readSession();
+  if (!session) {
+    wireLoginGate();
+    document.getElementById("gateLogin").classList.add("active");
+    return;
+  }
+  startApp(session);
+})();
