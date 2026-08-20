@@ -2142,10 +2142,16 @@ function actualizarCambioPOS() {
   document.getElementById("posCambio").textContent = money(Math.max(0, recibido - total));
 }
 
+// nombre libre del cliente (para facturas a clientes no registrados) — se llena
+// desde el modal "Cobrar servicio" y se usa al cobrar mientras no se elija un
+// cliente registrado del <select>.
+let posClienteLibre = "";
+
 function abrirModalServicioPOS() {
   document.getElementById("servicioPOSNombre").value = "";
   document.getElementById("servicioPOSCantidad").value = "1";
   document.getElementById("servicioPOSPrecio").value = "";
+  document.getElementById("servicioPOSCliente").value = posClienteLibre;
   document.getElementById("modalServicioPOS").classList.add("active");
   setTimeout(() => document.getElementById("servicioPOSNombre").focus(), 50);
 }
@@ -2163,6 +2169,7 @@ alHacerClicUnaVez(document.getElementById("btnGuardarServicioPOS"), async () => 
   if (!(precio >= 0)) { toast("El precio no puede ser negativo", "off"); return; }
   // inventarioId: null → registrarVentaRapida lo trata como ítem manual sin tocar stock
   posCarrito.push({ inventarioId: null, nombre, cantidad, precio });
+  posClienteLibre = document.getElementById("servicioPOSCliente").value.trim();
   cerrarModalServicioPOS();
   renderPosCarrito();
   toast(`"${nombre}" agregado al carrito`);
@@ -2170,9 +2177,7 @@ alHacerClicUnaVez(document.getElementById("btnGuardarServicioPOS"), async () => 
 
 document.getElementById("posBuscar").addEventListener("input", (e) => { posBusqueda = e.target.value; renderPOS(); });
 document.getElementById("posCliente").addEventListener("change", (e) => {
-  const nombreInput = document.getElementById("posClienteNombre");
-  if (e.target.value) { nombreInput.value = ""; nombreInput.disabled = true; }
-  else nombreInput.disabled = false;
+  if (e.target.value) posClienteLibre = "";
 });
 document.getElementById("posMetodo").addEventListener("change", actualizarCambioPOS);
 document.getElementById("posEfectivoRecibido").addEventListener("input", actualizarCambioPOS);
@@ -2185,13 +2190,13 @@ alHacerClicUnaVez(document.getElementById("btnCobrar"), async () => {
   if (metodoPago === "efectivo" && efectivoRecibido < total) { toast("El efectivo recibido es menor que el total", "off"); return; }
   const posClienteSelect = document.getElementById("posCliente");
   const clienteId = posClienteSelect.value ? Number(posClienteSelect.value) : null;
-  // el nombre se resuelve aquí (del <select> ya cargado o del campo libre) y se guarda
-  // tal cual en la venta, para que el ticket lo muestre sin tener que consultar la BD
-  // de nuevo en imprimirTicketPOS — eso mantendría el segundo clic 100% sincrónico.
-  const clienteNombreLibre = document.getElementById("posClienteNombre").value.trim();
+  // el nombre se resuelve aquí (del <select> ya cargado o del nombre libre capturado
+  // en el modal "Cobrar servicio") y se guarda tal cual en la venta, para que el
+  // ticket lo muestre sin tener que consultar la BD de nuevo en imprimirTicketPOS
+  // — eso mantendría el segundo clic 100% sincrónico.
   const clienteNombre = clienteId
     ? posClienteSelect.options[posClienteSelect.selectedIndex].textContent
-    : (clienteNombreLibre || null);
+    : (posClienteLibre || null);
 
   try {
     const { id, venta } = await registrarVentaRapida({
@@ -2204,9 +2209,8 @@ alHacerClicUnaVez(document.getElementById("btnCobrar"), async () => {
     imprimirTicketPOS(id, venta);
     toast(`Venta #${id} registrada por ${money(total)}`);
     posCarrito = [];
+    posClienteLibre = "";
     document.getElementById("posEfectivoRecibido").value = "";
-    document.getElementById("posClienteNombre").value = "";
-    document.getElementById("posClienteNombre").disabled = !!posClienteSelect.value;
     renderPOS();
     renderDashboard();
   } catch (err) {

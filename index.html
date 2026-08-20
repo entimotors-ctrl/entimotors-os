@@ -649,10 +649,11 @@
   @media (max-width: 900px) { .pos-layout { grid-template-columns: 1fr; } }
   .pos-buscar-row { display: flex; gap: 0.5rem; align-items: stretch; }
   .pos-buscar-row input { flex: 1; min-width: 0; }
-  .pos-buscar-row #btnAgregarServicioPOS { flex: none; white-space: nowrap; }
+  .pos-buscar-row #btnAgregarServicioPOS { flex: none; white-space: nowrap; padding: 0.55rem 1.2rem; font-size: 0.85rem; }
   @media (max-width: 480px) {
     .pos-buscar-row { flex-wrap: wrap; }
-    .pos-buscar-row input, .pos-buscar-row #btnAgregarServicioPOS { flex: 1 1 100%; }
+    .pos-buscar-row input, .pos-buscar-row #btnAgregarServicioPOS { flex: 1 1 100%; width: 100%; }
+    .pos-buscar-row #btnAgregarServicioPOS { padding: 0.7rem 1rem; font-size: 0.9rem; }
   }
   .pos-cats { display: flex; gap: 0.5rem; flex-wrap: wrap; margin: 0.7rem 0; }
   .cat-chip { border: 1px solid var(--border); background: var(--panel); color: var(--text-muted); border-radius: 999px; padding: 0.3rem 0.8rem; font-size: 0.78rem; cursor: pointer; }
@@ -971,7 +972,6 @@
 
           <label>Cliente (opcional)</label>
           <select id="posCliente"><option value="">Cliente de mostrador</option></select>
-          <input type="text" id="posClienteNombre" placeholder="O escribe el nombre si no está registrado" style="margin-top:0.4rem;">
 
           <label>Método de pago</label>
           <select id="posMetodo">
@@ -1279,6 +1279,8 @@
       <div><label>Cantidad</label><input type="number" id="servicioPOSCantidad" value="1" min="1"></div>
       <div><label>Precio (L.)</label><input type="number" id="servicioPOSPrecio" step="0.01" min="0"></div>
     </div>
+    <label>Nombre del cliente (opcional)</label>
+    <input type="text" id="servicioPOSCliente" placeholder="Si no está registrado, escribe su nombre para la factura">
     <div class="modal-actions">
       <button class="btn ghost" id="btnCancelarServicioPOS">Cancelar</button>
       <button class="btn primary" id="btnGuardarServicioPOS">Agregar al carrito</button>
@@ -1450,6 +1452,6 @@
      sw.js) — es la forma más universal de forzar que CUALQUIER navegador
      pida el archivo de nuevo aunque ya tenga guardada una copia vieja en su
      propio caché HTTP, sin depender de que respete el Service Worker. -->
-<script src="app.js?v=2.9.0"></script>
+<script src="app.js?v=2.9.1"></script>
 </body>
 </html>
