@@ -2428,11 +2428,14 @@ document.getElementById("btnEmpezarDeCero").addEventListener("click", async () =
 });
 
 /* ================= datos de prueba adicionales (inventario, clientes, citas) =================
-   Aditivo, no borra nada: revisa por nombre antes de crear, así se puede tocar el
-   botón varias veces sin duplicar. Solo agrega datos EN ESTE dispositivo — no hay
-   sincronización entre dispositivos, así que si se quiere la misma demo en el
-   celular hay que tocar el botón desde el celular también. */
-alHacerClicUnaVez(document.getElementById("btnCargarDatosPrueba"), async () => {
+   No hay botón visible en Ajustes a propósito — esto es solo para la cuenta
+   "prueba" (ver TEAM), que abre únicamente Wilkin, no el cliente. Se ejecuta
+   sola en continuarArranque() cada vez que se entra con esa cuenta. Es aditivo
+   y revisa por nombre antes de crear, así que entrar varias veces no duplica
+   nada. Solo agrega datos EN ESTE dispositivo — no hay sincronización entre
+   dispositivos, así que en cada celular donde se use "prueba" se siembra sola
+   la primera vez que se entra ahí. */
+async function sembrarDatosPrueba() {
   const catsExistentes = await DB.getAll("categorias_inv");
   async function idDeCategoria(nombre) {
     const encontrada = catsExistentes.find(c => c.nombre === nombre);
@@ -2501,13 +2504,14 @@ alHacerClicUnaVez(document.getElementById("btnCargarDatosPrueba"), async () => {
     citasAgregadas = 2;
   }
 
-  markDirty();
-  toast(`Listo: ${repuestosAgregados} repuestos, ${clientesAgregados} clientes y ${citasAgregadas} citas de prueba agregados`);
-  await renderInventario();
-  await renderClientes();
-  await renderCitasList();
-  await renderDashboard();
-});
+  // continuarArranque() ya renderiza todas las vistas justo después de llamar
+  // esto, así que aquí no hace falta re-renderizar nada — solo dejar los datos
+  // guardados antes de que ese primer render ocurra.
+  if (repuestosAgregados || clientesAgregados || citasAgregadas) {
+    markDirty();
+    toast(`Datos de prueba listos: ${repuestosAgregados} repuestos, ${clientesAgregados} clientes y ${citasAgregadas} citas`);
+  }
+}
 
 /* ================= conexión: real + simulada ================= */
 document.getElementById("offlineToggle").addEventListener("click", () => {
@@ -2629,6 +2633,7 @@ document.getElementById("btnModoBlanco").addEventListener("click", () => elegirM
 
 async function continuarArranque(modo) {
   if (modo === "demo") await seedIfEmpty();
+  if (currentUser?.user === "prueba") await sembrarDatosPrueba();
   aplicarPermisosPorRol();
   await renderOrdersList();
   await renderClientes();
