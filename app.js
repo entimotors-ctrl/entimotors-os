@@ -45,6 +45,10 @@ const ADMIN_CODE = "2468";
 let db;
 let currentUser = null;
 let currentOrderId = null;
+let currentOrderCache = null; // { o, moto, cliente } — la llena openOrder(); así el
+// botón de imprimir factura no necesita leer IndexedDB (con await) antes de
+// llamar a window.print(), lo cual en navegadores móviles hace que el
+// navegador ya no reconozca el clic como el gesto que autoriza imprimir.
 
 /* ---------------- utilidades ---------------- */
 function esc(s) {
@@ -63,10 +67,26 @@ function toWaDigits(raw) {
   if (digits.length < 8) return null;
   return digits.startsWith("504") ? digits : `504${digits}`;
 }
-function openWhatsApp(phoneRaw, text) {
+// abrirVentanaWA() debe llamarse de inmediato, ANTES de cualquier await, en el
+// mismo evento de clic — si primero se espera a leer datos de IndexedDB y
+// hasta entonces se llama a window.open(), el gesto del usuario ya "expiró" en
+// varios navegadores móviles (sobre todo iOS) y el navegador lo bloquea en
+// silencio, sin ningún error: el botón "no hace nada". Por eso se abre la
+// pestaña en blanco de una vez y se le pone la URL real después, cuando ya se
+// tenga el texto armado.
+function abrirVentanaWA() {
+  return window.open("", "_blank");
+}
+function navegarWA(ventana, phoneRaw, text) {
   const digits = toWaDigits(phoneRaw);
-  if (!digits) { toast("Falta un teléfono válido para enviar por WhatsApp", "off"); return false; }
-  window.open(`https://wa.me/${digits}?text=${encodeURIComponent(text)}`, "_blank");
+  if (!digits) {
+    ventana?.close();
+    toast("Falta un teléfono válido para enviar por WhatsApp", "off");
+    return false;
+  }
+  const url = `https://wa.me/${digits}?text=${encodeURIComponent(text)}`;
+  if (ventana && !ventana.closed) ventana.location.href = url;
+  else window.open(url, "_blank");
   return true;
 }
 
@@ -447,6 +467,27 @@ document.getElementById("btnLogout").addEventListener("click", () => {
   localStorage.removeItem("enti_session");
   location.reload();
 });
+
+/* ================= modo claro / oscuro ================= */
+// el <script> inline en <head> ya aplicó el tema guardado antes de pintar;
+// aquí solo hace falta que el botón muestre el estado correcto y lo cambie.
+function temaActual() {
+  const explicito = document.documentElement.getAttribute("data-theme");
+  if (explicito === "light" || explicito === "dark") return explicito;
+  return window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+}
+function actualizarBotonTema() {
+  const btn = document.getElementById("btnTema");
+  if (!btn) return;
+  btn.textContent = temaActual() === "dark" ? "☀️ Modo claro" : "🌙 Modo oscuro";
+}
+document.getElementById("btnTema").addEventListener("click", () => {
+  const nuevo = temaActual() === "dark" ? "light" : "dark";
+  document.documentElement.setAttribute("data-theme", nuevo);
+  localStorage.setItem("enti_theme", nuevo);
+  actualizarBotonTema();
+});
+actualizarBotonTema();
 
 /* ================= navegación entre vistas ================= */
 function showView(name) {
@@ -857,6 +898,7 @@ async function openOrder(id) {
   const o = await DB.get("ordenes", id);
   const moto = await DB.get("motos", o.motoId);
   const cliente = await DB.get("clientes", o.clienteId);
+  currentOrderCache = { o, moto, cliente };
 
   document.getElementById("detalleTitulo").textContent = `Orden #${o.id} — ${moto.marca} ${moto.modelo}`;
   document.getElementById("detalleSub").textContent = `${cliente.nombre} · ${cliente.telefono || "sin teléfono"} · placa ${moto.placa || "s/p"} · asignada a ${o.mecanico}`;
@@ -1047,13 +1089,14 @@ async function renderPresupuestoStage(o) {
   });
 
   document.getElementById("btnEnviarWA").addEventListener("click", async () => {
+    const ventanaWA = abrirVentanaWA();
     const ord = await DB.get("ordenes", o.id);
     const moto = await DB.get("motos", ord.motoId);
     const cliente = await DB.get("clientes", ord.clienteId);
     const total = (ord.items || []).reduce((s, it) => s + it.cantidad * it.precio, 0);
     const lineas = (ord.items || []).map(it => `- ${it.nombre} x${it.cantidad}: ${money(it.cantidad * it.precio)}`).join("\n");
     const texto = `Hola ${cliente.nombre}, este es el presupuesto para tu ${moto.marca} ${moto.modelo} (orden #${ord.id}):\n\n${lineas}\n\nTotal: ${money(total)}\n\n¿Lo aprobamos para empezar la reparación?`;
-    const sent = openWhatsApp(cliente.telefono, texto);
+    const sent = navegarWA(ventanaWA, cliente.telefono, texto);
     if (!sent) return;
     await updateOrder(o.id, x => { x.aprobacion = { via: "whatsapp", en: Date.now() }; });
     renderAprobacionEstado(await DB.get("ordenes", o.id));
@@ -1307,10 +1350,11 @@ alHacerClicUnaVez(document.getElementById("btnGuardarItem"), async () => {
 });
 
 /* ---- imprimir factura ---- */
-document.getElementById("btnImprimirFactura").addEventListener("click", async () => {
-  const o = await DB.get("ordenes", currentOrderId);
-  const moto = await DB.get("motos", o.motoId);
-  const cliente = await DB.get("clientes", o.clienteId);
+document.getElementById("btnImprimirFactura").addEventListener("click", () => {
+  // sincrónico a propósito: usa lo que openOrder() ya dejó en currentOrderCache
+  // en vez de volver a leer con await — así el clic sigue "fresco" para que el
+  // navegador permita el diálogo de impresión (ver nota en currentOrderCache).
+  const { o, moto, cliente } = currentOrderCache;
   const items = o.items || [];
   const total = items.reduce((s, it) => s + it.cantidad * it.precio, 0);
 
@@ -1445,11 +1489,12 @@ async function renderCitasList() {
   list.querySelectorAll('[data-action="recordar"]').forEach(btn => {
     btn.addEventListener("click", async (e) => {
       e.stopPropagation();
+      const ventanaWA = abrirVentanaWA();
       const id = Number(btn.dataset.id);
       const c = await DB.get("citas", id);
       const { label, dt } = citaWhenInfo(c);
       const texto = `Hola ${btn.dataset.nombre}, te recordamos tu cita en ENTIMOTORS el ${label === "Hoy" || label === "Mañana" ? label.toLowerCase() : dt.toLocaleDateString()} a las ${dt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}. ¡Te esperamos!`;
-      const sent = openWhatsApp(btn.dataset.tel, texto);
+      const sent = navegarWA(ventanaWA, btn.dataset.tel, texto);
       if (!sent) return;
       await DB.save("citas", { ...c, recordatorioEnviado: true });
       markDirty();
@@ -1460,11 +1505,12 @@ async function renderCitasList() {
   list.querySelectorAll('[data-action="eliminar"]').forEach(btn => {
     btn.addEventListener("click", async (e) => {
       e.stopPropagation();
+      const ventanaWA = btn.dataset.tel ? abrirVentanaWA() : null;
       const id = Number(btn.dataset.id);
       const c = await DB.get("citas", id);
       const { label, dt } = citaWhenInfo(c);
       const texto = `Hola ${btn.dataset.nombre}, tu cita en ENTIMOTORS del ${label === "Hoy" || label === "Mañana" ? label.toLowerCase() : dt.toLocaleDateString()} a las ${dt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })} fue cancelada. Escríbenos para reprogramarla.`;
-      if (btn.dataset.tel) openWhatsApp(btn.dataset.tel, texto);
+      if (btn.dataset.tel) navegarWA(ventanaWA, btn.dataset.tel, texto);
       await DB.delete("citas", id);
       markDirty();
       toast("Cita eliminada" + (btn.dataset.tel ? " y aviso de cancelación abierto en WhatsApp" : ""));
@@ -1536,18 +1582,24 @@ alHacerClicUnaVez(document.getElementById("btnGuardarCita"), async () => {
     if (!nombreTmp) { toast("Falta el nombre del cliente", "off"); return; }
   }
 
-  if (!(await checkCitaConflicto(fecha, hora, mecanico))) return;
+  // se abre YA, antes del modal de confirmación de choque de horario — ese
+  // modal puede tardar segundos en cerrarse (espera a que la persona toque
+  // algo), y para cuando eso resuelve, el gesto original ya expiró y
+  // window.open() se bloquearía en silencio si se abriera hasta después.
+  const mecanicoInfo = TEAM.find(t => t.nombre === mecanico);
+  const ventanaWA = mecanicoInfo?.telefono ? abrirVentanaWA() : null;
+
+  if (!(await checkCitaConflicto(fecha, hora, mecanico))) { ventanaWA?.close(); return; }
 
   const id = await DB.save("citas", { clienteId, nombreTmp, telefonoTmp, fecha, hora, motivo, mecanico, origen: "interna", recordatorioEnviado: false, creadoEn: Date.now() });
   markDirty();
   document.getElementById("modalCita").classList.remove("active");
   toast("Cita guardada");
 
-  const mecanicoInfo = TEAM.find(t => t.nombre === mecanico);
   const nombreCliente = clienteId ? (await DB.get("clientes", clienteId)).nombre : nombreTmp;
   const texto = `Nueva cita asignada: ${nombreCliente} el ${new Date(`${fecha}T${hora}`).toLocaleDateString()} a las ${hora}. Motivo: ${motivo || "sin especificar"}.`;
   if (mecanicoInfo?.telefono) {
-    openWhatsApp(mecanicoInfo.telefono, texto);
+    navegarWA(ventanaWA, mecanicoInfo.telefono, texto);
   } else {
     toast(`${mecanico} no tiene teléfono configurado en TEAM (app.js) — no se pudo abrir el aviso por WhatsApp`, "off");
   }
@@ -1647,11 +1699,12 @@ async function renderClientes() {
   body.querySelectorAll('[data-action="recordar-mant"]').forEach(btn => {
     btn.addEventListener("click", async (e) => {
       e.stopPropagation();
+      const ventanaWA = abrirVentanaWA();
       const moto = await DB.get("motos", Number(btn.dataset.moto));
       const cliente = await DB.get("clientes", Number(btn.dataset.cliente));
       const fecha = new Date(`${moto.mantenimiento.fecha}T00:00:00`).toLocaleDateString();
       const texto = `Hola ${cliente.nombre}, tu ${moto.marca} ${moto.modelo} tiene programado "${moto.mantenimiento.tipo || "mantenimiento"}" para el ${fecha}. ¿Agendamos tu cita?`;
-      const sent = openWhatsApp(cliente.telefono, texto);
+      const sent = navegarWA(ventanaWA, cliente.telefono, texto);
       if (!sent) return;
       moto.mantenimiento.recordatorioEnviado = true;
       await DB.save("motos", moto);
@@ -2107,6 +2160,8 @@ alHacerClicUnaVez(document.getElementById("btnCobrar"), async () => {
       clienteId, metodoPago, efectivoRecibido,
     });
     markDirty();
+    ultimoTicket = { id, venta };
+    document.getElementById("btnReimprimirTicket").style.display = "block";
     imprimirTicketPOS(id, venta);
     toast(`Venta #${id} registrada por ${money(total)}`);
     posCarrito = [];
@@ -2116,6 +2171,15 @@ alHacerClicUnaVez(document.getElementById("btnCobrar"), async () => {
   } catch (err) {
     toast("No se pudo registrar la venta: " + err.message, "off");
   }
+});
+
+let ultimoTicket = null; // { id, venta } — para el botón "Reimprimir último ticket"
+document.getElementById("btnReimprimirTicket").addEventListener("click", () => {
+  // clic nuevo y 100% sincrónico: si el print automático de después de cobrar
+  // no se disparó en el celular (por el gesto ya vencido), este sí funciona,
+  // porque no espera ningún await antes de llamar a window.print().
+  if (!ultimoTicket) return;
+  imprimirTicketPOS(ultimoTicket.id, ultimoTicket.venta);
 });
 
 function imprimirTicketPOS(ventaId, venta) {
@@ -2284,10 +2348,11 @@ async function renderWebCMS() {
     }).join("");
     list.querySelectorAll("[data-confirmar]").forEach(btn => {
       btn.addEventListener("click", async () => {
+        const ventanaWA = abrirVentanaWA();
         const c = await DB.get("citas", Number(btn.dataset.confirmar));
         const { label, dt } = citaWhenInfo(c);
         const texto = `Hola ${btn.dataset.nombre}, confirmamos tu cita en ENTIMOTORS el ${label === "Hoy" || label === "Mañana" ? label.toLowerCase() : dt.toLocaleDateString()} a las ${dt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}. ¡Te esperamos!`;
-        const sent = openWhatsApp(btn.dataset.tel, texto);
+        const sent = navegarWA(ventanaWA, btn.dataset.tel, texto);
         if (!sent) return;
         await DB.save("citas", { ...c, confirmada: true });
         markDirty();

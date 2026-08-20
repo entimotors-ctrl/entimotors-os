@@ -8,6 +8,15 @@
 <meta name="theme-color" content="#0a0a0a">
 <link rel="icon" href="icons/icon-192.png">
 <link rel="apple-touch-icon" href="icons/icon-192.png">
+<script>
+  // aplica el tema guardado ANTES de pintar la página — si esto se hiciera desde
+  // app.js (que carga después y tarda más), se vería un parpadeo del tema del
+  // sistema cambiando al tema elegido apenas un instante después.
+  (function () {
+    var t = localStorage.getItem("enti_theme");
+    if (t === "light" || t === "dark") document.documentElement.setAttribute("data-theme", t);
+  })();
+</script>
 <!-- Requiere internet la primera vez; el service worker la cachea después para que los gráficos también funcionen sin conexión. -->
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <style>
@@ -752,6 +761,7 @@
         <div class="account-panel" id="accountPanel">
           <span class="chip" id="syncChip"><span class="dot on" id="syncDot"></span><span id="syncLabel">En línea · sincronizado</span></span>
           <button class="btn small ghost" id="offlineToggle" title="Simular pérdida de señal para probar el modo sin internet">Simular sin conexión</button>
+          <button class="btn small ghost" id="btnTema" title="Cambiar entre modo claro y oscuro">🌙 Modo oscuro</button>
           <span class="chip user-chip"><span class="who"><span id="loggedUserName">—</span><small id="loggedUserRole"></small></span></span>
           <button class="btn small ghost" id="btnLogout">Cerrar sesión</button>
         </div>
@@ -802,21 +812,13 @@
           </div>
         </div>
         <div class="qa-group qa-group-dark">
-          <span class="qa-group-label">Sitio web</span>
+          <span class="qa-group-label">Sitio web y sistema</span>
           <div class="qa-falling-tools" aria-hidden="true">
             <span class="qa-tool t1">🔧</span><span class="qa-tool t2">🪛</span><span class="qa-tool t3">⚙️</span>
             <span class="qa-tool t4">🔩</span><span class="qa-tool t5">🔧</span><span class="qa-tool t6">⚙️</span>
           </div>
           <div class="qa-grid">
             <button type="button" class="qa-btn" data-view="web-cms"><span class="qa-top"><span class="qa-ic">🌐</span><span class="qa-num">7</span></span><span class="qa-lbl">Gestor de la web</span></button>
-          </div>
-        </div>
-        <div class="qa-group qa-group-dark">
-          <span class="qa-group-label">Sistema</span>
-          <div class="qa-falling-tools" aria-hidden="true">
-            <span class="qa-tool t7">🪛</span><span class="qa-tool t8">🔩</span><span class="qa-tool t9">🔧</span>
-          </div>
-          <div class="qa-grid">
             <button type="button" class="qa-btn" data-view="ajustes"><span class="qa-top"><span class="qa-ic">⚙️</span><span class="qa-num">8</span></span><span class="qa-lbl">Ajustes</span></button>
           </div>
         </div>
@@ -974,6 +976,7 @@
           </div>
 
           <button class="btn primary" id="btnCobrar" style="width:100%;">Cobrar</button>
+          <button class="btn small ghost" id="btnReimprimirTicket" style="width:100%; margin-top:0.5rem; display:none;">🖨️ Reimprimir último ticket</button>
         </div>
       </div>
     </section>
@@ -1417,6 +1420,6 @@
      sw.js) — es la forma más universal de forzar que CUALQUIER navegador
      pida el archivo de nuevo aunque ya tenga guardada una copia vieja en su
      propio caché HTTP, sin depender de que respete el Service Worker. -->
-<script src="app.js?v=2.6.1"></script>
+<script src="app.js?v=2.7.0"></script>
 </body>
 </html>
