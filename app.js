@@ -2142,6 +2142,32 @@ function actualizarCambioPOS() {
   document.getElementById("posCambio").textContent = money(Math.max(0, recibido - total));
 }
 
+function abrirModalServicioPOS() {
+  document.getElementById("servicioPOSNombre").value = "";
+  document.getElementById("servicioPOSCantidad").value = "1";
+  document.getElementById("servicioPOSPrecio").value = "";
+  document.getElementById("modalServicioPOS").classList.add("active");
+  setTimeout(() => document.getElementById("servicioPOSNombre").focus(), 50);
+}
+function cerrarModalServicioPOS() { document.getElementById("modalServicioPOS").classList.remove("active"); }
+
+document.getElementById("btnAgregarServicioPOS").addEventListener("click", abrirModalServicioPOS);
+document.getElementById("btnCancelarServicioPOS").addEventListener("click", cerrarModalServicioPOS);
+
+alHacerClicUnaVez(document.getElementById("btnGuardarServicioPOS"), async () => {
+  const nombre = document.getElementById("servicioPOSNombre").value.trim();
+  const cantidad = Number(document.getElementById("servicioPOSCantidad").value) || 1;
+  const precio = Number(document.getElementById("servicioPOSPrecio").value);
+  if (!nombre) { toast("Escribe el nombre del servicio", "off"); return; }
+  if (cantidad <= 0) { toast("La cantidad debe ser mayor a 0", "off"); return; }
+  if (!(precio >= 0)) { toast("El precio no puede ser negativo", "off"); return; }
+  // inventarioId: null → registrarVentaRapida lo trata como ítem manual sin tocar stock
+  posCarrito.push({ inventarioId: null, nombre, cantidad, precio });
+  cerrarModalServicioPOS();
+  renderPosCarrito();
+  toast(`"${nombre}" agregado al carrito`);
+});
+
 document.getElementById("posBuscar").addEventListener("input", (e) => { posBusqueda = e.target.value; renderPOS(); });
 document.getElementById("posMetodo").addEventListener("change", actualizarCambioPOS);
 document.getElementById("posEfectivoRecibido").addEventListener("input", actualizarCambioPOS);

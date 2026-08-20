@@ -956,6 +956,7 @@
         </div>
         <div class="card">
           <h3 class="font-display" style="font-size:0.95rem; margin-bottom:0.5rem;">Carrito</h3>
+          <button type="button" class="btn ghost small" id="btnAgregarServicioPOS" style="width:100%; margin-bottom:0.6rem;">🔧 Cobrar servicio (sin inventario)</button>
           <div id="posCarrito"><div class="empty" style="padding:1rem 0;">Toca un producto para agregarlo</div></div>
           <div class="pos-total-row"><span>Total</span><span class="big" id="posTotal">L. 0.00</span></div>
 
@@ -1256,6 +1257,24 @@
   </div>
 </div>
 
+<!-- Modal: cobrar servicio suelto en TPV (sin inventario) -->
+<div class="modal-bg" id="modalServicioPOS">
+  <div class="modal">
+    <h3>Cobrar servicio</h3>
+    <p class="hint">Para mano de obra u otros cobros que no están en el inventario.</p>
+    <label>Nombre del servicio</label>
+    <input type="text" id="servicioPOSNombre" placeholder="Ej. Mano de obra, revisión general…">
+    <div class="field-row" style="grid-template-columns:1fr 1fr;">
+      <div><label>Cantidad</label><input type="number" id="servicioPOSCantidad" value="1" min="1"></div>
+      <div><label>Precio (L.)</label><input type="number" id="servicioPOSPrecio" step="0.01" min="0"></div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn ghost" id="btnCancelarServicioPOS">Cancelar</button>
+      <button class="btn primary" id="btnGuardarServicioPOS">Agregar al carrito</button>
+    </div>
+  </div>
+</div>
+
 <!-- Modal: nuevo repuesto -->
 <div class="modal-bg" id="modalRepuesto">
   <div class="modal">
@@ -1420,6 +1439,6 @@
      sw.js) — es la forma más universal de forzar que CUALQUIER navegador
      pida el archivo de nuevo aunque ya tenga guardada una copia vieja en su
      propio caché HTTP, sin depender de que respete el Service Worker. -->
-<script src="app.js?v=2.7.0"></script>
+<script src="app.js?v=2.8.0"></script>
 </body>
 </html>
