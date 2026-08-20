@@ -228,7 +228,7 @@ function setStage(ord, key) {
    IndexedDB ya garantiza atomicidad dentro de una misma transacción: si cualquier
    request falla, el navegador aborta TODA la transacción automáticamente (no hay
    que revertir nada a mano) y t.onerror/t.onabort se disparan en vez de t.oncomplete. */
-function registrarVentaRapida({ items, clienteId, metodoPago, efectivoRecibido }) {
+function registrarVentaRapida({ items, clienteId, clienteNombre, metodoPago, efectivoRecibido }) {
   return new Promise((resolve, reject) => {
     if (!items || !items.length) { reject(new Error("El carrito está vacío")); return; }
 
@@ -242,7 +242,7 @@ function registrarVentaRapida({ items, clienteId, metodoPago, efectivoRecibido }
     let ventaId = null;
 
     const venta = {
-      items, clienteId: clienteId || null, metodoPago, total,
+      items, clienteId: clienteId || null, clienteNombre: clienteNombre || null, metodoPago, total,
       efectivoRecibido: metodoPago === "efectivo" ? Number(efectivoRecibido) || 0 : null,
       cambio: metodoPago === "efectivo" ? Math.max(0, (Number(efectivoRecibido) || 0) - total) : 0,
       fechaISO, creadoEn: Date.now(), mecanico: currentUser?.nombre || "",
@@ -2169,6 +2169,11 @@ alHacerClicUnaVez(document.getElementById("btnGuardarServicioPOS"), async () => 
 });
 
 document.getElementById("posBuscar").addEventListener("input", (e) => { posBusqueda = e.target.value; renderPOS(); });
+document.getElementById("posCliente").addEventListener("change", (e) => {
+  const nombreInput = document.getElementById("posClienteNombre");
+  if (e.target.value) { nombreInput.value = ""; nombreInput.disabled = true; }
+  else nombreInput.disabled = false;
+});
 document.getElementById("posMetodo").addEventListener("change", actualizarCambioPOS);
 document.getElementById("posEfectivoRecibido").addEventListener("input", actualizarCambioPOS);
 
@@ -2178,12 +2183,20 @@ alHacerClicUnaVez(document.getElementById("btnCobrar"), async () => {
   const efectivoRecibido = Number(document.getElementById("posEfectivoRecibido").value) || 0;
   const total = posCarrito.reduce((s, it) => s + it.cantidad * it.precio, 0);
   if (metodoPago === "efectivo" && efectivoRecibido < total) { toast("El efectivo recibido es menor que el total", "off"); return; }
-  const clienteId = document.getElementById("posCliente").value ? Number(document.getElementById("posCliente").value) : null;
+  const posClienteSelect = document.getElementById("posCliente");
+  const clienteId = posClienteSelect.value ? Number(posClienteSelect.value) : null;
+  // el nombre se resuelve aquí (del <select> ya cargado o del campo libre) y se guarda
+  // tal cual en la venta, para que el ticket lo muestre sin tener que consultar la BD
+  // de nuevo en imprimirTicketPOS — eso mantendría el segundo clic 100% sincrónico.
+  const clienteNombreLibre = document.getElementById("posClienteNombre").value.trim();
+  const clienteNombre = clienteId
+    ? posClienteSelect.options[posClienteSelect.selectedIndex].textContent
+    : (clienteNombreLibre || null);
 
   try {
     const { id, venta } = await registrarVentaRapida({
       items: posCarrito.map(it => ({ inventarioId: it.inventarioId, nombre: it.nombre, cantidad: it.cantidad, precio: it.precio })),
-      clienteId, metodoPago, efectivoRecibido,
+      clienteId, clienteNombre, metodoPago, efectivoRecibido,
     });
     markDirty();
     ultimoTicket = { id, venta };
@@ -2192,6 +2205,8 @@ alHacerClicUnaVez(document.getElementById("btnCobrar"), async () => {
     toast(`Venta #${id} registrada por ${money(total)}`);
     posCarrito = [];
     document.getElementById("posEfectivoRecibido").value = "";
+    document.getElementById("posClienteNombre").value = "";
+    document.getElementById("posClienteNombre").disabled = !!posClienteSelect.value;
     renderPOS();
     renderDashboard();
   } catch (err) {
@@ -2210,6 +2225,13 @@ document.getElementById("btnReimprimirTicket").addEventListener("click", () => {
 
 function imprimirTicketPOS(ventaId, venta) {
   document.getElementById("ticketFecha").textContent = new Date(venta.fechaISO).toLocaleString("es-HN");
+  const clienteRow = document.getElementById("ticketClienteRow");
+  if (venta.clienteNombre) {
+    document.getElementById("ticketCliente").textContent = venta.clienteNombre;
+    clienteRow.style.display = "block";
+  } else {
+    clienteRow.style.display = "none";
+  }
   document.getElementById("ticketItems").innerHTML = venta.items.map(it => `
     <div class="ticket-item-row"><span>${esc(it.nombre)} x${it.cantidad}</span><span>${money(it.cantidad * it.precio)}</span></div>
   `).join("");

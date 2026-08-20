@@ -971,6 +971,7 @@
 
           <label>Cliente (opcional)</label>
           <select id="posCliente"><option value="">Cliente de mostrador</option></select>
+          <input type="text" id="posClienteNombre" placeholder="O escribe el nombre si no está registrado" style="margin-top:0.4rem;">
 
           <label>Método de pago</label>
           <select id="posMetodo">
@@ -1125,6 +1126,7 @@
     Venta rápida<br>
     <span id="ticketFecha"></span>
   </div>
+  <div id="ticketClienteRow" style="display:none; margin-top:0.3rem;">Cliente: <span id="ticketCliente"></span></div>
   <hr>
   <div id="ticketItems"></div>
   <hr>
@@ -1448,6 +1450,6 @@
      sw.js) — es la forma más universal de forzar que CUALQUIER navegador
      pida el archivo de nuevo aunque ya tenga guardada una copia vieja en su
      propio caché HTTP, sin depender de que respete el Service Worker. -->
-<script src="app.js?v=2.8.1"></script>
+<script src="app.js?v=2.9.0"></script>
 </body>
 </html>
