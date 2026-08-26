@@ -418,6 +418,29 @@
   .fin-view table thead th { border-bottom-width: 2px; }
   .fin-view tbody tr:hover { background: var(--panel); }
 
+  /* ---- detalle de crédito: un cliente puede tener varias facturas, así que
+     el modal muestra primero su saldo consolidado y luego cada factura por
+     separado con su fecha y sus propios botones ---- */
+  .cred-resumen { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.6rem; }
+  .cred-resumen > div {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 0.6rem;
+    padding: 0.55rem 0.7rem; display: flex; flex-direction: column; gap: 0.15rem;
+  }
+  .cred-resumen .eyebrow { font-family: 'Teko', sans-serif; font-size: 0.62rem; letter-spacing: 0.1em; text-transform: uppercase; color: var(--text-faint); }
+  .cred-resumen b { font-family: 'Teko', sans-serif; font-size: 1.25rem; font-variant-numeric: tabular-nums; line-height: 1; }
+  .cred-resumen b.saldo { color: var(--red); }
+
+  .cred-factura { border: 1px solid var(--border); border-radius: 0.7rem; padding: 0.7rem 0.8rem; margin-bottom: 0.6rem; background: var(--panel); }
+  .cred-factura-head { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 0.4rem; }
+  .cred-factura-head .quien { font-weight: 600; font-size: 0.9rem; }
+  .cred-factura-head .cuando { color: var(--text-muted); font-size: 0.8rem; font-weight: 400; }
+  .cred-factura table { font-size: 0.82rem; }
+  .cred-factura td, .cred-factura th { padding: 0.3rem 0.4rem; }
+  .cred-factura-tot { display: flex; flex-wrap: wrap; gap: 0.2rem 0.9rem; font-size: 0.8rem; color: var(--text-muted); margin-top: 0.45rem; }
+  .cred-factura-tot b { color: var(--text); font-variant-numeric: tabular-nums; }
+  .cred-factura-tot b.saldo { color: var(--red); }
+  .cred-factura-acciones { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 0.6rem; }
+
   /* ---- acceso rápido (página principal): mismos 8 destinos y mismo orden que
      el menú hamburguesa, como botones grandes para no tener que abrir el menú. ---- */
   .qa-wrap { display: flex; flex-direction: column; gap: 0.8rem; margin-bottom: 1.8rem; }
@@ -600,6 +623,23 @@
     }
     body.print-credito table { color: #111; }
     body.print-credito th, body.print-credito td { border-color: #ccc !important; }
+  }
+
+  /* ---- impresión de estado de cuenta (todas las facturas de un cliente) ---- */
+  #estadoCuentaPrint { display: none; }
+  @media print {
+    body.print-estado #facturaPrint, body.print-estado #facturaPrint * { visibility: hidden !important; display: none !important; }
+    body.print-estado #estadoCuentaPrint, body.print-estado #estadoCuentaPrint * { visibility: visible !important; }
+    body.print-estado #estadoCuentaPrint {
+      display: block !important; position: absolute; top: 0; left: 0; width: 100%; padding: 2cm; color: #111; background: #fff;
+      -webkit-print-color-adjust: exact; print-color-adjust: exact;
+    }
+    body.print-estado table { color: #111; }
+    body.print-estado th, body.print-estado td { border-color: #ccc !important; }
+    /* cada factura del estado de cuenta procura no partirse a la mitad entre páginas */
+    .edc-factura { margin-bottom: 1.1rem; break-inside: avoid; page-break-inside: avoid; }
+    .edc-factura-head { font-size: 0.9rem; font-weight: 700; margin-bottom: 0.25rem; border-bottom: 1px solid #ccc; padding-bottom: 0.2rem; }
+    .edc-factura-tot { text-align: right; font-size: 0.85rem; margin-top: 0.25rem; }
   }
 
   /* botón hamburguesa: solo existe visualmente en mobile/tablet angosto.
@@ -1141,7 +1181,7 @@
       </div>
       <div class="table-scroll">
       <table>
-        <thead><tr><th>Cliente</th><th>Fecha</th><th class="num">Total</th><th class="num">Abonado</th><th class="num">Saldo</th><th>Estado</th><th></th></tr></thead>
+        <thead><tr><th>Cliente</th><th class="num">Facturas</th><th>Último crédito</th><th class="num">Total</th><th class="num">Abonado</th><th class="num">Saldo</th><th>Estado</th><th></th></tr></thead>
         <tbody id="creditosBody"></tbody>
       </table>
       </div>
@@ -1386,25 +1426,23 @@
 <!-- Modal: detalle de crédito — factura + todas sus funciones en un solo lugar -->
 <div class="modal-bg" id="modalCreditoDetalle">
   <div class="modal" style="max-width:560px;">
-    <h3 id="credDetTitulo">Crédito</h3>
+    <h3 id="credDetTitulo">Cliente</h3>
     <p class="hint" id="credDetSub" style="margin-top:-0.6rem;"></p>
-    <div class="table-scroll">
-    <table>
-      <thead><tr><th>Ítem</th><th class="num">Cant.</th><th class="num">Precio</th><th class="num">Subtotal</th></tr></thead>
-      <tbody id="credDetItems"></tbody>
-    </table>
+
+    <div class="cred-resumen">
+      <div><span class="eyebrow">Total a crédito</span><b id="credDetTotal">L. 0.00</b></div>
+      <div><span class="eyebrow">Abonado</span><b id="credDetAbonado">L. 0.00</b></div>
+      <div><span class="eyebrow">Saldo</span><b id="credDetSaldo" class="saldo">L. 0.00</b></div>
     </div>
-    <div class="pos-total-row"><span>Total</span><span class="big" id="credDetTotal">L. 0.00</span></div>
-    <div style="display:flex; justify-content:space-between; font-size:0.9rem; color:var(--text-muted); margin-top:-0.6rem; margin-bottom:0.8rem;">
-      <span>Abonado: <b id="credDetAbonado" style="color:var(--text);"></b></span>
-      <span>Saldo: <b id="credDetSaldo" style="color:var(--red);"></b></span>
-    </div>
-    <p class="hint" id="credDetNota" style="display:none;"></p>
+
+    <div class="fin-section-label" style="margin-top:1.1rem;" id="credDetListaLabel">Historial de facturas</div>
+    <!-- una tarjeta por factura: cada una con su fecha y sus propios botones,
+         para poder abonar o imprimir esa factura en concreto sin salir de aquí -->
+    <div id="credDetLista"></div>
+
     <div class="modal-actions" style="justify-content:flex-start; flex-wrap:wrap;">
-      <button type="button" class="btn small" id="btnDetAbonar">Abonar</button>
-      <button type="button" class="btn wa small" id="btnDetRecordar">Recordar</button>
-      <button type="button" class="btn ghost small" id="btnDetImprimir">🖨️ Factura</button>
-      <button type="button" class="btn ghost small danger" id="btnDetEliminar">🗑 Eliminar</button>
+      <button type="button" class="btn wa small" id="btnDetRecordar">Recordar saldo</button>
+      <button type="button" class="btn ghost small" id="btnDetEstadoCuenta">🖨️ Estado de cuenta</button>
     </div>
     <div class="modal-actions">
       <button class="btn ghost" id="btnCerrarCreditoDetalle">Cerrar</button>
@@ -1674,10 +1712,34 @@
   <div style="margin-top:1rem; font-size:0.8rem; color:#666;">Factura a crédito — pendiente de cobro.</div>
 </div>
 
+<!-- Plantilla de impresión: estado de cuenta — todas las facturas a crédito de
+     un mismo cliente en un solo documento, cada una con su fecha -->
+<div id="estadoCuentaPrint">
+  <div class="factura-header">
+    <div class="factura-marca">
+      <img src="icons/icon-192.png" alt="" class="factura-logo">
+      <div class="marca">ENTI<span style="color:#e11d48;">MOTORS</span></div>
+    </div>
+    <div class="factura-meta">
+      <div><b>Estado de cuenta</b></div>
+      <div id="edcFecha"></div>
+    </div>
+  </div>
+  <div class="factura-block">
+    <b>Cliente</b>
+    <span id="edcCliente"></span> — <span id="edcTelefono"></span>
+  </div>
+  <div id="edcFacturas"></div>
+  <div class="factura-total">Total a crédito: <span id="edcTotal"></span></div>
+  <div class="factura-total">Abonado: <span id="edcAbonado"></span></div>
+  <div class="factura-total" style="color:#e11d48;">Saldo pendiente: <span id="edcSaldo"></span></div>
+  <div style="margin-top:1rem; font-size:0.8rem; color:#666;">Resumen de todas las facturas a crédito de este cliente.</div>
+</div>
+
 <!-- el ?v= debe cambiar cada vez que se toque app.js (junto con CACHE_NAME en
      sw.js) — es la forma más universal de forzar que CUALQUIER navegador
      pida el archivo de nuevo aunque ya tenga guardada una copia vieja en su
      propio caché HTTP, sin depender de que respete el Service Worker. -->
-<script src="app.js?v=3.3.0"></script>
+<script src="app.js?v=3.4.0"></script>
 </body>
 </html>

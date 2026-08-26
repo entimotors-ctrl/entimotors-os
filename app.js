@@ -2596,6 +2596,47 @@ let creditosFiltroEstado = ""; // "" | "pendiente" (incluye parcial) | "pagado"
 let creditosCache = {}; // id -> crédito, se llena en cada renderCreditos() para que
                          // imprimir/recordar no necesiten un await antes de actuar
                          // sobre el clic (mismo motivo que currentOrderCache/ultimoTicket).
+let creditosPorCliente = {}; // clave de cliente -> { nombre, telefono, creditos[], total, abonado, saldo, estado }
+
+// Un mismo cliente puede llevar varias veces al crédito, y cada vez genera su
+// propia factura. En la lista queremos verlo UNA sola vez con su saldo junto,
+// así que agrupamos por cliente: por id cuando lo tiene (que es siempre en los
+// créditos nuevos, porque al registrarlos se crea el cliente si no existía) y
+// por nombre como respaldo para registros viejos. Sin nombre ni id, cada
+// crédito queda solo en su propio grupo para no mezclar clientes distintos.
+function claveCliente(cred) {
+  if (cred.clienteId) return `id:${cred.clienteId}`;
+  const nombre = (cred.clienteNombre || "").trim().toLowerCase();
+  return nombre ? `n:${nombre}` : `s:${cred.id}`;
+}
+
+function agruparCreditosPorCliente(creditos) {
+  const grupos = {};
+  creditos.forEach(c => {
+    const clave = claveCliente(c);
+    if (!grupos[clave]) {
+      grupos[clave] = {
+        clave,
+        nombre: c.clienteNombre || "Cliente de mostrador",
+        telefono: c.clienteTelefono || "",
+        creditos: [], total: 0, abonado: 0, saldo: 0,
+      };
+    }
+    const g = grupos[clave];
+    g.creditos.push(c);
+    g.total += c.total;
+    g.abonado += c.abonado;
+    g.saldo += c.saldo;
+    // el teléfono más reciente que tengamos gana, por si lo actualizó después
+    if (!g.telefono && c.clienteTelefono) g.telefono = c.clienteTelefono;
+  });
+  Object.values(grupos).forEach(g => {
+    g.creditos.sort((a, b) => b.fechaISO.localeCompare(a.fechaISO));
+    g.ultimaFecha = g.creditos[0].fechaISO;
+    g.estado = g.saldo <= 0.01 ? "pagado" : (g.abonado > 0 ? "parcial" : "pendiente");
+  });
+  return Object.values(grupos).sort((a, b) => b.ultimaFecha.localeCompare(a.ultimaFecha));
+}
 
 async function renderCreditos() {
   const creditos = (await DB.getAll("creditos")).sort((a, b) => b.fechaISO.localeCompare(a.fechaISO));
@@ -2615,32 +2656,42 @@ async function renderCreditos() {
     <div class="widget-card"><span class="eyebrow" style="color:var(--text-faint);">Créditos totales</span><span class="big">${creditos.length}</span><span class="sub">Histórico</span></div>
   `;
 
-  const filtrados = creditos.filter(c => {
+  const grupos = agruparCreditosPorCliente(creditos);
+  creditosPorCliente = {};
+  grupos.forEach(g => { creditosPorCliente[g.clave] = g; });
+
+  const filtrados = grupos.filter(g => {
     if (!creditosFiltroEstado) return true;
-    if (creditosFiltroEstado === "pendiente") return c.estado !== "pagado";
-    return c.estado === creditosFiltroEstado;
+    if (creditosFiltroEstado === "pendiente") return g.estado !== "pagado";
+    return g.estado === creditosFiltroEstado;
   });
 
   const estadoLabel = { pendiente: "Pendiente", parcial: "Parcial", pagado: "Pagado" };
   const body = document.getElementById("creditosBody");
   document.getElementById("creditosEmpty").style.display = filtrados.length ? "none" : "block";
-  // clic en cualquier parte de la fila abre el detalle del crédito con todas
-  // sus funciones (abonar, recordar, factura, eliminar) — así no hace falta
-  // hacer scroll horizontal para llegar a los botones en pantallas angostas.
-  body.innerHTML = filtrados.map(c => `
-    <tr class="credito-row" data-id="${c.id}" style="cursor:pointer;">
-      <td>${esc(c.clienteNombre || "Cliente de mostrador")}</td>
-      <td>${new Date(c.fechaISO).toLocaleDateString("es-HN")}</td>
-      <td class="num">${money(c.total)}</td>
-      <td class="num">${money(c.abonado)}</td>
-      <td class="num">${money(c.saldo)}</td>
-      <td><span class="pill ${c.estado}">${estadoLabel[c.estado]}</span></td>
+  // una fila por cliente, no por factura: al tocarla se abre su historial
+  // completo con cada factura por separado y sus propios botones.
+  body.innerHTML = filtrados.map(g => `
+    <tr class="credito-row" data-clave="${esc(g.clave)}" style="cursor:pointer;">
+      <td>${esc(g.nombre)}</td>
+      <td class="num">${g.creditos.length}</td>
+      <td>${new Date(g.ultimaFecha).toLocaleDateString("es-HN")}</td>
+      <td class="num">${money(g.total)}</td>
+      <td class="num">${money(g.abonado)}</td>
+      <td class="num">${money(g.saldo)}</td>
+      <td><span class="pill ${g.estado}">${estadoLabel[g.estado]}</span></td>
       <td class="num" style="color:var(--text-faint);">›</td>
     </tr>`).join("");
 
   body.querySelectorAll(".credito-row").forEach(tr => {
-    tr.addEventListener("click", () => abrirCreditoDetalle(Number(tr.dataset.id)));
+    tr.addEventListener("click", () => abrirCreditoDetalle(tr.dataset.clave));
   });
+
+  // si el detalle está abierto, lo refrescamos para que un abono o un borrado
+  // se vea de inmediato sin tener que cerrarlo y volverlo a abrir
+  if (creditoDetalleClave && document.getElementById("modalCreditoDetalle").classList.contains("active")) {
+    abrirCreditoDetalle(creditoDetalleClave);
+  }
 }
 
 document.getElementById("creditosFiltro").querySelectorAll(".cat-chip").forEach(btn => {
@@ -2667,54 +2718,128 @@ function imprimirFacturaCredito(cred) {
   setTimeout(() => document.body.classList.remove("print-credito"), 300);
 }
 
-/* ---- detalle de un crédito: reúne factura + acciones en un solo lugar, para
-   no tener que ir a buscar botones haciendo scroll en la tabla ---- */
-let creditoDetalleId = null;
+/* ---- detalle de un cliente: su saldo consolidado y TODAS sus facturas a
+   crédito en un solo historial, cada una con su fecha y sus propios botones
+   (abonar / imprimir esa factura / eliminarla) ---- */
+let creditoDetalleClave = null;
 const estadoLabelDetalle = { pendiente: "Pendiente", parcial: "Parcial", pagado: "Pagado" };
 
-function abrirCreditoDetalle(id) {
-  const cred = creditosCache[id];
-  if (!cred) return;
-  creditoDetalleId = id;
+function abrirCreditoDetalle(clave) {
+  const g = creditosPorCliente[clave];
+  if (!g) return;
+  creditoDetalleClave = clave;
 
-  document.getElementById("credDetTitulo").textContent = cred.clienteNombre || "Cliente de mostrador";
-  document.getElementById("credDetSub").innerHTML = `Crédito #${cred.id} · ${new Date(cred.fechaISO).toLocaleDateString("es-HN")} · ${esc(cred.clienteTelefono || "sin teléfono")} · <span class="pill ${cred.estado}">${estadoLabelDetalle[cred.estado]}</span>`;
-  document.getElementById("credDetItems").innerHTML = cred.items.map(it => `
-    <tr><td>${esc(it.nombre)}</td><td class="num">${it.cantidad}</td><td class="num">${money(it.precio)}</td><td class="num">${money(it.cantidad * it.precio)}</td></tr>
+  document.getElementById("credDetTitulo").textContent = g.nombre;
+  document.getElementById("credDetSub").innerHTML =
+    `${esc(g.telefono || "sin teléfono")} · ${g.creditos.length} factura${g.creditos.length === 1 ? "" : "s"} a crédito · <span class="pill ${g.estado}">${estadoLabelDetalle[g.estado]}</span>`;
+  document.getElementById("credDetTotal").textContent = money(g.total);
+  document.getElementById("credDetAbonado").textContent = money(g.abonado);
+  document.getElementById("credDetSaldo").textContent = money(g.saldo);
+  document.getElementById("credDetListaLabel").textContent =
+    g.creditos.length === 1 ? "Factura" : `Historial de facturas (${g.creditos.length})`;
+
+  document.getElementById("credDetLista").innerHTML = g.creditos.map(c => `
+    <div class="cred-factura" data-id="${c.id}">
+      <div class="cred-factura-head">
+        <div><span class="quien">Crédito #${c.id}</span> <span class="cuando">${new Date(c.fechaISO).toLocaleDateString("es-HN")}</span></div>
+        <span class="pill ${c.estado}">${estadoLabelDetalle[c.estado]}</span>
+      </div>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th>Ítem</th><th class="num">Cant.</th><th class="num">Precio</th><th class="num">Subtotal</th></tr></thead>
+          <tbody>${c.items.map(it => `
+            <tr><td>${esc(it.nombre)}</td><td class="num">${it.cantidad}</td><td class="num">${money(it.precio)}</td><td class="num">${money(it.cantidad * it.precio)}</td></tr>
+          `).join("")}</tbody>
+        </table>
+      </div>
+      <div class="cred-factura-tot">
+        <span>Total <b>${money(c.total)}</b></span>
+        <span>Abonado <b>${money(c.abonado)}</b></span>
+        <span>Saldo <b class="saldo">${money(c.saldo)}</b></span>
+      </div>
+      ${c.nota ? `<p class="hint" style="margin:0.4rem 0 0;">Nota: ${esc(c.nota)}</p>` : ""}
+      <div class="cred-factura-acciones">
+        ${c.estado !== "pagado" ? `<button type="button" class="btn small" data-act="abonar">Abonar</button>` : ""}
+        <button type="button" class="btn ghost small" data-act="imprimir">🖨️ Factura</button>
+        ${c.abonado === 0 ? `<button type="button" class="btn ghost small danger" data-act="eliminar">🗑</button>` : ""}
+      </div>
+    </div>
   `).join("");
-  document.getElementById("credDetTotal").textContent = money(cred.total);
-  document.getElementById("credDetAbonado").textContent = money(cred.abonado);
-  document.getElementById("credDetSaldo").textContent = money(cred.saldo);
 
-  const notaEl = document.getElementById("credDetNota");
-  if (cred.nota) { notaEl.textContent = `Nota: ${cred.nota}`; notaEl.style.display = "block"; } else notaEl.style.display = "none";
-
-  document.getElementById("btnDetAbonar").style.display = cred.estado !== "pagado" ? "inline-flex" : "none";
-  document.getElementById("btnDetRecordar").style.display = (cred.clienteTelefono && cred.estado !== "pagado") ? "inline-flex" : "none";
-  document.getElementById("btnDetEliminar").style.display = cred.abonado === 0 ? "inline-flex" : "none";
-
+  document.getElementById("btnDetRecordar").style.display = (g.telefono && g.saldo > 0.01) ? "inline-flex" : "none";
   document.getElementById("modalCreditoDetalle").classList.add("active");
 }
-document.getElementById("btnCerrarCreditoDetalle").addEventListener("click", () => document.getElementById("modalCreditoDetalle").classList.remove("active"));
-
-document.getElementById("btnDetAbonar").addEventListener("click", () => {
+document.getElementById("btnCerrarCreditoDetalle").addEventListener("click", () => {
   document.getElementById("modalCreditoDetalle").classList.remove("active");
-  abrirModalAbonoCredito(creditoDetalleId);
+  creditoDetalleClave = null;
 });
-document.getElementById("btnDetImprimir").addEventListener("click", () => imprimirFacturaCredito(creditosCache[creditoDetalleId]));
+
+// delegación: los botones de cada factura se generan en cada render, así que
+// escuchamos en el contenedor en vez de re-enganchar listeners uno por uno.
+document.getElementById("credDetLista").addEventListener("click", (e) => {
+  const btn = e.target.closest("button[data-act]");
+  if (!btn) return;
+  const id = Number(btn.closest(".cred-factura").dataset.id);
+  const act = btn.dataset.act;
+
+  if (act === "imprimir") { imprimirFacturaCredito(creditosCache[id]); return; }
+  if (act === "abonar") {
+    document.getElementById("modalCreditoDetalle").classList.remove("active");
+    abrirModalAbonoCredito(id);
+    return;
+  }
+  if (act === "eliminar") {
+    requestAdminCode(async () => {
+      await eliminarCredito(id);
+      toast("Crédito eliminado");
+      await renderCreditos();
+      // si al cliente ya no le queda ninguna factura, el grupo desaparece
+      if (!creditosPorCliente[creditoDetalleClave]) {
+        document.getElementById("modalCreditoDetalle").classList.remove("active");
+        creditoDetalleClave = null;
+      }
+    });
+  }
+});
+
 document.getElementById("btnDetRecordar").addEventListener("click", () => {
   const ventana = abrirVentanaWA(); // sincrónico, antes de cualquier await — ver nota en abrirVentanaWA()
-  const cred = creditosCache[creditoDetalleId];
-  const texto = `Hola ${cred.clienteNombre}, te recordamos que tienes un saldo pendiente de ${money(cred.saldo)} con ENTIMOTORS por el crédito #${cred.id}. ¡Gracias!`;
-  navegarWA(ventana, cred.clienteTelefono, texto);
+  const g = creditosPorCliente[creditoDetalleClave];
+  const pendientes = g.creditos.filter(c => c.saldo > 0.01);
+  const detalle = pendientes
+    .map(c => `• Crédito #${c.id} del ${new Date(c.fechaISO).toLocaleDateString("es-HN")}: ${money(c.saldo)}`)
+    .join("\n");
+  const texto = pendientes.length === 1
+    ? `Hola ${g.nombre}, te recordamos que tienes un saldo pendiente de ${money(g.saldo)} con ENTIMOTORS por el crédito #${pendientes[0].id}. ¡Gracias!`
+    : `Hola ${g.nombre}, te recordamos que tienes un saldo pendiente de ${money(g.saldo)} con ENTIMOTORS:\n${detalle}\n¡Gracias!`;
+  navegarWA(ventana, g.telefono, texto);
 });
-document.getElementById("btnDetEliminar").addEventListener("click", () => {
-  requestAdminCode(async () => {
-    await eliminarCredito(creditoDetalleId);
-    document.getElementById("modalCreditoDetalle").classList.remove("active");
-    toast("Crédito eliminado");
-    renderCreditos();
-  });
+
+// estado de cuenta: todas las facturas del cliente en un solo documento
+document.getElementById("btnDetEstadoCuenta").addEventListener("click", () => {
+  const g = creditosPorCliente[creditoDetalleClave];
+  if (!g) return;
+  document.getElementById("edcFecha").textContent = new Date().toLocaleDateString("es-HN");
+  document.getElementById("edcCliente").textContent = g.nombre;
+  document.getElementById("edcTelefono").textContent = g.telefono || "";
+  document.getElementById("edcFacturas").innerHTML = g.creditos.map(c => `
+    <div class="edc-factura">
+      <div class="edc-factura-head">Crédito #${c.id} — ${new Date(c.fechaISO).toLocaleDateString("es-HN")}</div>
+      <table>
+        <thead><tr><th>Ítem</th><th class="num">Cant.</th><th class="num">Precio</th><th class="num">Subtotal</th></tr></thead>
+        <tbody>${c.items.map(it => `
+          <tr><td>${esc(it.nombre)}</td><td class="num">${it.cantidad}</td><td class="num">${money(it.precio)}</td><td class="num">${money(it.cantidad * it.precio)}</td></tr>
+        `).join("")}</tbody>
+      </table>
+      <div class="edc-factura-tot">Total ${money(c.total)} · Abonado ${money(c.abonado)} · Saldo ${money(c.saldo)}</div>
+    </div>
+  `).join("");
+  document.getElementById("edcTotal").textContent = money(g.total);
+  document.getElementById("edcAbonado").textContent = money(g.abonado);
+  document.getElementById("edcSaldo").textContent = money(g.saldo);
+  document.body.classList.add("print-estado");
+  window.print();
+  setTimeout(() => document.body.classList.remove("print-estado"), 300);
 });
 
 /* ---- registrar abono ---- */
@@ -2742,7 +2867,10 @@ alHacerClicUnaVez(document.getElementById("btnGuardarAbono"), async () => {
   await registrarAbonoCredito(abonoCreditoActualId, monto, metodoPago);
   toast(`Abono de ${money(monto)} registrado`);
   document.getElementById("modalAbonoCredito").classList.remove("active");
-  renderCreditos();
+  await renderCreditos();
+  // volvemos al historial del cliente para ver el abono aplicado, en vez de
+  // dejar a la persona en la tabla teniendo que buscarlo otra vez
+  if (creditoDetalleClave && creditosPorCliente[creditoDetalleClave]) abrirCreditoDetalle(creditoDetalleClave);
 });
 
 /* ---- nuevo crédito ---- */
