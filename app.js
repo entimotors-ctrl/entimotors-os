@@ -901,7 +901,7 @@ async function renderFinanzasCharts() {
         { label: "Gastos", data: gastosPorDia, borderColor: "#ef4444", backgroundColor: "rgba(239,68,68,0.15)", tension: 0.3, fill: true },
       ],
     },
-    options: { responsive: true, scales: { x: { grid: { display: false } }, y: { grid: { color: grid }, beginAtZero: true } } },
+    options: { responsive: true, maintainAspectRatio: false, scales: { x: { grid: { display: false } }, y: { grid: { color: grid }, beginAtZero: true } } },
   });
 
   // 2) Ganancias por línea de negocio: taller (órdenes de servicio) vs venta de
@@ -923,7 +923,7 @@ async function renderFinanzasCharts() {
       labels: [`Taller (${money(totalTaller)})`, `Venta de repuestos (${money(totalRepuestos)})`, `Trabajo rápido (${money(totalTrabajoRapido)})`],
       datasets: [{ data: [totalTaller, totalRepuestos, totalTrabajoRapido], backgroundColor: ["#ef4444", "#f5a524", "#34d399"] }],
     },
-    options: { responsive: true, plugins: { legend: { position: "bottom" } } },
+    options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { position: "bottom", labels: { boxWidth: 12, font: { size: 11 } } } } },
   });
 
   // 3) Top 5 repuestos con mayor rotación (unidades vendidas por TPV)
@@ -940,7 +940,7 @@ async function renderFinanzasCharts() {
   chartInstances.topRepuestos = new Chart(document.getElementById("chartTopRepuestos"), {
     type: "bar",
     data: { labels: top5.map(x => x.nombre), datasets: [{ label: "Unidades vendidas", data: top5.map(x => x.cant), backgroundColor: "#ef4444" }] },
-    options: { indexAxis: "y", responsive: true, plugins: { legend: { display: false } }, scales: { x: { beginAtZero: true, grid: { color: grid } }, y: { grid: { display: false } } } },
+    options: { indexAxis: "y", responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { x: { beginAtZero: true, grid: { color: grid } }, y: { grid: { display: false } } } },
   });
 }
 
