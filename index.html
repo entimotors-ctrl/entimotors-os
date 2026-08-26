@@ -229,6 +229,9 @@
   .pill.reparacion { background: var(--red-soft); color: var(--red); }
   .pill.calidad { background: var(--red-soft); color: var(--red); }
   .pill.entregado { background: var(--green-soft); color: var(--green); }
+  .pill.pendiente { background: var(--red-soft); color: var(--red); }
+  .pill.parcial { background: var(--amber-soft); color: var(--amber); }
+  .pill.pagado { background: var(--green-soft); color: var(--green); }
   .order-row .amount { font-variant-numeric: tabular-nums; font-weight: 600; flex: none; }
   .order-row .meta.mech { flex: none; }
 
@@ -399,6 +402,15 @@
   .dash-section-head h3 { font-family: 'Teko', sans-serif; text-transform: uppercase; font-size: 1.3rem; }
   .demo-flag { font-size: 0.74rem; color: var(--text-faint); background: var(--panel-strong); border-radius: 999px; padding: 0.2rem 0.65rem; }
 
+  /* ---- Finanzas y caja: apartado formal ---- */
+  .fin-section-label { font-family: 'Teko', sans-serif; text-transform: uppercase; letter-spacing: 0.12em; font-size: 0.8rem; color: var(--text-faint); margin-bottom: 0.6rem; }
+  .fin-form-card, .fin-table-card { border-top: 2px solid var(--red-border); }
+  .fin-table-card { padding: 0; overflow: hidden; }
+  .fin-table-card .table-scroll { padding: 1.1rem 1.2rem 0; }
+  .fin-table-card .empty { padding: 1.5rem 0 2rem; }
+  .fin-view table thead th { border-bottom-width: 2px; }
+  .fin-view tbody tr:hover { background: var(--panel); }
+
   /* ---- acceso rápido (página principal): mismos 8 destinos y mismo orden que
      el menú hamburguesa, como botones grandes para no tener que abrir el menú. ---- */
   .qa-wrap { display: flex; flex-direction: column; gap: 0.8rem; margin-bottom: 1.8rem; }
@@ -568,6 +580,19 @@
     }
     body.print-cierre table { color: #111; }
     body.print-cierre th, body.print-cierre td { border-color: #ccc !important; }
+  }
+
+  /* ---- impresión de factura de crédito (pendiente de cobro) ---- */
+  #creditoPrint { display: none; }
+  @media print {
+    body.print-credito #facturaPrint, body.print-credito #facturaPrint * { visibility: hidden !important; display: none !important; }
+    body.print-credito #creditoPrint, body.print-credito #creditoPrint * { visibility: visible !important; }
+    body.print-credito #creditoPrint {
+      display: block !important; position: absolute; top: 0; left: 0; width: 100%; padding: 2cm; color: #111; background: #fff;
+      -webkit-print-color-adjust: exact; print-color-adjust: exact;
+    }
+    body.print-credito table { color: #111; }
+    body.print-credito th, body.print-credito td { border-color: #ccc !important; }
   }
 
   /* botón hamburguesa: solo existe visualmente en mobile/tablet angosto.
@@ -787,6 +812,7 @@
     <button class="nav-item" data-view="clientes"><span class="sw"></span>Clientes y motos</button>
     <button class="nav-item" data-view="inventario"><span class="sw"></span>Inventario</button>
     <button class="nav-item" data-view="finanzas"><span class="sw"></span>Finanzas y caja</button>
+    <button class="nav-item" data-view="creditos"><span class="sw"></span>Créditos</button>
     <div class="nav-grp">Sitio web</div>
     <button class="nav-item" data-view="web-cms"><span class="sw"></span>Gestor de la web<span class="badge" id="citasWebBadge" style="display:none;"></span></button>
     <button class="nav-item disabled" title="Se administra hoy desde admin.html — se integra en una siguiente etapa"><span class="sw"></span>Catálogo</button>
@@ -817,6 +843,7 @@
             <button type="button" class="qa-btn" data-view="clientes"><span class="qa-top"><span class="qa-ic">🏍️</span><span class="qa-num">4</span></span><span class="qa-lbl">Clientes y motos</span></button>
             <button type="button" class="qa-btn" data-view="inventario"><span class="qa-top"><span class="qa-ic">📦</span><span class="qa-num">5</span></span><span class="qa-lbl">Inventario</span></button>
             <button type="button" class="qa-btn" data-view="finanzas"><span class="qa-top"><span class="qa-ic">💰</span><span class="qa-num">6</span></span><span class="qa-lbl">Finanzas y caja</span></button>
+            <button type="button" class="qa-btn" data-view="creditos"><span class="qa-top"><span class="qa-ic">💳</span><span class="qa-num">7</span></span><span class="qa-lbl">Créditos</span></button>
           </div>
         </div>
         <div class="qa-group qa-group-dark">
@@ -826,8 +853,8 @@
             <span class="qa-tool t4">🔩</span><span class="qa-tool t5">🔧</span><span class="qa-tool t6">⚙️</span>
           </div>
           <div class="qa-grid">
-            <button type="button" class="qa-btn" data-view="web-cms"><span class="qa-top"><span class="qa-ic">🌐</span><span class="qa-num">7</span></span><span class="qa-lbl">Gestor de la web</span></button>
-            <button type="button" class="qa-btn" data-view="ajustes"><span class="qa-top"><span class="qa-ic">⚙️</span><span class="qa-num">8</span></span><span class="qa-lbl">Ajustes</span></button>
+            <button type="button" class="qa-btn" data-view="web-cms"><span class="qa-top"><span class="qa-ic">🌐</span><span class="qa-num">8</span></span><span class="qa-lbl">Gestor de la web</span></button>
+            <button type="button" class="qa-btn" data-view="ajustes"><span class="qa-top"><span class="qa-ic">⚙️</span><span class="qa-num">9</span></span><span class="qa-lbl">Ajustes</span></button>
           </div>
         </div>
       </div>
@@ -993,15 +1020,16 @@
     </section>
 
     <!-- FINANZAS Y CAJA -->
-    <section class="view" id="view-finanzas">
+    <section class="view fin-view" id="view-finanzas">
       <div class="view-head">
-        <div><h2>Finanzas y caja</h2><p>Aperturas/cierres de caja, gastos operativos y el resumen de utilidad del taller.</p></div>
+        <div><h2>Finanzas y caja</h2><p>Estado de caja, cuentas por cobrar y el resumen de utilidad del taller.</p></div>
         <button class="btn ghost small" id="btnImprimirCierre">🖨 Cierre del día</button>
       </div>
 
+      <div class="fin-section-label">Resumen financiero</div>
       <div class="widget-grid" id="finanzasResumen"></div>
 
-      <div class="dash-section-head" style="margin-top:1.6rem;">
+      <div class="dash-section-head" style="margin-top:1.8rem;">
         <h3>Tendencias</h3>
         <span class="demo-flag" id="finanzasChartsFlag" style="display:none;">Aún no hay movimientos suficientes — usa el TPV o Finanzas para ver datos aquí</span>
       </div>
@@ -1012,10 +1040,12 @@
       </div>
 
       <div class="dash-section-head" style="margin-top:0.6rem;">
-        <h3>Registro de caja</h3>
+        <h3>Libro de caja</h3>
+        <span class="demo-flag">Cada movimiento queda con fecha, método de pago y quién lo registró</span>
       </div>
-      <div class="card">
-        <h3 class="font-display" style="font-size:0.95rem; margin-bottom:0.6rem;">Registrar movimiento</h3>
+      <div class="card fin-form-card">
+        <h3 class="font-display" style="font-size:0.95rem; margin-bottom:0.2rem;">Registrar movimiento</h3>
+        <p class="hint" style="margin-top:0;">Ingresos y egresos que no vienen de una venta o un crédito — apertura de caja, compras, planilla, etc.</p>
         <div class="field-row">
           <div><label>Tipo</label>
             <select id="moviTipo"><option value="ingreso">Ingreso</option><option value="egreso">Egreso</option></select>
@@ -1029,8 +1059,16 @@
           </div>
           <div><label>Monto (L.)</label><input type="number" id="moviMonto" min="0" step="0.01"></div>
         </div>
-        <label>Descripción</label>
-        <input type="text" id="moviDescripcion" placeholder="Detalle del movimiento">
+        <div class="field-row" style="grid-template-columns:1fr 2fr;">
+          <div><label>Método de pago</label>
+            <select id="moviMetodo">
+              <option value="efectivo">Efectivo</option>
+              <option value="transferencia">Transferencia</option>
+              <option value="tarjeta">Tarjeta</option>
+            </select>
+          </div>
+          <div><label>Descripción</label><input type="text" id="moviDescripcion" placeholder="Detalle del movimiento"></div>
+        </div>
         <button class="btn primary small" id="btnGuardarMovimiento">Registrar</button>
       </div>
 
@@ -1047,13 +1085,41 @@
           <button class="btn small" id="btnFiltrarFinanzas" style="align-self:end;">Filtrar</button>
         </div>
       </div>
+      <div class="card fin-table-card">
+        <div class="table-scroll">
+        <table>
+          <thead><tr><th>Fecha</th><th>Tipo</th><th>Categoría</th><th>Método</th><th>Descripción</th><th class="num">Monto</th><th></th></tr></thead>
+          <tbody id="movimientosBody"></tbody>
+        </table>
+        </div>
+        <div class="empty" id="movimientosEmpty" style="display:none;">Sin movimientos en este rango.</div>
+      </div>
+    </section>
+
+    <!-- CREDITOS -->
+    <section class="view" id="view-creditos">
+      <div class="view-head">
+        <div><h2>Créditos</h2><p>Clientes que se llevan repuestos o servicios a crédito — con su factura pendiente de cobro.</p></div>
+        <button class="btn primary" id="btnNuevoCredito">+ Nuevo crédito</button>
+      </div>
+
+      <div class="widget-grid" id="creditosResumen"></div>
+
+      <div class="view-head" style="margin-top:1.4rem;">
+        <div><h3 style="font-family:'Teko',sans-serif; text-transform:uppercase; font-size:1.2rem;">Facturas a crédito</h3></div>
+        <div class="pos-cats" id="creditosFiltro">
+          <button type="button" class="cat-chip active" data-estado="">Todos</button>
+          <button type="button" class="cat-chip" data-estado="pendiente">Pendientes</button>
+          <button type="button" class="cat-chip" data-estado="pagado">Pagados</button>
+        </div>
+      </div>
       <div class="table-scroll">
       <table>
-        <thead><tr><th>Fecha</th><th>Tipo</th><th>Categoría</th><th>Descripción</th><th class="num">Monto</th><th></th></tr></thead>
-        <tbody id="movimientosBody"></tbody>
+        <thead><tr><th>Cliente</th><th>Fecha</th><th class="num">Total</th><th class="num">Abonado</th><th class="num">Saldo</th><th>Estado</th><th></th></tr></thead>
+        <tbody id="creditosBody"></tbody>
       </table>
       </div>
-      <div class="empty" id="movimientosEmpty" style="display:none;">Sin movimientos en este rango.</div>
+      <div class="empty" id="creditosEmpty" style="display:none;">Aún no hay créditos registrados.</div>
     </section>
 
     <!-- GESTOR DE LA WEB -->
@@ -1220,6 +1286,73 @@
     <div class="modal-actions">
       <button class="btn ghost" id="btnCancelarCliente">Cancelar</button>
       <button class="btn primary" id="btnGuardarCliente">Guardar</button>
+    </div>
+  </div>
+</div>
+
+<!-- Modal: nuevo crédito -->
+<div class="modal-bg" id="modalCredito">
+  <div class="modal" style="max-width:560px;">
+    <h3>Nuevo crédito</h3>
+    <p class="hint">Repuestos o servicios que el cliente se lleva a crédito — se genera su factura pendiente de cobro.</p>
+
+    <label>Buscar cliente por nombre o placa</label>
+    <div class="autocomplete-wrap">
+      <input type="text" id="creditoBuscarCliente" placeholder="Ej. Carlos Reyes o HAX-4471" autocomplete="off">
+      <div class="autocomplete-list" id="creditoBuscarClienteList"></div>
+    </div>
+    <div id="creditoClienteChipWrap"></div>
+    <p class="hint">si no aparece, completa los datos de un cliente nuevo:</p>
+    <div class="field-row" style="grid-template-columns:1fr 1fr;">
+      <div><label>Nombre</label><input type="text" id="creditoNombre"></div>
+      <div><label>Teléfono</label><input type="tel" id="creditoTelefono" placeholder="9704-9635"></div>
+    </div>
+
+    <label style="margin-top:0.4rem;">Repuestos y servicios</label>
+    <select id="creditoItemOrigen"><option value="inventario">Desde inventario</option><option value="manual">Manual</option></select>
+    <div id="creditoItemInventarioFields">
+      <select id="creditoItemInventarioSelect"></select>
+    </div>
+    <div id="creditoItemManualFields" style="display:none;">
+      <input type="text" id="creditoItemNombre" placeholder="Nombre del repuesto o servicio">
+    </div>
+    <div class="field-row" style="grid-template-columns:1fr 1fr;">
+      <div><label>Cantidad</label><input type="number" id="creditoItemCantidad" value="1" min="1"></div>
+      <div><label>Precio unitario (L.)</label><input type="number" id="creditoItemPrecio" step="0.01" min="0"></div>
+    </div>
+    <button type="button" class="btn small" id="btnAgregarItemCredito" style="width:100%; margin-bottom:0.6rem;">+ Agregar a la factura</button>
+
+    <div id="creditoCarritoList"></div>
+    <div class="pos-total-row"><span>Total</span><span class="big" id="creditoTotal">L. 0.00</span></div>
+
+    <label>Fecha límite de pago (opcional)</label>
+    <input type="date" id="creditoVencimiento">
+    <label>Nota (opcional)</label>
+    <input type="text" id="creditoNota" placeholder="Ej. Paga cada quincena">
+
+    <div class="modal-actions">
+      <button class="btn ghost" id="btnCancelarCredito">Cancelar</button>
+      <button class="btn primary" id="btnGuardarCredito">Registrar crédito</button>
+    </div>
+  </div>
+</div>
+
+<!-- Modal: registrar abono a un crédito -->
+<div class="modal-bg" id="modalAbonoCredito">
+  <div class="modal">
+    <h3>Registrar abono</h3>
+    <div id="abonoCreditoResumen" class="hint" style="margin-top:0;"></div>
+    <label>Monto del abono (L.)</label>
+    <input type="number" id="abonoMonto" min="0" step="0.01">
+    <label>Método de pago</label>
+    <select id="abonoMetodo">
+      <option value="efectivo">Efectivo</option>
+      <option value="transferencia">Transferencia</option>
+      <option value="tarjeta">Tarjeta</option>
+    </select>
+    <div class="modal-actions">
+      <button class="btn ghost" id="btnCancelarAbono">Cancelar</button>
+      <button class="btn primary" id="btnGuardarAbono">Registrar abono</button>
     </div>
   </div>
 </div>
@@ -1460,10 +1593,36 @@
   <div class="factura-total">Total: <span id="facTotal"></span></div>
 </div>
 
+<!-- Plantilla de impresión: factura de crédito pendiente de cobro -->
+<div id="creditoPrint">
+  <div class="factura-header">
+    <div class="factura-marca">
+      <img src="icons/icon-192.png" alt="" class="factura-logo">
+      <div class="marca">ENTI<span style="color:#e11d48;">MOTORS</span></div>
+    </div>
+    <div class="factura-meta">
+      <div>Crédito #<span id="credFacId"></span></div>
+      <div id="credFacFecha"></div>
+    </div>
+  </div>
+  <div class="factura-block">
+    <b>Cliente</b>
+    <span id="credFacCliente"></span> — <span id="credFacTelefono"></span>
+  </div>
+  <table>
+    <thead><tr><th>Ítem</th><th class="num">Cant.</th><th class="num">Precio</th><th class="num">Subtotal</th></tr></thead>
+    <tbody id="credFacItems"></tbody>
+  </table>
+  <div class="factura-total">Total: <span id="credFacTotal"></span></div>
+  <div class="factura-total">Abonado: <span id="credFacAbonado"></span></div>
+  <div class="factura-total" style="color:#e11d48;">Saldo pendiente: <span id="credFacSaldo"></span></div>
+  <div style="margin-top:1rem; font-size:0.8rem; color:#666;">Factura a crédito — pendiente de cobro.</div>
+</div>
+
 <!-- el ?v= debe cambiar cada vez que se toque app.js (junto con CACHE_NAME en
      sw.js) — es la forma más universal de forzar que CUALQUIER navegador
      pida el archivo de nuevo aunque ya tenga guardada una copia vieja en su
      propio caché HTTP, sin depender de que respete el Service Worker. -->
-<script src="app.js?v=2.10.0"></script>
+<script src="app.js?v=3.0.0"></script>
 </body>
 </html>

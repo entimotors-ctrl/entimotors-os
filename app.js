@@ -93,7 +93,7 @@ function navegarWA(ventana, phoneRaw, text) {
 /* ---------------- IndexedDB helper mínimo ---------------- */
 function openDb() {
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open("entimotors_os_demo", 3);
+    const req = indexedDB.open("entimotors_os_demo", 4);
     req.onupgradeneeded = (e) => {
       const d = req.result;
       const t = req.transaction;
@@ -120,6 +120,12 @@ function openDb() {
         s.createIndex("by_fecha", "fechaISO");
         s.createIndex("by_tipo", "tipo");
         s.createIndex("by_categoria", "categoria");
+      }
+      if (!d.objectStoreNames.contains("creditos")) {
+        const s = d.createObjectStore("creditos", { keyPath: "id", autoIncrement: true });
+        s.createIndex("by_fecha", "fechaISO");
+        s.createIndex("by_cliente", "clienteId");
+        s.createIndex("by_estado", "estado");
       }
       if (!d.objectStoreNames.contains("web_cms")) d.createObjectStore("web_cms", { keyPath: "key" });
       if (!d.objectStoreNames.contains("categorias_inv")) {
@@ -211,7 +217,7 @@ const DB = {
     });
   },
 };
-const ALL_STORES = ["clientes", "motos", "ordenes", "inventario", "citas", "ventas_rapidas", "caja_movimientos", "web_cms", "categorias_inv"];
+const ALL_STORES = ["clientes", "motos", "ordenes", "inventario", "citas", "ventas_rapidas", "caja_movimientos", "creditos", "web_cms", "categorias_inv"];
 async function updateOrder(id, mutator) {
   const o = await DB.get("ordenes", id);
   mutator(o);
@@ -270,6 +276,93 @@ function registrarVentaRapida({ items, clienteId, clienteNombre, metodoPago, efe
     t.onerror = () => reject(t.error);
     t.onabort = () => reject(t.error);
   });
+}
+
+/* ---------------- créditos: clientes que se llevan repuestos/servicios a crédito ----------------
+   Se descuenta el inventario igual que una venta (el repuesto sí sale del
+   estante), pero NO se registra ingreso en caja_movimientos todavía — el
+   dinero no ha entrado. Ese ingreso se crea después, cuando el cliente abona
+   (ver registrarAbonoCredito), y es lo que hace que los créditos se vean
+   reflejados en Finanzas y caja. */
+function registrarCredito({ clienteId, clienteNombre, clienteTelefono, items, vencimiento, nota }) {
+  return new Promise((resolve, reject) => {
+    if (!items || !items.length) { reject(new Error("Agrega al menos un repuesto o servicio")); return; }
+
+    const t = db.transaction(["creditos", "inventario"], "readwrite");
+    const credStore = t.objectStore("creditos");
+    const invStore = t.objectStore("inventario");
+
+    const total = items.reduce((s, it) => s + it.cantidad * it.precio, 0);
+    const fechaISO = new Date().toISOString();
+    let credId = null;
+
+    const credito = {
+      clienteId: clienteId || null, clienteNombre, clienteTelefono: clienteTelefono || "",
+      items, total, abonado: 0, saldo: total, estado: "pendiente",
+      vencimiento: vencimiento || null, nota: nota || "",
+      historialAbonos: [], fechaISO, creadoEn: Date.now(), mecanico: currentUser?.nombre || "",
+    };
+    const credReq = credStore.add(credito);
+    credReq.onsuccess = () => { credId = credReq.result; };
+
+    items.forEach((it) => {
+      if (!it.inventarioId) return;
+      const getReq = invStore.get(it.inventarioId);
+      getReq.onsuccess = () => {
+        const rep = getReq.result;
+        if (rep) { rep.cantidad = Math.max(0, rep.cantidad - it.cantidad); invStore.put(rep); }
+      };
+    });
+
+    t.oncomplete = () => resolve({ id: credId, credito });
+    t.onerror = () => reject(t.error);
+    t.onabort = () => reject(t.error);
+  });
+}
+
+async function registrarAbonoCredito(creditoId, monto, metodoPago) {
+  const cred = await DB.get("creditos", creditoId);
+  if (!cred) throw new Error("Crédito no encontrado");
+  const abonado = cred.abonado + monto;
+  const saldo = Math.max(0, cred.total - abonado);
+  cred.abonado = abonado;
+  cred.saldo = saldo;
+  cred.estado = saldo <= 0 ? "pagado" : "parcial";
+  cred.historialAbonos = (cred.historialAbonos || []).concat([{ monto, metodoPago, fechaISO: new Date().toISOString() }]);
+  await DB.save("creditos", cred);
+  await DB.save("caja_movimientos", {
+    tipo: "ingreso", categoria: "Cobro de crédito", monto, metodoPago,
+    descripcion: `Abono crédito #${creditoId} — ${cred.clienteNombre}`, creditoId,
+    fechaISO: new Date().toISOString(), creadoEn: Date.now(),
+  });
+  markDirty();
+  return cred;
+}
+
+// solo se puede eliminar un crédito que todavía no tiene abonos — si ya
+// recibió pagos, borrarlo dejaría ese dinero sin respaldo en la factura.
+async function eliminarCredito(id) {
+  const cred = await DB.get("creditos", id);
+  if (!cred) return;
+  if (cred.abonado > 0) { toast("No se puede eliminar un crédito que ya tiene abonos registrados", "off"); return; }
+
+  const t = db.transaction(["creditos", "inventario"], "readwrite");
+  const invStore = t.objectStore("inventario");
+  cred.items.forEach((it) => {
+    if (!it.inventarioId) return;
+    const getReq = invStore.get(it.inventarioId);
+    getReq.onsuccess = () => {
+      const rep = getReq.result;
+      if (rep) { rep.cantidad += it.cantidad; invStore.put(rep); }
+    };
+  });
+  t.objectStore("creditos").delete(id);
+  await new Promise((resolve, reject) => {
+    t.oncomplete = resolve;
+    t.onerror = () => reject(t.error);
+    t.onabort = () => reject(t.error);
+  });
+  markDirty();
 }
 
 /* ---------------- caja chica: registrar un ingreso de una orden de taller entregada ---------------- */
@@ -642,6 +735,7 @@ const renderByView = {
   inventario: () => renderInventario(),
   pos: () => renderPOS(),
   finanzas: () => renderFinanzas(),
+  creditos: () => renderCreditos(),
   "web-cms": () => renderWebCMS(),
   ajustes: () => renderAjustes(),
 };
@@ -2327,20 +2421,41 @@ async function renderFinanzas() {
   const utilidad = ingresos - costosTotal;
   const margen = ingresos > 0 ? (utilidad / ingresos) * 100 : 0;
 
+  // saldo pendiente de créditos: es un saldo vivo, no depende del rango de
+  // fechas filtrado — por eso se calcula aparte de "filtrados".
+  const creditos = await DB.getAll("creditos");
+  const creditosPendientes = creditos.filter(c => c.estado !== "pagado");
+  const cuentasPorCobrar = creditosPendientes.reduce((s, c) => s + c.saldo, 0);
+
   document.getElementById("finanzasResumen").innerHTML = `
     <div class="widget-card tint-green"><span class="eyebrow">Ingresos totales</span><span class="big">${money(ingresos)}</span><span class="sub">En el rango filtrado</span></div>
     <div class="widget-card tint-red"><span class="eyebrow">Costos</span><span class="big">${money(costosTotal)}</span><span class="sub">Egresos + costo de repuestos vendidos</span></div>
     <div class="widget-card ${utilidad >= 0 ? "tint-green" : "tint-red"}"><span class="eyebrow">Utilidad neta</span><span class="big">${money(utilidad)}</span><span class="sub">Ingresos − costos</span></div>
     <div class="widget-card"><span class="eyebrow" style="color:var(--text-faint);">Margen promedio</span><span class="big">${margen.toFixed(1)}%</span><span class="sub">Utilidad / ingresos</span></div>
+    <button type="button" class="widget-card span-2 ${cuentasPorCobrar > 0 ? "tint-amber" : ""}" id="cardCuentasPorCobrar" style="text-align:left; font-family:inherit; cursor:pointer;">
+      <span class="eyebrow">Cuentas por cobrar</span><span class="big">${money(cuentasPorCobrar)}</span><span class="sub">Saldo pendiente en créditos activos</span>
+    </button>
+    <button type="button" class="widget-card span-2" id="cardCreditosActivos" style="text-align:left; font-family:inherit; cursor:pointer;">
+      <span class="eyebrow" style="color:var(--text-faint);">Créditos activos</span><span class="big">${creditosPendientes.length}</span><span class="sub">Clientes con saldo pendiente</span>
+    </button>
   `;
+  ["cardCuentasPorCobrar", "cardCreditosActivos"].forEach(id => {
+    document.getElementById(id).addEventListener("click", () => {
+      showView("creditos");
+      document.querySelectorAll(".nav-item[data-view]").forEach(b => b.classList.toggle("active", b.dataset.view === "creditos"));
+      renderCreditos();
+    });
+  });
 
   const body = document.getElementById("movimientosBody");
   document.getElementById("movimientosEmpty").style.display = filtrados.length ? "none" : "block";
+  const metodoLabel = { efectivo: "Efectivo", transferencia: "Transferencia", tarjeta: "Tarjeta" };
   body.innerHTML = filtrados.map(m => `
     <tr>
       <td>${new Date(m.fechaISO).toLocaleDateString("es-HN")}</td>
       <td><span class="pill ${m.tipo === "ingreso" ? "entregado" : "reparacion"}">${m.tipo === "ingreso" ? "Ingreso" : "Egreso"}</span></td>
       <td>${esc(m.categoria)}</td>
+      <td>${esc(metodoLabel[m.metodoPago] || "—")}</td>
       <td>${esc(m.descripcion || "")}</td>
       <td class="num">${money(m.monto)}</td>
       <td class="num"><button type="button" class="btn ghost small danger" data-eliminar-movi="${m.id}" title="Eliminar" aria-label="Eliminar movimiento">🗑</button></td>
@@ -2368,6 +2483,7 @@ alHacerClicUnaVez(document.getElementById("btnGuardarMovimiento"), async () => {
     tipo: document.getElementById("moviTipo").value,
     categoria: document.getElementById("moviCategoria").value,
     monto,
+    metodoPago: document.getElementById("moviMetodo").value,
     descripcion: document.getElementById("moviDescripcion").value.trim(),
     fechaISO: new Date().toISOString(), creadoEn: Date.now(),
   });
@@ -2409,6 +2525,269 @@ document.getElementById("btnImprimirCierre").addEventListener("click", async () 
   document.body.classList.add("print-cierre");
   window.print();
   setTimeout(() => document.body.classList.remove("print-cierre"), 300);
+});
+
+/* ================= CREDITOS ================= */
+let creditosFiltroEstado = ""; // "" | "pendiente" (incluye parcial) | "pagado"
+let creditosCache = {}; // id -> crédito, se llena en cada renderCreditos() para que
+                         // imprimir/recordar no necesiten un await antes de actuar
+                         // sobre el clic (mismo motivo que currentOrderCache/ultimoTicket).
+
+async function renderCreditos() {
+  const creditos = (await DB.getAll("creditos")).sort((a, b) => b.fechaISO.localeCompare(a.fechaISO));
+  creditosCache = {};
+  creditos.forEach(c => { creditosCache[c.id] = c; });
+
+  const pendientes = creditos.filter(c => c.estado !== "pagado");
+  const cuentasPorCobrar = pendientes.reduce((s, c) => s + c.saldo, 0);
+  const hoyMes = new Date();
+  const cobradoMes = creditos.reduce((s, c) => s + (c.historialAbonos || [])
+    .filter(a => sameMonth(new Date(a.fechaISO), hoyMes))
+    .reduce((ss, a) => ss + a.monto, 0), 0);
+
+  document.getElementById("creditosResumen").innerHTML = `
+    <div class="widget-card ${cuentasPorCobrar > 0 ? "tint-amber" : ""}"><span class="eyebrow">Cuentas por cobrar</span><span class="big">${money(cuentasPorCobrar)}</span><span class="sub">${pendientes.length} crédito${pendientes.length === 1 ? "" : "s"} pendiente${pendientes.length === 1 ? "" : "s"}</span></div>
+    <div class="widget-card tint-green"><span class="eyebrow">Cobrado este mes</span><span class="big">${money(cobradoMes)}</span><span class="sub">Abonos recibidos en ${esc(hoyMes.toLocaleDateString("es-HN", { month: "long" }))}</span></div>
+    <div class="widget-card"><span class="eyebrow" style="color:var(--text-faint);">Créditos totales</span><span class="big">${creditos.length}</span><span class="sub">Histórico</span></div>
+  `;
+
+  const filtrados = creditos.filter(c => {
+    if (!creditosFiltroEstado) return true;
+    if (creditosFiltroEstado === "pendiente") return c.estado !== "pagado";
+    return c.estado === creditosFiltroEstado;
+  });
+
+  const estadoLabel = { pendiente: "Pendiente", parcial: "Parcial", pagado: "Pagado" };
+  const body = document.getElementById("creditosBody");
+  document.getElementById("creditosEmpty").style.display = filtrados.length ? "none" : "block";
+  body.innerHTML = filtrados.map(c => `
+    <tr>
+      <td>${esc(c.clienteNombre || "Cliente de mostrador")}</td>
+      <td>${new Date(c.fechaISO).toLocaleDateString("es-HN")}</td>
+      <td class="num">${money(c.total)}</td>
+      <td class="num">${money(c.abonado)}</td>
+      <td class="num">${money(c.saldo)}</td>
+      <td><span class="pill ${c.estado}">${estadoLabel[c.estado]}</span></td>
+      <td class="num" style="white-space:nowrap;">
+        ${c.estado !== "pagado" ? `<button type="button" class="btn small" data-action="abonar" data-id="${c.id}">Abonar</button>` : ""}
+        <button type="button" class="btn ghost small" data-action="imprimir-credito" data-id="${c.id}" title="Ver / imprimir factura" aria-label="Ver o imprimir factura">🖨️</button>
+        ${c.clienteTelefono && c.estado !== "pagado" ? `<button type="button" class="btn wa small" data-action="recordar-credito" data-id="${c.id}">Recordar</button>` : ""}
+        ${c.abonado === 0 ? `<button type="button" class="btn ghost small danger" data-action="eliminar-credito" data-id="${c.id}" title="Eliminar" aria-label="Eliminar crédito">🗑</button>` : ""}
+      </td>
+    </tr>`).join("");
+
+  body.querySelectorAll('[data-action="abonar"]').forEach(btn => {
+    btn.addEventListener("click", () => abrirModalAbonoCredito(Number(btn.dataset.id)));
+  });
+  body.querySelectorAll('[data-action="imprimir-credito"]').forEach(btn => {
+    btn.addEventListener("click", () => imprimirFacturaCredito(creditosCache[Number(btn.dataset.id)]));
+  });
+  body.querySelectorAll('[data-action="recordar-credito"]').forEach(btn => {
+    btn.addEventListener("click", () => {
+      const ventana = abrirVentanaWA(); // sincrónico, antes de cualquier await — ver nota en abrirVentanaWA()
+      const cred = creditosCache[Number(btn.dataset.id)];
+      const texto = `Hola ${cred.clienteNombre}, te recordamos que tienes un saldo pendiente de ${money(cred.saldo)} con ENTIMOTORS por el crédito #${cred.id}. ¡Gracias!`;
+      navegarWA(ventana, cred.clienteTelefono, texto);
+    });
+  });
+  body.querySelectorAll('[data-action="eliminar-credito"]').forEach(btn => {
+    btn.addEventListener("click", () => {
+      requestAdminCode(async () => {
+        await eliminarCredito(Number(btn.dataset.id));
+        toast("Crédito eliminado");
+        renderCreditos();
+      });
+    });
+  });
+}
+
+document.getElementById("creditosFiltro").querySelectorAll(".cat-chip").forEach(btn => {
+  btn.addEventListener("click", () => {
+    creditosFiltroEstado = btn.dataset.estado;
+    document.getElementById("creditosFiltro").querySelectorAll(".cat-chip").forEach(b => b.classList.toggle("active", b === btn));
+    renderCreditos();
+  });
+});
+
+function imprimirFacturaCredito(cred) {
+  document.getElementById("credFacId").textContent = cred.id;
+  document.getElementById("credFacFecha").textContent = new Date(cred.fechaISO).toLocaleDateString("es-HN");
+  document.getElementById("credFacCliente").textContent = cred.clienteNombre || "Cliente de mostrador";
+  document.getElementById("credFacTelefono").textContent = cred.clienteTelefono || "";
+  document.getElementById("credFacItems").innerHTML = cred.items.map(it => `
+    <tr><td>${esc(it.nombre)}</td><td class="num">${it.cantidad}</td><td class="num">${money(it.precio)}</td><td class="num">${money(it.cantidad * it.precio)}</td></tr>
+  `).join("");
+  document.getElementById("credFacTotal").textContent = money(cred.total);
+  document.getElementById("credFacAbonado").textContent = money(cred.abonado);
+  document.getElementById("credFacSaldo").textContent = money(cred.saldo);
+  document.body.classList.add("print-credito");
+  window.print();
+  setTimeout(() => document.body.classList.remove("print-credito"), 300);
+}
+
+/* ---- registrar abono ---- */
+let abonoCreditoActualId = null;
+function abrirModalAbonoCredito(id) {
+  const cred = creditosCache[id];
+  if (!cred) return;
+  abonoCreditoActualId = id;
+  document.getElementById("abonoCreditoResumen").innerHTML =
+    `<b>${esc(cred.clienteNombre)}</b> — Total ${money(cred.total)} · Abonado ${money(cred.abonado)} · Saldo <b>${money(cred.saldo)}</b>`;
+  document.getElementById("abonoMonto").value = "";
+  document.getElementById("abonoMetodo").value = "efectivo";
+  document.getElementById("modalAbonoCredito").classList.add("active");
+  setTimeout(() => document.getElementById("abonoMonto").focus(), 50);
+}
+document.getElementById("btnCancelarAbono").addEventListener("click", () => document.getElementById("modalAbonoCredito").classList.remove("active"));
+
+alHacerClicUnaVez(document.getElementById("btnGuardarAbono"), async () => {
+  const cred = creditosCache[abonoCreditoActualId];
+  if (!cred) return;
+  const monto = Number(document.getElementById("abonoMonto").value) || 0;
+  if (monto <= 0) { toast("El monto debe ser mayor a cero", "off"); return; }
+  if (monto > cred.saldo + 0.01) { toast(`El abono no puede ser mayor al saldo pendiente (${money(cred.saldo)})`, "off"); return; }
+  const metodoPago = document.getElementById("abonoMetodo").value;
+  await registrarAbonoCredito(abonoCreditoActualId, monto, metodoPago);
+  toast(`Abono de ${money(monto)} registrado`);
+  document.getElementById("modalAbonoCredito").classList.remove("active");
+  renderCreditos();
+});
+
+/* ---- nuevo crédito ---- */
+let creditoClienteSel = null; // { clienteId } cuando se elige un cliente existente
+let creditoCarrito = []; // { inventarioId|null, nombre, cantidad, precio, stockDisponible }
+
+function renderCreditoClienteChip() {
+  const wrap = document.getElementById("creditoClienteChipWrap");
+  wrap.innerHTML = creditoClienteSel
+    ? `<span class="selected-chip">Cliente existente seleccionado <button type="button" id="btnQuitarCreditoClienteSel" title="Quitar selección" aria-label="Quitar cliente seleccionado">✕</button></span>`
+    : "";
+  document.getElementById("btnQuitarCreditoClienteSel")?.addEventListener("click", () => {
+    creditoClienteSel = null;
+    document.getElementById("creditoBuscarCliente").value = "";
+    renderCreditoClienteChip();
+  });
+}
+wireAutocompleteCliente(document.getElementById("creditoBuscarCliente"), document.getElementById("creditoBuscarClienteList"), (cliente) => {
+  creditoClienteSel = { clienteId: cliente.id };
+  document.getElementById("creditoNombre").value = cliente.nombre;
+  document.getElementById("creditoTelefono").value = cliente.telefono || "";
+  renderCreditoClienteChip();
+});
+document.getElementById("creditoBuscarCliente").addEventListener("input", () => { creditoClienteSel = null; renderCreditoClienteChip(); });
+
+let creditoInventarioCache = {}; // id -> repuesto, para no volver a consultar la BD al agregar el ítem
+async function refreshCreditoInventarioSelect() {
+  const inv = (await DB.getAll("inventario")).filter(r => r.cantidad > 0);
+  creditoInventarioCache = {};
+  inv.forEach(r => { creditoInventarioCache[r.id] = r; });
+  document.getElementById("creditoItemInventarioSelect").innerHTML = inv.length
+    ? inv.map(r => `<option value="${r.id}" data-precio="${r.precio}">${esc(r.nombre)} (quedan ${r.cantidad})</option>`).join("")
+    : `<option value="">Sin repuestos disponibles</option>`;
+}
+function toggleCreditoItemOrigen() {
+  const fromInv = document.getElementById("creditoItemOrigen").value === "inventario";
+  document.getElementById("creditoItemInventarioFields").style.display = fromInv ? "block" : "none";
+  document.getElementById("creditoItemManualFields").style.display = fromInv ? "none" : "block";
+}
+document.getElementById("creditoItemOrigen").addEventListener("change", toggleCreditoItemOrigen);
+document.getElementById("creditoItemInventarioSelect").addEventListener("change", (e) => {
+  const precio = e.target.selectedOptions[0]?.dataset.precio;
+  if (precio) document.getElementById("creditoItemPrecio").value = precio;
+});
+
+function renderCreditoCarrito() {
+  const el = document.getElementById("creditoCarritoList");
+  el.innerHTML = creditoCarrito.length
+    ? creditoCarrito.map((it, i) => `
+      <div class="pos-cart-item">
+        <span class="nom">${esc(it.nombre)} ×${it.cantidad}</span>
+        <span style="width:80px; text-align:right;">${money(it.cantidad * it.precio)}</span>
+        <button type="button" class="btn ghost small danger" data-quitar-credito-item="${i}" title="Quitar" aria-label="Quitar de la factura">🗑</button>
+      </div>`).join("")
+    : `<div class="empty" style="padding:1rem 0;">Agrega repuestos o servicios arriba</div>`;
+  el.querySelectorAll("[data-quitar-credito-item]").forEach(btn => {
+    btn.addEventListener("click", () => { creditoCarrito.splice(Number(btn.dataset.quitarCreditoItem), 1); renderCreditoCarrito(); });
+  });
+  const total = creditoCarrito.reduce((s, it) => s + it.cantidad * it.precio, 0);
+  document.getElementById("creditoTotal").textContent = money(total);
+}
+
+document.getElementById("btnAgregarItemCredito").addEventListener("click", () => {
+  const cantidad = Number(document.getElementById("creditoItemCantidad").value) || 1;
+  const precio = Number(document.getElementById("creditoItemPrecio").value);
+  const fromInv = document.getElementById("creditoItemOrigen").value === "inventario";
+  if (cantidad <= 0) { toast("La cantidad debe ser mayor a cero", "off"); return; }
+  if (!(precio >= 0)) { toast("El precio no puede ser negativo", "off"); return; }
+
+  if (fromInv) {
+    const repId = Number(document.getElementById("creditoItemInventarioSelect").value);
+    const rep = creditoInventarioCache[repId];
+    if (!rep) { toast("Elige un repuesto", "off"); return; }
+    const enCarrito = creditoCarrito.filter(it => it.inventarioId === repId).reduce((s, it) => s + it.cantidad, 0);
+    if (enCarrito + cantidad > rep.cantidad) { toast(`Solo quedan ${rep.cantidad} en inventario`, "off"); return; }
+    creditoCarrito.push({ inventarioId: repId, nombre: rep.nombre, cantidad, precio, stockDisponible: rep.cantidad });
+  } else {
+    const nombre = document.getElementById("creditoItemNombre").value.trim();
+    if (!nombre) { toast("Falta el nombre del repuesto o servicio", "off"); return; }
+    creditoCarrito.push({ inventarioId: null, nombre, cantidad, precio });
+  }
+  document.getElementById("creditoItemNombre").value = "";
+  document.getElementById("creditoItemCantidad").value = "1";
+  document.getElementById("creditoItemPrecio").value = "";
+  renderCreditoCarrito();
+});
+
+document.getElementById("btnNuevoCredito").addEventListener("click", async () => {
+  creditoClienteSel = null;
+  creditoCarrito = [];
+  document.getElementById("creditoBuscarCliente").value = "";
+  renderCreditoClienteChip();
+  ["creditoNombre", "creditoTelefono", "creditoItemNombre", "creditoVencimiento", "creditoNota"].forEach(id => document.getElementById(id).value = "");
+  document.getElementById("creditoItemOrigen").value = "inventario";
+  document.getElementById("creditoItemCantidad").value = "1";
+  document.getElementById("creditoItemPrecio").value = "";
+  toggleCreditoItemOrigen();
+  await refreshCreditoInventarioSelect();
+  renderCreditoCarrito();
+  document.getElementById("modalCredito").classList.add("active");
+});
+document.getElementById("btnCancelarCredito").addEventListener("click", () => document.getElementById("modalCredito").classList.remove("active"));
+
+alHacerClicUnaVez(document.getElementById("btnGuardarCredito"), async () => {
+  if (!creditoCarrito.length) { toast("Agrega al menos un repuesto o servicio", "off"); return; }
+
+  let clienteId = null, clienteNombre, clienteTelefono;
+  if (creditoClienteSel?.clienteId) {
+    clienteId = creditoClienteSel.clienteId;
+    clienteNombre = document.getElementById("creditoNombre").value.trim() || document.getElementById("creditoBuscarCliente").value.trim();
+    clienteTelefono = document.getElementById("creditoTelefono").value.trim();
+  } else {
+    const nombre = document.getElementById("creditoNombre").value.trim();
+    const telefono = document.getElementById("creditoTelefono").value.trim();
+    if (!nombre) { toast("Falta el nombre del cliente", "off"); return; }
+    if (!(await checkDuplicateBeforeCreate(nombre, telefono))) return;
+    clienteId = await DB.save("clientes", { nombre, telefono });
+    markDirty();
+    clienteNombre = nombre;
+    clienteTelefono = telefono;
+  }
+
+  try {
+    await registrarCredito({
+      clienteId, clienteNombre, clienteTelefono,
+      items: creditoCarrito.map(it => ({ inventarioId: it.inventarioId, nombre: it.nombre, cantidad: it.cantidad, precio: it.precio })),
+      vencimiento: document.getElementById("creditoVencimiento").value || null,
+      nota: document.getElementById("creditoNota").value.trim(),
+    });
+    markDirty();
+    document.getElementById("modalCredito").classList.remove("active");
+    creditoCarrito = [];
+    toast("Crédito registrado — toca 🖨️ en la lista para ver o imprimir la factura");
+    renderCreditos();
+  } catch (err) {
+    toast("No se pudo registrar el crédito: " + err.message, "off");
+  }
 });
 
 /* ================= GESTOR DE LA WEB (CMS local) ================= */
