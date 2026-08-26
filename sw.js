@@ -2,8 +2,8 @@
 // cambiando la app todos los días, "caché primero" deja a los dispositivos ya
 // instalados atascados en una versión vieja para siempre — network-first evita
 // eso y de todos modos cae al caché cuando de verdad no hay señal.
-const CACHE_NAME = "entimotors-v3.2.0";
-const SHELL = ["./", "./index.html", "./app.js?v=3.2.0", "./manifest.json", "./icons/icon-192.png"];
+const CACHE_NAME = "entimotors-v3.2.1";
+const SHELL = ["./", "./index.html", "./app.js?v=3.2.1", "./manifest.json", "./icons/icon-192.png"];
 
 self.addEventListener("install", (event) => {
   // cache.addAll() no deja pasar { cache: "no-store" } — sin eso, el propio
