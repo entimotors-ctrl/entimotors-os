@@ -227,8 +227,22 @@ async function updateOrder(id, mutator) {
 }
 function setStage(ord, key) {
   ord.estado = key;
-  if (key === "entregado" && !ord.entregadoEn) ord.entregadoEn = Date.now();
+  if (key === "entregado") {
+    if (!ord.entregadoEn) ord.entregadoEn = Date.now();
+    if (ord.garantiaDias === undefined) ord.garantiaDias = 30;
+  }
 }
+
+// mensajes de progreso por WhatsApp — uno por etapa, se envían desde el detalle
+// de la orden con el botón "📲 Progreso por WhatsApp".
+const PROGRESO_MENSAJES = {
+  recibido: (m) => `hemos recibido tu ${m} en el taller. Pronto comenzamos el diagnóstico.`,
+  diagnostico: (m) => `estamos revisando tu ${m} para diagnosticar la falla.`,
+  presupuesto: (m) => `ya tenemos el presupuesto de tu ${m} listo.`,
+  reparacion: (m) => `tu ${m} ya está en reparación.`,
+  calidad: (m) => `tu ${m} está en control de calidad final, ya casi lista.`,
+  entregado: (m) => `¡tu ${m} está lista! Ya puedes pasar a recogerla.`,
+};
 
 /* ---------------- venta rápida (TPV): transacción atómica multi-store ----------------
    IndexedDB ya garantiza atomicidad dentro de una misma transacción: si cualquier
@@ -865,7 +879,7 @@ function chartColors() {
 async function renderFinanzasCharts() {
   if (typeof Chart === "undefined") return; // sin internet la primera vez, la librería no llegó a cargar
 
-  const [movs, ventas, ordenes, inv] = await Promise.all([DB.getAll("caja_movimientos"), DB.getAll("ventas_rapidas"), DB.getAll("ordenes"), DB.getAll("inventario")]);
+  const [movs, ventas, ordenes, inv, creditos] = await Promise.all([DB.getAll("caja_movimientos"), DB.getAll("ventas_rapidas"), DB.getAll("ordenes"), DB.getAll("inventario"), DB.getAll("creditos")]);
   const { grid, text } = chartColors();
   Chart.defaults.color = text;
   Chart.defaults.borderColor = grid;
@@ -890,15 +904,24 @@ async function renderFinanzasCharts() {
     options: { responsive: true, scales: { x: { grid: { display: false } }, y: { grid: { color: grid }, beginAtZero: true } } },
   });
 
-  // 2) Origen de ingresos: mano de obra taller vs ventas TPV
-  const totalTaller = movs.filter(m => m.categoria === "Servicio taller").reduce((s, m) => s + m.monto, 0);
-  const totalTPV = movs.filter(m => m.categoria === "Venta mostrador").reduce((s, m) => s + m.monto, 0);
+  // 2) Ganancias por línea de negocio: taller (órdenes de servicio) vs venta de
+  // repuestos vs trabajo rápido — se calcula directo de las órdenes/ventas/créditos
+  // (no de caja_movimientos) para poder separar cada ítem por su origen, algo que
+  // el registro de caja ya no distingue una vez que el dinero entra como un solo monto.
+  const totalTaller = ordenes
+    .filter(o => o.estado === "entregado")
+    .reduce((s, o) => s + (o.items || []).reduce((ss, it) => ss + it.cantidad * it.precio, 0), 0);
+  let totalRepuestos = 0, totalTrabajoRapido = 0;
+  [...ventas, ...creditos].forEach(v => (v.items || []).forEach(it => {
+    const sub = it.cantidad * it.precio;
+    if (it.inventarioId) totalRepuestos += sub; else totalTrabajoRapido += sub;
+  }));
   chartInstances.origenIngresos?.destroy();
   chartInstances.origenIngresos = new Chart(document.getElementById("chartOrigenIngresos"), {
     type: "doughnut",
     data: {
-      labels: ["Taller (mano de obra)", "TPV (mostrador)"],
-      datasets: [{ data: [totalTaller, totalTPV], backgroundColor: ["#ef4444", "#f5a524"] }],
+      labels: [`Taller (${money(totalTaller)})`, `Venta de repuestos (${money(totalRepuestos)})`, `Trabajo rápido (${money(totalTrabajoRapido)})`],
+      datasets: [{ data: [totalTaller, totalRepuestos, totalTrabajoRapido], backgroundColor: ["#ef4444", "#f5a524", "#34d399"] }],
     },
     options: { responsive: true, plugins: { legend: { position: "bottom" } } },
   });
@@ -1103,6 +1126,10 @@ async function renderStageContent(o) {
 
   } else if (o.estado === "entregado") {
     const total = (o.items || []).reduce((s, it) => s + it.cantidad * it.precio, 0);
+    const garantiaDias = o.garantiaDias ?? 30;
+    const venceEn = o.entregadoEn ? o.entregadoEn + garantiaDias * 86400000 : null;
+    const vigente = !venceEn || Date.now() <= venceEn;
+    const fechaVence = venceEn ? new Date(venceEn).toLocaleDateString("es-HN") : "—";
     el.innerHTML = `
       <div class="card">
         <h4 class="font-display" style="font-size:0.95rem; margin-bottom:0.4rem;">Entregada</h4>
@@ -1113,9 +1140,36 @@ async function renderStageContent(o) {
           <option value="transferencia" ${o.metodoPago === "transferencia" ? "selected" : ""}>Transferencia</option>
           <option value="tarjeta" ${o.metodoPago === "tarjeta" ? "selected" : ""}>Tarjeta</option>
         </select>
+      </div>
+      <div class="card" style="margin-top:1rem;">
+        <h4 class="font-display" style="font-size:0.95rem; margin-bottom:0.4rem;">Garantía</h4>
+        <div class="field-row" style="grid-template-columns:1fr 1fr;">
+          <div><label>Días de garantía</label><input type="number" id="garantiaDiasInput" min="0" value="${garantiaDias}"></div>
+          <div><label>Vence</label>
+            <p style="margin:0.55rem 0 0; display:flex; align-items:center; gap:0.5rem;">
+              ${fechaVence} <span class="pill ${vigente ? "entregado" : "reparacion"}">${vigente ? "Vigente" : "Vencida"}</span>
+            </p>
+          </div>
+        </div>
+        <button class="btn wa small" id="btnEnviarGarantiaWA" style="margin-top:0.4rem;">Enviar nota de garantía por WhatsApp</button>
       </div>`;
     document.getElementById("entregaMetodoPago").addEventListener("change", (e) => {
       updateOrder(o.id, ord => { ord.metodoPago = e.target.value; });
+    });
+    document.getElementById("garantiaDiasInput").addEventListener("change", async (e) => {
+      const dias = Number(e.target.value) || 0;
+      const ord = await updateOrder(o.id, x => { x.garantiaDias = dias; });
+      renderStageContent(ord);
+    });
+    document.getElementById("btnEnviarGarantiaWA").addEventListener("click", () => {
+      const ventana = abrirVentanaWA(); // sincrónico, antes de cualquier await
+      const { cliente, moto } = currentOrderCache;
+      const motoDesc = `${moto.marca} ${moto.modelo}`.trim();
+      const cuerpo = vigente
+        ? `tu garantía por el trabajo en tu ${motoDesc} (orden #${o.id}) sigue vigente hasta el ${fechaVence}. Cualquier falla relacionada, contáctanos.`
+        : `tu garantía por el trabajo en tu ${motoDesc} (orden #${o.id}) venció el ${fechaVence}. Si necesitas otra revisión, con gusto te ayudamos.`;
+      const texto = `Hola ${cliente.nombre}, ${cuerpo} — ENTIMOTORS`;
+      navegarWA(ventana, cliente.telefono, texto);
     });
   }
 }
@@ -1441,6 +1495,16 @@ alHacerClicUnaVez(document.getElementById("btnGuardarItem"), async () => {
   const o = await updateOrder(currentOrderId, ord => { ord.items = (ord.items || []).concat([{ nombre, cantidad, precio, origenInventarioId }]); });
   document.getElementById("modalItem").classList.remove("active");
   openOrder(o.id);
+});
+
+/* ---- enviar progreso de la reparación por WhatsApp ---- */
+document.getElementById("btnEnviarProgresoWA").addEventListener("click", () => {
+  const ventana = abrirVentanaWA(); // sincrónico, antes de cualquier await
+  const { o, moto, cliente } = currentOrderCache;
+  const motoDesc = `${moto.marca} ${moto.modelo}`.trim();
+  const cuerpo = (PROGRESO_MENSAJES[o.estado] || (() => `tu ${motoDesc} avanzó de etapa.`))(motoDesc);
+  const texto = `Hola ${cliente.nombre}, ${cuerpo} — ENTIMOTORS`;
+  navegarWA(ventana, cliente.telefono, texto);
 });
 
 /* ---- imprimir factura ---- */
@@ -2560,44 +2624,22 @@ async function renderCreditos() {
   const estadoLabel = { pendiente: "Pendiente", parcial: "Parcial", pagado: "Pagado" };
   const body = document.getElementById("creditosBody");
   document.getElementById("creditosEmpty").style.display = filtrados.length ? "none" : "block";
+  // clic en cualquier parte de la fila abre el detalle del crédito con todas
+  // sus funciones (abonar, recordar, factura, eliminar) — así no hace falta
+  // hacer scroll horizontal para llegar a los botones en pantallas angostas.
   body.innerHTML = filtrados.map(c => `
-    <tr>
+    <tr class="credito-row" data-id="${c.id}" style="cursor:pointer;">
       <td>${esc(c.clienteNombre || "Cliente de mostrador")}</td>
       <td>${new Date(c.fechaISO).toLocaleDateString("es-HN")}</td>
       <td class="num">${money(c.total)}</td>
       <td class="num">${money(c.abonado)}</td>
       <td class="num">${money(c.saldo)}</td>
       <td><span class="pill ${c.estado}">${estadoLabel[c.estado]}</span></td>
-      <td class="num" style="white-space:nowrap;">
-        ${c.estado !== "pagado" ? `<button type="button" class="btn small" data-action="abonar" data-id="${c.id}">Abonar</button>` : ""}
-        <button type="button" class="btn ghost small" data-action="imprimir-credito" data-id="${c.id}" title="Ver / imprimir factura" aria-label="Ver o imprimir factura">🖨️</button>
-        ${c.clienteTelefono && c.estado !== "pagado" ? `<button type="button" class="btn wa small" data-action="recordar-credito" data-id="${c.id}">Recordar</button>` : ""}
-        ${c.abonado === 0 ? `<button type="button" class="btn ghost small danger" data-action="eliminar-credito" data-id="${c.id}" title="Eliminar" aria-label="Eliminar crédito">🗑</button>` : ""}
-      </td>
+      <td class="num" style="color:var(--text-faint);">›</td>
     </tr>`).join("");
 
-  body.querySelectorAll('[data-action="abonar"]').forEach(btn => {
-    btn.addEventListener("click", () => abrirModalAbonoCredito(Number(btn.dataset.id)));
-  });
-  body.querySelectorAll('[data-action="imprimir-credito"]').forEach(btn => {
-    btn.addEventListener("click", () => imprimirFacturaCredito(creditosCache[Number(btn.dataset.id)]));
-  });
-  body.querySelectorAll('[data-action="recordar-credito"]').forEach(btn => {
-    btn.addEventListener("click", () => {
-      const ventana = abrirVentanaWA(); // sincrónico, antes de cualquier await — ver nota en abrirVentanaWA()
-      const cred = creditosCache[Number(btn.dataset.id)];
-      const texto = `Hola ${cred.clienteNombre}, te recordamos que tienes un saldo pendiente de ${money(cred.saldo)} con ENTIMOTORS por el crédito #${cred.id}. ¡Gracias!`;
-      navegarWA(ventana, cred.clienteTelefono, texto);
-    });
-  });
-  body.querySelectorAll('[data-action="eliminar-credito"]').forEach(btn => {
-    btn.addEventListener("click", () => {
-      requestAdminCode(async () => {
-        await eliminarCredito(Number(btn.dataset.id));
-        toast("Crédito eliminado");
-        renderCreditos();
-      });
-    });
+  body.querySelectorAll(".credito-row").forEach(tr => {
+    tr.addEventListener("click", () => abrirCreditoDetalle(Number(tr.dataset.id)));
   });
 }
 
@@ -2624,6 +2666,56 @@ function imprimirFacturaCredito(cred) {
   window.print();
   setTimeout(() => document.body.classList.remove("print-credito"), 300);
 }
+
+/* ---- detalle de un crédito: reúne factura + acciones en un solo lugar, para
+   no tener que ir a buscar botones haciendo scroll en la tabla ---- */
+let creditoDetalleId = null;
+const estadoLabelDetalle = { pendiente: "Pendiente", parcial: "Parcial", pagado: "Pagado" };
+
+function abrirCreditoDetalle(id) {
+  const cred = creditosCache[id];
+  if (!cred) return;
+  creditoDetalleId = id;
+
+  document.getElementById("credDetTitulo").textContent = cred.clienteNombre || "Cliente de mostrador";
+  document.getElementById("credDetSub").innerHTML = `Crédito #${cred.id} · ${new Date(cred.fechaISO).toLocaleDateString("es-HN")} · ${esc(cred.clienteTelefono || "sin teléfono")} · <span class="pill ${cred.estado}">${estadoLabelDetalle[cred.estado]}</span>`;
+  document.getElementById("credDetItems").innerHTML = cred.items.map(it => `
+    <tr><td>${esc(it.nombre)}</td><td class="num">${it.cantidad}</td><td class="num">${money(it.precio)}</td><td class="num">${money(it.cantidad * it.precio)}</td></tr>
+  `).join("");
+  document.getElementById("credDetTotal").textContent = money(cred.total);
+  document.getElementById("credDetAbonado").textContent = money(cred.abonado);
+  document.getElementById("credDetSaldo").textContent = money(cred.saldo);
+
+  const notaEl = document.getElementById("credDetNota");
+  if (cred.nota) { notaEl.textContent = `Nota: ${cred.nota}`; notaEl.style.display = "block"; } else notaEl.style.display = "none";
+
+  document.getElementById("btnDetAbonar").style.display = cred.estado !== "pagado" ? "inline-flex" : "none";
+  document.getElementById("btnDetRecordar").style.display = (cred.clienteTelefono && cred.estado !== "pagado") ? "inline-flex" : "none";
+  document.getElementById("btnDetEliminar").style.display = cred.abonado === 0 ? "inline-flex" : "none";
+
+  document.getElementById("modalCreditoDetalle").classList.add("active");
+}
+document.getElementById("btnCerrarCreditoDetalle").addEventListener("click", () => document.getElementById("modalCreditoDetalle").classList.remove("active"));
+
+document.getElementById("btnDetAbonar").addEventListener("click", () => {
+  document.getElementById("modalCreditoDetalle").classList.remove("active");
+  abrirModalAbonoCredito(creditoDetalleId);
+});
+document.getElementById("btnDetImprimir").addEventListener("click", () => imprimirFacturaCredito(creditosCache[creditoDetalleId]));
+document.getElementById("btnDetRecordar").addEventListener("click", () => {
+  const ventana = abrirVentanaWA(); // sincrónico, antes de cualquier await — ver nota en abrirVentanaWA()
+  const cred = creditosCache[creditoDetalleId];
+  const texto = `Hola ${cred.clienteNombre}, te recordamos que tienes un saldo pendiente de ${money(cred.saldo)} con ENTIMOTORS por el crédito #${cred.id}. ¡Gracias!`;
+  navegarWA(ventana, cred.clienteTelefono, texto);
+});
+document.getElementById("btnDetEliminar").addEventListener("click", () => {
+  requestAdminCode(async () => {
+    await eliminarCredito(creditoDetalleId);
+    document.getElementById("modalCreditoDetalle").classList.remove("active");
+    toast("Crédito eliminado");
+    renderCreditos();
+  });
+});
 
 /* ---- registrar abono ---- */
 let abonoCreditoActualId = null;

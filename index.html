@@ -917,6 +917,7 @@
         </div>
         <span class="mant-badge ok" id="finalizadoBadge" style="display:none;"></span>
         <div style="display:flex; gap:0.5rem; flex-wrap:wrap;">
+          <button class="btn wa" id="btnEnviarProgresoWA">📲 Progreso por WhatsApp</button>
           <button class="btn ghost" id="btnImprimirFactura" style="display:none;">🖨 Imprimir factura</button>
           <button class="btn ghost" id="btnRetroceder">&larr; Retroceder etapa</button>
           <button class="btn primary" id="btnAvanzar">Avanzar a la siguiente etapa &rarr;</button>
@@ -1035,7 +1036,7 @@
       </div>
       <div class="charts-grid">
         <div class="card chart-card span-2"><h4>Ingresos vs Gastos (últimos 7 días)</h4><canvas id="chartIngresosGastos" height="220"></canvas></div>
-        <div class="card chart-card"><h4>Origen de ingresos</h4><canvas id="chartOrigenIngresos" height="220"></canvas></div>
+        <div class="card chart-card"><h4>Ganancias por línea de negocio</h4><canvas id="chartOrigenIngresos" height="220"></canvas></div>
         <div class="card chart-card"><h4>Top 5 repuestos con mayor rotación</h4><canvas id="chartTopRepuestos" height="220"></canvas></div>
       </div>
 
@@ -1357,6 +1358,35 @@
   </div>
 </div>
 
+<!-- Modal: detalle de crédito — factura + todas sus funciones en un solo lugar -->
+<div class="modal-bg" id="modalCreditoDetalle">
+  <div class="modal" style="max-width:560px;">
+    <h3 id="credDetTitulo">Crédito</h3>
+    <p class="hint" id="credDetSub" style="margin-top:-0.6rem;"></p>
+    <div class="table-scroll">
+    <table>
+      <thead><tr><th>Ítem</th><th class="num">Cant.</th><th class="num">Precio</th><th class="num">Subtotal</th></tr></thead>
+      <tbody id="credDetItems"></tbody>
+    </table>
+    </div>
+    <div class="pos-total-row"><span>Total</span><span class="big" id="credDetTotal">L. 0.00</span></div>
+    <div style="display:flex; justify-content:space-between; font-size:0.9rem; color:var(--text-muted); margin-top:-0.6rem; margin-bottom:0.8rem;">
+      <span>Abonado: <b id="credDetAbonado" style="color:var(--text);"></b></span>
+      <span>Saldo: <b id="credDetSaldo" style="color:var(--red);"></b></span>
+    </div>
+    <p class="hint" id="credDetNota" style="display:none;"></p>
+    <div class="modal-actions" style="justify-content:flex-start; flex-wrap:wrap;">
+      <button type="button" class="btn small" id="btnDetAbonar">Abonar</button>
+      <button type="button" class="btn wa small" id="btnDetRecordar">Recordar</button>
+      <button type="button" class="btn ghost small" id="btnDetImprimir">🖨️ Factura</button>
+      <button type="button" class="btn ghost small danger" id="btnDetEliminar">🗑 Eliminar</button>
+    </div>
+    <div class="modal-actions">
+      <button class="btn ghost" id="btnCerrarCreditoDetalle">Cerrar</button>
+    </div>
+  </div>
+</div>
+
 <!-- Modal: detalle de cliente -->
 <div class="modal-bg" id="modalClienteDetalle">
   <div class="modal" style="max-width:560px;">
@@ -1623,6 +1653,6 @@
      sw.js) — es la forma más universal de forzar que CUALQUIER navegador
      pida el archivo de nuevo aunque ya tenga guardada una copia vieja en su
      propio caché HTTP, sin depender de que respete el Service Worker. -->
-<script src="app.js?v=3.0.0"></script>
+<script src="app.js?v=3.1.0"></script>
 </body>
 </html>
