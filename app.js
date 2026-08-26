@@ -829,16 +829,16 @@ async function renderDashboard() {
       <span class="big">${money(ingresosMes)}</span>
       <span class="sub">De órdenes entregadas en ${esc(now.toLocaleDateString("es-HN", { month: "long" }))}</span>
     </div>
-    <div class="widget-card span-2">
-      <span class="eyebrow" style="color:var(--text-faint);">Órdenes por etapa</span>
-      <div class="seg-bar">${porEtapa.map(s => `<span title="${esc(s.label)}: ${s.count}" style="width:${(s.count / totalOrdenes) * 100}%; background:${stageColor[s.key]};"></span>`).join("")}</div>
-      <div class="seg-legend">${porEtapa.map(s => `<span><span class="dot" style="background:${stageColor[s.key]}"></span>${esc(s.label)} <b>${s.count}</b></span>`).join("")}</div>
-    </div>
     <button type="button" class="widget-card ${mantenimientos > 0 ? "tint-amber" : ""}" id="cardMantenimientos" style="text-align:left; font-family:inherit; cursor:pointer;">
       <span class="eyebrow">Mantenimientos</span>
       <span class="big">${mantenimientos}</span>
       <span class="sub">Vencidos o por vencer en 7 días</span>
     </button>
+    <div class="widget-card span-2">
+      <span class="eyebrow" style="color:var(--text-faint);">Órdenes por etapa</span>
+      <div class="seg-bar">${porEtapa.map(s => `<span title="${esc(s.label)}: ${s.count}" style="width:${(s.count / totalOrdenes) * 100}%; background:${stageColor[s.key]};"></span>`).join("")}</div>
+      <div class="seg-legend">${porEtapa.map(s => `<span><span class="dot" style="background:${stageColor[s.key]}"></span>${esc(s.label)} <b>${s.count}</b></span>`).join("")}</div>
+    </div>
   `;
   document.getElementById("cardMantenimientos").addEventListener("click", () => {
     showView("clientes");
@@ -2496,10 +2496,10 @@ async function renderFinanzas() {
     <div class="widget-card tint-red"><span class="eyebrow">Costos</span><span class="big">${money(costosTotal)}</span><span class="sub">Egresos + costo de repuestos vendidos</span></div>
     <div class="widget-card ${utilidad >= 0 ? "tint-green" : "tint-red"}"><span class="eyebrow">Utilidad neta</span><span class="big">${money(utilidad)}</span><span class="sub">Ingresos − costos</span></div>
     <div class="widget-card"><span class="eyebrow" style="color:var(--text-faint);">Margen promedio</span><span class="big">${margen.toFixed(1)}%</span><span class="sub">Utilidad / ingresos</span></div>
-    <button type="button" class="widget-card span-2 ${cuentasPorCobrar > 0 ? "tint-amber" : ""}" id="cardCuentasPorCobrar" style="text-align:left; font-family:inherit; cursor:pointer;">
+    <button type="button" class="widget-card ${cuentasPorCobrar > 0 ? "tint-amber" : ""}" id="cardCuentasPorCobrar" style="text-align:left; font-family:inherit; cursor:pointer;">
       <span class="eyebrow">Cuentas por cobrar</span><span class="big">${money(cuentasPorCobrar)}</span><span class="sub">Saldo pendiente en créditos activos</span>
     </button>
-    <button type="button" class="widget-card span-2" id="cardCreditosActivos" style="text-align:left; font-family:inherit; cursor:pointer;">
+    <button type="button" class="widget-card" id="cardCreditosActivos" style="text-align:left; font-family:inherit; cursor:pointer;">
       <span class="eyebrow" style="color:var(--text-faint);">Créditos activos</span><span class="big">${creditosPendientes.length}</span><span class="sub">Clientes con saldo pendiente</span>
     </button>
   `;
