@@ -740,7 +740,7 @@ async function renderNotificaciones() {
   const [citasAll, motos, inventario] = await Promise.all([DB.getAll("citas"), DB.getAll("motos"), DB.getAll("inventario")]);
   const avisos = [];
 
-  citasAll.filter(c => citaWhenInfo(c).diffDays === 0).forEach(c => {
+  citasAll.filter(c => !citaCerrada(c) && citaWhenInfo(c).diffDays === 0).forEach(c => {
     avisos.push({ ic: "📅", titulo: "Cita hoy", sub: c.motivo || "Sin motivo especificado", onClick: () => { showView("citas"); renderCitasList(); } });
   });
   motos.filter(m => ["due", "soon"].includes(mantStatus(m).cls)).forEach(m => {
@@ -840,7 +840,7 @@ async function renderDashboard() {
 
   const activas = ordenes.filter(o => o.estado !== "entregado").length;
   const hoyStr = new Date().toISOString().slice(0, 10);
-  const citasHoy = citas.filter(c => c.fecha === hoyStr).length;
+  const citasHoy = citas.filter(c => c.fecha === hoyStr && !citaCerrada(c)).length;
   const mantenimientos = countMantenimientos(motos);
   const repuestosBajos = inventario.filter(r => r.cantidad <= 3).length;
 
@@ -1026,7 +1026,7 @@ async function renderOrdersList() {
         <span class="pill ${o.estado}">${STAGES.find(s => s.key === o.estado)?.label ?? o.estado}${o.finalizada ? " ✓" : ""}</span>
         <div class="order-info">
           <div class="moto">${esc(moto ? `${moto.marca} ${moto.modelo}` : "Moto")} <span class="cliente">— ${esc(cliente?.nombre ?? "cliente")}</span></div>
-          <div class="meta">placa ${esc(moto?.placa || "s/p")} · orden #${o.id}</div>
+          <div class="meta">placa ${esc(moto?.placa || "s/p")} · orden #${o.id}${o.citaId ? ' · <span class="mant-badge soon">📅 Desde cita</span>' : ""}</div>
         </div>
         <span class="amount">${money(total)}</span>
         <span class="meta mech">${esc(o.mecanico ?? "")}</span>
@@ -1061,7 +1061,11 @@ async function openOrder(id) {
   currentOrderCache = { o, moto, cliente };
 
   document.getElementById("detalleTitulo").textContent = `Orden #${o.id} — ${moto.marca} ${moto.modelo}`;
-  document.getElementById("detalleSub").textContent = `${cliente.nombre} · ${cliente.telefono || "sin teléfono"} · placa ${moto.placa || "s/p"} · asignada a ${o.mecanico}`;
+  const desdeCita = o.citaId
+    ? ` · <span class="mant-badge soon">📅 Desde cita${o.citaFechaISO ? " del " + new Date(o.citaFechaISO).toLocaleDateString("es-HN") : ""}</span>`
+    : "";
+  document.getElementById("detalleSub").innerHTML =
+    `${esc(cliente.nombre)} · ${esc(cliente.telefono || "sin teléfono")} · placa ${esc(moto.placa || "s/p")} · asignada a ${esc(o.mecanico)}${desdeCita}`;
   document.getElementById("detalleFalla").textContent = o.falla || "(sin descripción)";
   document.getElementById("inputKm").value = moto.km ?? "";
   document.getElementById("inputKm").previousElementSibling.textContent = o.estado === "entregado" ? "Kilometraje de salida" : "Kilometraje actual";
@@ -1414,7 +1418,54 @@ wireAutocompleteCliente(document.getElementById("ordenBuscarCliente"), document.
 });
 document.getElementById("ordenBuscarCliente").addEventListener("input", () => { ordenClienteSel = null; renderOrdenClienteChip(); });
 
+/* El cliente llegó a su cita: se le abre la orden de servicio con todo lo que
+   ya sabíamos de la cita (cliente, su moto, el motivo y el mecánico con quien
+   la apartó), y al crearla la cita se marca como atendida y sale del listado.
+   La cita NO se borra: queda en el historial ligada a su orden, para poder
+   saber después cuántas citas se cumplieron y cuáles no. */
+let citaPendienteDeConvertir = null;
+
+async function abrirOrdenDesdeCita(citaId) {
+  const cita = await DB.get("citas", citaId);
+  if (!cita) return;
+  citaPendienteDeConvertir = cita;
+
+  ordenClienteSel = null;
+  ["ordenNombre", "ordenTelefono", "ordenPlaca", "ordenMarca", "ordenModelo", "ordenKm", "ordenFalla"].forEach(id => document.getElementById(id).value = "");
+  document.getElementById("ordenFoto").value = "";
+  document.getElementById("ordenBuscarCliente").value = "";
+
+  if (cita.clienteId) {
+    const cliente = await DB.get("clientes", cita.clienteId);
+    const motos = await DB.getAll("motos");
+    const moto = motos.find(m => m.clienteId === cita.clienteId) || null;
+    if (cliente) {
+      ordenClienteSel = { clienteId: cliente.id, motoId: moto?.id || null };
+      document.getElementById("ordenBuscarCliente").value = cliente.nombre;
+      document.getElementById("ordenNombre").value = cliente.nombre;
+      document.getElementById("ordenTelefono").value = cliente.telefono || "";
+      document.getElementById("ordenPlaca").value = moto?.placa || "";
+      document.getElementById("ordenMarca").value = moto?.marca || "";
+      document.getElementById("ordenModelo").value = moto?.modelo || "";
+      document.getElementById("ordenKm").value = moto?.km || 0;
+    }
+  } else {
+    // cita de alguien que todavía no estaba registrado (típico de la web)
+    document.getElementById("ordenNombre").value = cita.nombreTmp || "";
+    document.getElementById("ordenTelefono").value = cita.telefonoTmp || "";
+  }
+  document.getElementById("ordenFalla").value = cita.motivo || "";
+  renderOrdenClienteChip();
+
+  document.getElementById("ordenDesdeCitaAviso").style.display = "block";
+  document.getElementById("ordenDesdeCitaTexto").textContent =
+    `Viene de la cita del ${citaWhenInfo(cita).dt.toLocaleDateString("es-HN")} a las ${citaWhenInfo(cita).dt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}${cita.mecanico ? ` con ${cita.mecanico}` : ""}.`;
+  document.getElementById("modalOrden").classList.add("active");
+}
+
 document.getElementById("btnNuevaOrden").addEventListener("click", async () => {
+  citaPendienteDeConvertir = null;
+  document.getElementById("ordenDesdeCitaAviso").style.display = "none";
   ordenClienteSel = null;
   document.getElementById("ordenBuscarCliente").value = "";
   renderOrdenClienteChip();
@@ -1422,7 +1473,10 @@ document.getElementById("btnNuevaOrden").addEventListener("click", async () => {
   document.getElementById("ordenFoto").value = "";
   document.getElementById("modalOrden").classList.add("active");
 });
-document.getElementById("btnCancelarOrden").addEventListener("click", () => document.getElementById("modalOrden").classList.remove("active"));
+document.getElementById("btnCancelarOrden").addEventListener("click", () => {
+  citaPendienteDeConvertir = null;
+  document.getElementById("modalOrden").classList.remove("active");
+});
 
 alHacerClicUnaVez(document.getElementById("btnCrearOrden"), async () => {
   let clienteId, motoId;
@@ -1465,18 +1519,31 @@ alHacerClicUnaVez(document.getElementById("btnCrearOrden"), async () => {
   const fotoFile = document.getElementById("ordenFoto").files[0];
   const fotos = fotoFile ? [await fileToDataUrl(fotoFile)] : [];
 
+  const cita = citaPendienteDeConvertir;
   const id = await DB.save("ordenes", {
     clienteId, motoId, estado: "recibido",
     falla: document.getElementById("ordenFalla").value.trim(),
     items: [], fotos, aprobacion: null,
     diagnostico: null, reparacionNotas: "", calidadChecklist: null,
-    mecanico: currentUser?.nombre || "—",
+    // si viene de una cita, la atiende el mecánico con quien se apartó
+    mecanico: cita?.mecanico || currentUser?.nombre || "—",
+    citaId: cita?.id || null,
+    citaFechaISO: cita ? `${cita.fecha}T${cita.hora}` : null,
     creadoEn: Date.now(),
   });
   markDirty();
+
+  if (cita) {
+    await DB.save("citas", { ...cita, estado: "atendida", ordenId: id, cerradaEn: Date.now() });
+    markDirty();
+    citaPendienteDeConvertir = null;
+    await renderCitasList();
+  }
+
   document.getElementById("modalOrden").classList.remove("active");
-  toast("Orden creada");
+  toast(cita ? `Orden #${id} creada desde la cita` : "Orden creada");
   await renderOrdersList();
+  renderDashboard();
   openOrder(id);
 });
 
@@ -1706,30 +1773,46 @@ function citaWhenInfo(cita) {
   return { diffDays, label, dt };
 }
 
-let citasFiltro = null; // null | "hoy" | "semana" | "sinRecordatorio"
+let citasFiltro = null; // null | "hoy" | "semana" | "sinRecordatorio" | "historial"
+
+// Una cita se "cierra" cuando ya sabemos qué pasó con ella: o el cliente llegó
+// (y se le abrió su orden de servicio) o no llegó. Mientras siga abierta se
+// queda en la lista para que alguien decida — así el listado no se llena de
+// citas viejas de las que nadie sabe en qué terminaron.
+function citaCerrada(c) { return c.estado === "atendida" || c.estado === "ausente"; }
 
 async function renderCitasList() {
   const [citasAll, clientes] = await Promise.all([DB.getAll("citas"), DB.getAll("clientes")]);
 
-  const hoy = citasAll.filter(c => citaWhenInfo(c).diffDays === 0);
-  const semana = citasAll.filter(c => { const d = citaWhenInfo(c).diffDays; return d >= 0 && d <= 6; });
-  const sinRecordatorio = citasAll.filter(c => !c.recordatorioEnviado && citaWhenInfo(c).diffDays >= 0);
+  const abiertas = citasAll.filter(c => !citaCerrada(c));
+  const cerradas = citasAll.filter(citaCerrada);
+  const hoy = abiertas.filter(c => citaWhenInfo(c).diffDays === 0);
+  const semana = abiertas.filter(c => { const d = citaWhenInfo(c).diffDays; return d >= 0 && d <= 6; });
+  const sinRecordatorio = abiertas.filter(c => !c.recordatorioEnviado && citaWhenInfo(c).diffDays >= 0);
+  // citas cuya hora ya pasó y que nadie marcó: hay que cerrarlas
+  const porCerrar = abiertas.filter(c => citaWhenInfo(c).diffDays < 0);
 
   renderWidgetRow("citasWidgetRow", [
     { ic: "📅", val: hoy.length, lbl: "Hoy", active: citasFiltro === "hoy", onClick: () => { citasFiltro = citasFiltro === "hoy" ? null : "hoy"; renderCitasList(); } },
     { ic: "🗓️", val: semana.length, lbl: "Esta semana", active: citasFiltro === "semana", onClick: () => { citasFiltro = citasFiltro === "semana" ? null : "semana"; renderCitasList(); } },
     { ic: "💬", val: sinRecordatorio.length, lbl: "Sin recordatorio", active: citasFiltro === "sinRecordatorio", onClick: () => { citasFiltro = citasFiltro === "sinRecordatorio" ? null : "sinRecordatorio"; renderCitasList(); } },
+    { ic: "⏳", val: porCerrar.length, lbl: "Por cerrar", active: citasFiltro === "porCerrar", onClick: () => { citasFiltro = citasFiltro === "porCerrar" ? null : "porCerrar"; renderCitasList(); } },
+    { ic: "📂", val: cerradas.length, lbl: "Historial", active: citasFiltro === "historial", onClick: () => { citasFiltro = citasFiltro === "historial" ? null : "historial"; renderCitasList(); } },
   ]);
 
-  let citas = citasAll;
+  // por defecto la lista muestra solo las citas abiertas: las ya atendidas
+  // pasaron a ser órdenes de servicio y viven allá, no aquí.
+  let citas = abiertas;
   if (citasFiltro === "hoy") citas = hoy;
   else if (citasFiltro === "semana") citas = semana;
   else if (citasFiltro === "sinRecordatorio") citas = sinRecordatorio;
+  else if (citasFiltro === "porCerrar") citas = porCerrar;
+  else if (citasFiltro === "historial") citas = cerradas;
 
   const list = document.getElementById("citasList");
   if (!citas.length) {
     list.innerHTML = citasAll.length
-      ? `<div class="empty">Ninguna cita coincide con este filtro.</div>`
+      ? `<div class="empty">${citasFiltro === "historial" ? "Todavía no hay citas cerradas." : citasFiltro ? "Ninguna cita coincide con este filtro." : "No hay citas pendientes. Las ya atendidas están en el historial."}</div>`
       : `<div class="empty">Sin citas todavía.<br><button class="btn primary small" id="btnEmptyNuevaCita" style="margin-top:0.8rem;">+ Crear la primera</button></div>`;
     document.getElementById("btnEmptyNuevaCita")?.addEventListener("click", () => document.getElementById("btnNuevaCita").click());
     updateCitasBadge(0);
@@ -1741,17 +1824,78 @@ async function renderCitasList() {
     const nombre = cliente?.nombre || c.nombreTmp || "Cliente";
     const telefono = cliente?.telefono || c.telefonoTmp || "";
     const { label, dt } = citaWhenInfo(c);
+    const { diffDays } = citaWhenInfo(c);
+    // los botones cambian según en qué momento está la cita: no tiene sentido
+    // preguntar "¿llegó?" por una cita de la próxima semana, ni ofrecer
+    // recordatorio de una que ya se atendió.
+    let acciones;
+    if (c.estado === "atendida") {
+      acciones = `<button type="button" class="btn ghost small" data-action="ver-orden" data-orden="${c.ordenId}">Ver orden #${c.ordenId} →</button>`;
+    } else if (c.estado === "ausente") {
+      acciones = `<button type="button" class="btn ghost small" data-action="reabrir" data-id="${c.id}">Reabrir</button>
+        <button type="button" class="btn ghost small danger" data-action="eliminar" data-id="${c.id}" data-tel="" data-nombre="${esc(nombre)}" title="Eliminar cita" aria-label="Eliminar cita">🗑</button>`;
+    } else if (diffDays <= 0) {
+      // ya llegó el día (o ya pasó): toca decidir si vino o no
+      acciones = `<button class="btn primary small" data-action="llego" data-id="${c.id}">✅ Llegó</button>
+        <button type="button" class="btn ghost small" data-action="ausente" data-id="${c.id}">🚫 No llegó</button>
+        <button type="button" class="btn ghost small danger" data-action="eliminar" data-id="${c.id}" data-tel="${esc(telefono)}" data-nombre="${esc(nombre)}" title="Eliminar cita" aria-label="Eliminar cita">🗑</button>`;
+    } else {
+      acciones = `<button class="btn wa small" data-action="recordar" data-id="${c.id}" data-tel="${esc(telefono)}" data-nombre="${esc(nombre)}">${c.recordatorioEnviado ? "Recordatorio enviado ✓" : "Enviar recordatorio"}</button>
+        <button type="button" class="btn ghost small danger" data-action="eliminar" data-id="${c.id}" data-tel="${esc(telefono)}" data-nombre="${esc(nombre)}" title="Eliminar cita" aria-label="Eliminar cita">🗑</button>`;
+    }
+
+    let etiqueta = "";
+    if (c.estado === "atendida") etiqueta = '<span class="mant-badge ok">Atendida</span>';
+    else if (c.estado === "ausente") etiqueta = '<span class="mant-badge due">No llegó</span>';
+    else if (diffDays < 0) etiqueta = '<span class="mant-badge due">Ya pasó — ciérrala</span>';
+
     return `
-      <div class="cita-row" data-id="${c.id}">
+      <div class="cita-row${citaCerrada(c) ? " cita-cerrada" : ""}" data-id="${c.id}">
         <div class="cita-when"><div class="d">${label}</div><div class="t">${dt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</div></div>
         <div class="cita-info">
-          <div class="who">${esc(nombre)} ${c.origen === "web" ? '<span class="mant-badge soon">Desde la web</span>' : ""}</div>
+          <div class="who">${esc(nombre)} ${c.origen === "web" ? '<span class="mant-badge soon">Desde la web</span>' : ""} ${etiqueta}</div>
           <div class="meta">${esc(c.motivo || "Sin motivo especificado")} · mecánico: ${esc(c.mecanico)}</div>
         </div>
-        <button class="btn wa small" data-action="recordar" data-id="${c.id}" data-tel="${esc(telefono)}" data-nombre="${esc(nombre)}">${c.recordatorioEnviado ? "Recordatorio enviado ✓" : "Enviar recordatorio"}</button>
-        <button type="button" class="btn ghost small danger" data-action="eliminar" data-id="${c.id}" data-tel="${esc(telefono)}" data-nombre="${esc(nombre)}" title="Eliminar cita" aria-label="Eliminar cita">🗑</button>
+        ${acciones}
       </div>`;
   }).join("");
+
+  // "Llegó": abre la orden de servicio ya llena con los datos de la cita
+  list.querySelectorAll('[data-action="llego"]').forEach(btn => {
+    btn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      await abrirOrdenDesdeCita(Number(btn.dataset.id));
+    });
+  });
+
+  list.querySelectorAll('[data-action="ausente"]').forEach(btn => {
+    btn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      const c = await DB.get("citas", Number(btn.dataset.id));
+      await DB.save("citas", { ...c, estado: "ausente", cerradaEn: Date.now() });
+      markDirty();
+      toast("Cita marcada como no asistida");
+      renderCitasList();
+      renderDashboard();
+    });
+  });
+
+  list.querySelectorAll('[data-action="reabrir"]').forEach(btn => {
+    btn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      const c = await DB.get("citas", Number(btn.dataset.id));
+      delete c.estado; delete c.cerradaEn;
+      await DB.save("citas", c);
+      markDirty();
+      toast("Cita reabierta");
+      renderCitasList();
+      renderDashboard();
+    });
+  });
+
+  list.querySelectorAll('[data-action="ver-orden"]').forEach(btn => {
+    btn.addEventListener("click", (e) => { e.stopPropagation(); openOrder(Number(btn.dataset.orden)); });
+  });
 
   list.querySelectorAll('[data-action="recordar"]').forEach(btn => {
     btn.addEventListener("click", async (e) => {
@@ -1785,7 +1929,7 @@ async function renderCitasList() {
     });
   });
 
-  const dueSoon = citasAll.filter(c => !c.recordatorioEnviado && citaWhenInfo(c).diffDays <= 1 && citaWhenInfo(c).diffDays >= 0).length;
+  const dueSoon = abiertas.filter(c => !c.recordatorioEnviado && citaWhenInfo(c).diffDays <= 1 && citaWhenInfo(c).diffDays >= 0).length;
   updateCitasBadge(dueSoon);
 }
 
