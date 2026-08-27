@@ -2281,9 +2281,12 @@ async function renderClientes() {
   });
 }
 
+let clienteDetalleId = null; // cliente cuya ficha está abierta, para saber a quién editar
+
 async function openClienteDetalle(id) {
   const cliente = await DB.get("clientes", id);
   if (!cliente) return;
+  clienteDetalleId = id;
   const [motos, ordenes, citas] = await Promise.all([DB.getAll("motos"), DB.getAll("ordenes"), DB.getAll("citas")]);
   const susMotos = motos.filter(m => m.clienteId === id);
   const susOrdenes = ordenes.filter(o => o.clienteId === id).sort((a, b) => b.id - a.id);
@@ -2300,12 +2303,16 @@ async function openClienteDetalle(id) {
         <div class="mant-badge ${mantStatus(m).cls}" style="display:inline-block; margin-top:0.3rem;">${mantStatus(m).label}</div>
       </div>
       <button type="button" class="btn small seguir-mant-btn" data-moto-id="${m.id}">Dar seguimiento</button>
+      <button type="button" class="btn ghost small editar-moto-btn" data-moto-id="${m.id}" title="Editar datos de la moto">✏️</button>
     </div>`).join("") : `<p class="hint" style="margin:0;">Sin motos registradas.</p>`;
   document.querySelectorAll("#clienteDetalleMotos .seguir-mant-btn").forEach(btn => {
     btn.addEventListener("click", () => {
       const moto = susMotos.find(m => m.id === Number(btn.dataset.motoId));
       abrirNuevaOrdenParaMoto(cliente, moto);
     });
+  });
+  document.querySelectorAll("#clienteDetalleMotos .editar-moto-btn").forEach(btn => {
+    btn.addEventListener("click", () => abrirModalEditarMoto(Number(btn.dataset.motoId)));
   });
 
   document.getElementById("clienteDetalleOrdenes").innerHTML = susOrdenes.length ? susOrdenes.map(o => {
@@ -2333,6 +2340,133 @@ async function openClienteDetalle(id) {
 
   document.getElementById("modalClienteDetalle").classList.add("active");
 }
+
+/* ---- editar un cliente ya registrado ----
+   El nombre y el teléfono del cliente están copiados dentro de cada crédito y
+   de cada venta (para que la factura y el ticket se puedan imprimir sin volver
+   a consultar la base). Si solo cambiáramos la ficha del cliente, esos
+   documentos seguirían con el dato viejo — y peor: el recordatorio de cobro por
+   WhatsApp de un crédito seguiría marcando al teléfono anterior. Por eso al
+   guardar se actualizan también esas copias. */
+let clienteEnEdicion = null;
+
+async function propagarCambioCliente(clienteId, nombre, telefono) {
+  let tocados = 0;
+  for (const cred of (await DB.getAll("creditos")).filter(c => c.clienteId === clienteId)) {
+    if (cred.clienteNombre === nombre && cred.clienteTelefono === telefono) continue;
+    cred.clienteNombre = nombre;
+    cred.clienteTelefono = telefono;
+    await DB.save("creditos", cred);
+    tocados++;
+  }
+  for (const v of (await DB.getAll("ventas_rapidas")).filter(x => x.clienteId === clienteId)) {
+    if (v.clienteNombre === nombre) continue;
+    v.clienteNombre = nombre;
+    await DB.save("ventas_rapidas", v);
+    tocados++;
+  }
+  return tocados;
+}
+
+async function abrirModalEditarCliente(clienteId) {
+  const cliente = await DB.get("clientes", clienteId);
+  if (!cliente) return;
+  clienteEnEdicion = cliente;
+  document.getElementById("editClienteNombre").value = cliente.nombre || "";
+  document.getElementById("editClienteTelefono").value = cliente.telefono || "";
+
+  const creditosAbiertos = (await DB.getAll("creditos")).filter(c => c.clienteId === clienteId && c.saldo > 0.01).length;
+  const aviso = document.getElementById("editClienteAviso");
+  if (creditosAbiertos) {
+    aviso.textContent = `Este cliente tiene ${creditosAbiertos} crédito${creditosAbiertos === 1 ? "" : "s"} pendiente${creditosAbiertos === 1 ? "" : "s"}: el cambio también se aplicará a esa${creditosAbiertos === 1 ? "" : "s"} factura${creditosAbiertos === 1 ? "" : "s"}.`;
+    aviso.style.display = "block";
+  } else aviso.style.display = "none";
+
+  document.getElementById("modalEditarCliente").classList.add("active");
+  setTimeout(() => document.getElementById("editClienteNombre").focus(), 50);
+}
+
+document.getElementById("btnEditarCliente").addEventListener("click", () => {
+  if (clienteDetalleId) abrirModalEditarCliente(clienteDetalleId);
+});
+document.getElementById("btnCancelarEditarCliente").addEventListener("click", () => {
+  clienteEnEdicion = null;
+  document.getElementById("modalEditarCliente").classList.remove("active");
+});
+
+alHacerClicUnaVez(document.getElementById("btnGuardarEditarCliente"), async () => {
+  const cliente = clienteEnEdicion;
+  if (!cliente) return;
+  const nombre = document.getElementById("editClienteNombre").value.trim();
+  const telefono = document.getElementById("editClienteTelefono").value.trim();
+  if (!nombre) { toast("El nombre no puede quedar vacío", "off"); return; }
+
+  await DB.save("clientes", { ...cliente, nombre, telefono });
+  const tocados = await propagarCambioCliente(cliente.id, nombre, telefono);
+  markDirty();
+
+  clienteEnEdicion = null;
+  document.getElementById("modalEditarCliente").classList.remove("active");
+  toast(tocados ? `Datos actualizados (también en ${tocados} documento${tocados === 1 ? "" : "s"})` : "Datos actualizados");
+  await renderClientes();
+  await openClienteDetalle(cliente.id);
+});
+
+/* ---- editar una moto ya registrada ---- */
+let motoEnEdicion = null;
+
+async function abrirModalEditarMoto(motoId) {
+  const moto = await DB.get("motos", motoId);
+  if (!moto) return;
+  motoEnEdicion = moto;
+  document.getElementById("editMotoMarca").value = moto.marca || "";
+  document.getElementById("editMotoModelo").value = moto.modelo || "";
+  document.getElementById("editMotoCilindraje").value = moto.cilindraje || "";
+  document.getElementById("editMotoPlaca").value = moto.placa || "";
+  document.getElementById("editMotoKm").value = moto.km ?? 0;
+  document.getElementById("editMotoFoto").value = "";
+  document.getElementById("editMotoMantFecha").value = moto.mantenimiento?.fecha || "";
+  document.getElementById("editMotoMantTipo").value = moto.mantenimiento?.tipo || "";
+  document.getElementById("modalEditarMoto").classList.add("active");
+}
+
+document.getElementById("btnCancelarEditarMoto").addEventListener("click", () => {
+  motoEnEdicion = null;
+  document.getElementById("modalEditarMoto").classList.remove("active");
+});
+
+alHacerClicUnaVez(document.getElementById("btnGuardarEditarMoto"), async () => {
+  const moto = motoEnEdicion;
+  if (!moto) return;
+  const fotoFile = document.getElementById("editMotoFoto").files[0];
+  const mantFecha = document.getElementById("editMotoMantFecha").value;
+  const mantTipo = document.getElementById("editMotoMantTipo").value.trim();
+
+  const actualizada = {
+    ...moto,
+    marca: document.getElementById("editMotoMarca").value.trim(),
+    modelo: document.getElementById("editMotoModelo").value.trim(),
+    cilindraje: document.getElementById("editMotoCilindraje").value.trim(),
+    placa: document.getElementById("editMotoPlaca").value.trim(),
+    km: Number(document.getElementById("editMotoKm").value) || 0,
+    // solo se reemplaza la foto si se eligió una nueva
+    foto: fotoFile ? await fileToDataUrl(fotoFile) : moto.foto,
+    mantenimiento: mantFecha
+      // si se cambia la fecha del mantenimiento hay que volver a avisar, así que
+      // el recordatorio se reinicia; si la fecha es la misma, se respeta.
+      ? { fecha: mantFecha, tipo: mantTipo, recordatorioEnviado: mantFecha === moto.mantenimiento?.fecha ? !!moto.mantenimiento?.recordatorioEnviado : false }
+      : null,
+  };
+  await DB.save("motos", actualizada);
+  markDirty();
+
+  motoEnEdicion = null;
+  document.getElementById("modalEditarMoto").classList.remove("active");
+  toast("Moto actualizada");
+  await renderClientes();
+  renderDashboard();
+  await openClienteDetalle(moto.clienteId);
+});
 
 function abrirNuevaOrdenParaMoto(cliente, moto) {
   document.getElementById("modalClienteDetalle").classList.remove("active");

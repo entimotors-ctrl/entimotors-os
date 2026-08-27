@@ -1518,6 +1518,7 @@
   <div class="modal" style="max-width:560px;">
     <h3 id="clienteDetalleTitulo">Cliente</h3>
     <p class="hint" style="margin-top:-0.6rem;" id="clienteDetalleSub"></p>
+    <button type="button" class="btn small" id="btnEditarCliente" style="margin-bottom:0.4rem;">✏️ Editar datos del cliente</button>
 
     <p class="section-label" style="font-family:'Teko',sans-serif; text-transform:uppercase; font-size:0.85rem; color:var(--text-faint); margin:1rem 0 0.4rem;">Motos</p>
     <div id="clienteDetalleMotos"></div>
@@ -1743,6 +1744,48 @@
   </div>
 </div>
 
+<!-- Modal: editar los datos de un cliente ya registrado -->
+<div class="modal-bg" id="modalEditarCliente">
+  <div class="modal">
+    <h3>Editar cliente</h3>
+    <div class="field-row" style="grid-template-columns:1fr 1fr;">
+      <div><label>Nombre</label><input type="text" id="editClienteNombre"></div>
+      <div><label>Teléfono</label><input type="tel" id="editClienteTelefono" placeholder="9704-9635"></div>
+    </div>
+    <p class="hint" id="editClienteAviso" style="display:none;"></p>
+    <div class="modal-actions">
+      <button class="btn ghost" id="btnCancelarEditarCliente">Cancelar</button>
+      <button class="btn primary" id="btnGuardarEditarCliente">Guardar cambios</button>
+    </div>
+  </div>
+</div>
+
+<!-- Modal: editar los datos de una moto ya registrada -->
+<div class="modal-bg" id="modalEditarMoto">
+  <div class="modal">
+    <h3>Editar moto</h3>
+    <div class="field-row">
+      <div><label>Marca</label><input type="text" id="editMotoMarca"></div>
+      <div><label>Modelo</label><input type="text" id="editMotoModelo"></div>
+      <div><label>Cilindraje</label><input type="text" id="editMotoCilindraje" placeholder="190cc"></div>
+    </div>
+    <div class="field-row" style="grid-template-columns:1fr 1fr;">
+      <div><label>Placa</label><input type="text" id="editMotoPlaca"></div>
+      <div><label>Km actual</label><input type="number" id="editMotoKm" min="0"></div>
+    </div>
+    <label>Cambiar foto de la moto (opcional)</label>
+    <input type="file" id="editMotoFoto" accept="image/*">
+    <div class="field-row" style="grid-template-columns:1fr 1fr;">
+      <div><label>Próximo mantenimiento (fecha)</label><input type="date" id="editMotoMantFecha"></div>
+      <div><label>Tipo de mantenimiento</label><input type="text" id="editMotoMantTipo" placeholder="Cambio de aceite"></div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn ghost" id="btnCancelarEditarMoto">Cancelar</button>
+      <button class="btn primary" id="btnGuardarEditarMoto">Guardar cambios</button>
+    </div>
+  </div>
+</div>
+
 <!-- Modal: mover una cita a otro día -->
 <div class="modal-bg" id="modalMoverCita">
   <div class="modal">
@@ -1854,6 +1897,6 @@
      sw.js) — es la forma más universal de forzar que CUALQUIER navegador
      pida el archivo de nuevo aunque ya tenga guardada una copia vieja en su
      propio caché HTTP, sin depender de que respete el Service Worker. -->
-<script src="app.js?v=3.7.1"></script>
+<script src="app.js?v=3.8.0"></script>
 </body>
 </html>
