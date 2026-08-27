@@ -566,6 +566,105 @@ function isStandalone() {
 }
 function devBypassed() { return sessionStorage.getItem("enti_dev_bypass") === "1"; }
 
+/* ---------------- impresión ----------------
+   En iOS, una app instalada en la pantalla de inicio corre en modo
+   "standalone", y ahí Safari IGNORA window.print(): al tocar imprimir no pasa
+   absolutamente nada. Como este sistema solo arranca instalado, en el iPhone
+   ningún botón de imprimir funcionaba.
+
+   La salida es sacar el documento de la app: se abre una pestaña de Safari con
+   la factura ya armada, y desde ahí el botón Compartir del navegador sí ofrece
+   "Imprimir" y "Guardar en Archivos" (PDF). En una computadora no hace falta
+   nada de esto, así que se sigue imprimiendo directo como siempre. */
+function necesitaVentanaDeImpresion() {
+  return isStandalone();
+}
+
+// debe llamarse SINCRÓNICAMENTE dentro del clic: si se abre después de un
+// await, el navegador la bloquea por "gesto vencido" (igual que con WhatsApp).
+function abrirVentanaImpresion() {
+  return necesitaVentanaDeImpresion() ? window.open("", "_blank") : null;
+}
+
+const CSS_IMPRESION = `
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #fff; color: #111;
+         font-family: -apple-system, system-ui, sans-serif; font-size: 14px; line-height: 1.5; }
+  /* el documento va dentro de .doc: así la barra de arriba puede ocupar todo
+     el ancho de la pantalla aunque el papel sea angosto (ticket de 58mm) */
+  .doc { padding: 1.5rem; max-width: 200mm; margin: 0 auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.9rem; margin-top: 0.5rem; }
+  th { text-align: left; font-size: 0.72rem; letter-spacing: 0.06em; text-transform: uppercase;
+       color: #666; font-weight: 600; padding: 0.5rem 0.6rem; border-bottom: 1px solid #999; }
+  td { padding: 0.55rem 0.6rem; border-bottom: 1px solid #ddd; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .factura-header { display: flex; justify-content: space-between; align-items: flex-start;
+                    border-bottom: 2px solid #111; padding-bottom: 0.8rem; margin-bottom: 1.2rem; }
+  .factura-marca { display: flex; align-items: center; gap: 0.6rem; }
+  .factura-logo { width: 40px; height: 40px; border-radius: 0.4rem; object-fit: cover; }
+  .factura-header .marca { font-weight: 800; font-size: 1.5rem; text-transform: uppercase; letter-spacing: 0.02em; }
+  .factura-meta { text-align: right; font-size: 0.85rem; }
+  .factura-block { margin-bottom: 1.2rem; font-size: 0.9rem; }
+  .factura-block b { display: block; font-size: 0.72rem; letter-spacing: 0.08em;
+                     text-transform: uppercase; color: #666; margin-bottom: 0.2rem; }
+  .factura-total { text-align: right; font-size: 1.1rem; font-weight: 700; margin-top: 0.8rem; }
+  .factura-watermark, .print-watermark { display: none; }
+  .edc-factura { margin-bottom: 1.1rem; break-inside: avoid; page-break-inside: avoid; }
+  .edc-factura-head { font-size: 0.9rem; font-weight: 700; margin-bottom: 0.25rem;
+                      border-bottom: 1px solid #ccc; padding-bottom: 0.2rem; }
+  .edc-factura-tot { text-align: right; font-size: 0.85rem; margin-top: 0.25rem; }
+  .ticket-item-row { display: flex; justify-content: space-between; gap: 4px; }
+  hr { border: none; border-top: 1px dashed #111; margin: 4px 0; }
+  /* barra de acción: solo se ve en pantalla, nunca en el papel ni en el PDF */
+  .barra-imprimir { position: sticky; top: 0; z-index: 9; display: flex; gap: 0.6rem; align-items: center;
+                    flex-wrap: wrap; background: #111; color: #fff; padding: 0.7rem 0.9rem;
+                    font-family: -apple-system, system-ui, sans-serif; font-size: 0.85rem; }
+  .barra-imprimir button { font: inherit; font-weight: 700; border: none; border-radius: 0.5rem;
+                           padding: 0.55rem 1rem; background: #e11d48; color: #fff; cursor: pointer; }
+  @media print { .barra-imprimir { display: none !important; } .doc { padding: 0; max-width: none; } }
+`;
+
+const CSS_TICKET = `
+  .doc { width: 58mm; padding: 2mm; margin: 0; font-family: 'Courier New', monospace; font-size: 11px; line-height: 1.4; }
+  @media print { .doc { width: 58mm; padding: 2mm; } }
+`;
+
+/* Imprime una de las plantillas ocultas del HTML. En computadora usa la
+   impresión normal del navegador; en la app instalada vuelca el documento a
+   una pestaña de Safari, que es la única forma de que el iPhone ofrezca
+   "Imprimir" y "Guardar PDF". */
+function imprimirPlantilla(idPlantilla, claseBody, ventana) {
+  if (!ventana) {
+    if (claseBody) document.body.classList.add(claseBody);
+    window.print();
+    if (claseBody) setTimeout(() => document.body.classList.remove(claseBody), 300);
+    return;
+  }
+
+  const contenido = document.getElementById(idPlantilla).innerHTML;
+  const esTicket = idPlantilla === "ticketPrint";
+  // <base> es imprescindible: sin él las rutas relativas de los logos
+  // (icons/…) se resolverían contra about:blank y saldrían rotas.
+  ventana.document.write(`<!doctype html>
+<html lang="es"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<base href="${location.href}">
+<title>ENTIMOTORS</title>
+<style>${CSS_IMPRESION}${esTicket ? CSS_TICKET : ""}</style>
+</head><body>
+<div class="barra-imprimir">
+  <button type="button" onclick="window.print()">🖨️ Imprimir o guardar PDF</button>
+  <span>o usa el botón Compartir del navegador</span>
+</div>
+<div class="doc">${contenido}</div>
+</body></html>`);
+  ventana.document.close();
+  // se intenta imprimir solo; si el navegador no lo permite, ahí queda el
+  // botón de arriba para que la persona lo haga con su propio toque.
+  ventana.addEventListener("load", () => { try { ventana.print(); } catch (e) {} });
+}
+
 let deferredInstallPrompt = null;
 window.addEventListener("beforeinstallprompt", (e) => {
   e.preventDefault();
@@ -1685,6 +1784,7 @@ document.getElementById("btnEnviarProgresoWA").addEventListener("click", () => {
 
 /* ---- imprimir factura ---- */
 document.getElementById("btnImprimirFactura").addEventListener("click", () => {
+  const ventana = abrirVentanaImpresion(); // sincrónico, antes que nada
   // sincrónico a propósito: usa lo que openOrder() ya dejó en currentOrderCache
   // en vez de volver a leer con await — así el clic sigue "fresco" para que el
   // navegador permita el diálogo de impresión (ver nota en currentOrderCache).
@@ -1702,7 +1802,7 @@ document.getElementById("btnImprimirFactura").addEventListener("click", () => {
     : `<tr><td colspan="4">Sin ítems</td></tr>`;
   document.getElementById("facTotal").textContent = money(total);
 
-  window.print();
+  imprimirPlantilla("facturaPrint", null, ventana);
 });
 
 /* ================= CITAS ================= */
@@ -3008,7 +3108,7 @@ async function cobrarCreditoPOS() {
       nota: "Venta al crédito desde el TPV", origen: "pos",
     });
     ultimoCreditoPOS = credito;
-    imprimirFacturaCredito(credito);
+    imprimirFacturaCredito(credito, abrirVentanaImpresion());
     toast(abono > 0
       ? `Crédito #${id} registrado — abonó ${money(abono)}, queda debiendo ${money(credito.saldo)}`
       : `Crédito #${id} registrado — queda debiendo ${money(credito.saldo)}`);
@@ -3048,7 +3148,7 @@ async function cobrarVentaPOS(metodoPago, efectivoRecibido) {
     markDirty();
     ultimoTicket = { id, venta };
     document.getElementById("btnReimprimirTicket").style.display = "block";
-    imprimirTicketPOS(id, venta);
+    imprimirTicketPOS(id, venta, abrirVentanaImpresion());
     toast(`Venta #${id} registrada por ${money(total)}`);
     posCarrito = [];
     posClienteLibre = "";
@@ -3075,10 +3175,10 @@ document.getElementById("btnReimprimirTicket").addEventListener("click", () => {
   // no se disparó en el celular (por el gesto ya vencido), este sí funciona,
   // porque no espera ningún await antes de llamar a window.print().
   if (!ultimoTicket) return;
-  imprimirTicketPOS(ultimoTicket.id, ultimoTicket.venta);
+  imprimirTicketPOS(ultimoTicket.id, ultimoTicket.venta, abrirVentanaImpresion());
 });
 
-function imprimirTicketPOS(ventaId, venta) {
+function imprimirTicketPOS(ventaId, venta, ventana) {
   document.getElementById("ticketFecha").textContent = new Date(venta.fechaISO).toLocaleString("es-HN");
   const clienteRow = document.getElementById("ticketClienteRow");
   if (venta.clienteNombre) {
@@ -3094,9 +3194,7 @@ function imprimirTicketPOS(ventaId, venta) {
   document.getElementById("ticketMetodo").textContent = { efectivo: "Efectivo", transferencia: "Transferencia", tarjeta: "Tarjeta" }[venta.metodoPago] || venta.metodoPago;
   document.getElementById("ticketCambioRow").style.display = venta.metodoPago === "efectivo" ? "flex" : "none";
   document.getElementById("ticketCambio").textContent = money(venta.cambio || 0);
-  document.body.classList.add("print-ticket");
-  window.print();
-  setTimeout(() => document.body.classList.remove("print-ticket"), 300);
+  imprimirPlantilla("ticketPrint", "print-ticket", ventana);
 }
 
 /* ================= FINANZAS Y CAJA CHICA ================= */
@@ -3209,10 +3307,11 @@ alHacerClicUnaVez(document.getElementById("btnGuardarMovimiento"), async () => {
 });
 
 document.getElementById("btnImprimirCierre").addEventListener("click", async () => {
+  const ventana = abrirVentanaImpresion(); // sincrónico, antes del await de abajo
   const hoyStr = new Date().toISOString().slice(0, 10);
   const movsHoy = (await DB.getAll("caja_movimientos")).filter(m => m.fechaISO.slice(0, 10) === hoyStr).sort((a, b) => a.fechaISO.localeCompare(b.fechaISO));
 
-  if (!movsHoy.length) { toast("No hay movimientos registrados hoy todavía", "off"); return; }
+  if (!movsHoy.length) { ventana?.close(); toast("No hay movimientos registrados hoy todavía", "off"); return; }
 
   document.getElementById("cierreFecha").textContent = new Date().toLocaleDateString("es-HN", { day: "2-digit", month: "long", year: "numeric" });
   document.getElementById("cierreItems").innerHTML = movsHoy.map(m => `
@@ -3235,9 +3334,7 @@ document.getElementById("btnImprimirCierre").addEventListener("click", async () 
     return `<div style="display:flex; justify-content:space-between; font-size:0.9rem;"><span>${met[0].toUpperCase() + met.slice(1)}</span><span>${money(total)}</span></div>`;
   }).join("");
 
-  document.body.classList.add("print-cierre");
-  window.print();
-  setTimeout(() => document.body.classList.remove("print-cierre"), 300);
+  imprimirPlantilla("cierreCajaPrint", "print-cierre", ventana);
 });
 
 /* ================= CREDITOS ================= */
@@ -3351,7 +3448,8 @@ document.getElementById("creditosFiltro").querySelectorAll(".cat-chip").forEach(
   });
 });
 
-function imprimirFacturaCredito(cred) {
+function imprimirFacturaCredito(cred, ventana) {
+  if (!cred) { ventana?.close(); return; }
   document.getElementById("credFacId").textContent = cred.id;
   document.getElementById("credFacFecha").textContent = new Date(cred.fechaISO).toLocaleDateString("es-HN");
   document.getElementById("credFacCliente").textContent = cred.clienteNombre || "Cliente de mostrador";
@@ -3362,9 +3460,7 @@ function imprimirFacturaCredito(cred) {
   document.getElementById("credFacTotal").textContent = money(cred.total);
   document.getElementById("credFacAbonado").textContent = money(cred.abonado);
   document.getElementById("credFacSaldo").textContent = money(cred.saldo);
-  document.body.classList.add("print-credito");
-  window.print();
-  setTimeout(() => document.body.classList.remove("print-credito"), 300);
+  imprimirPlantilla("creditoPrint", "print-credito", ventana);
 }
 
 /* ---- detalle de un cliente: su saldo consolidado y TODAS sus facturas a
@@ -3431,7 +3527,7 @@ document.getElementById("credDetLista").addEventListener("click", (e) => {
   const id = Number(btn.closest(".cred-factura").dataset.id);
   const act = btn.dataset.act;
 
-  if (act === "imprimir") { imprimirFacturaCredito(creditosCache[id]); return; }
+  if (act === "imprimir") { imprimirFacturaCredito(creditosCache[id], abrirVentanaImpresion()); return; }
   if (act === "abonar") {
     document.getElementById("modalCreditoDetalle").classList.remove("active");
     abrirModalAbonoCredito(id);
@@ -3466,8 +3562,9 @@ document.getElementById("btnDetRecordar").addEventListener("click", () => {
 
 // estado de cuenta: todas las facturas del cliente en un solo documento
 document.getElementById("btnDetEstadoCuenta").addEventListener("click", () => {
+  const ventana = abrirVentanaImpresion(); // sincrónico, antes que nada
   const g = creditosPorCliente[creditoDetalleClave];
-  if (!g) return;
+  if (!g) { ventana?.close(); return; }
   document.getElementById("edcFecha").textContent = new Date().toLocaleDateString("es-HN");
   document.getElementById("edcCliente").textContent = g.nombre;
   document.getElementById("edcTelefono").textContent = g.telefono || "";
@@ -3486,9 +3583,7 @@ document.getElementById("btnDetEstadoCuenta").addEventListener("click", () => {
   document.getElementById("edcTotal").textContent = money(g.total);
   document.getElementById("edcAbonado").textContent = money(g.abonado);
   document.getElementById("edcSaldo").textContent = money(g.saldo);
-  document.body.classList.add("print-estado");
-  window.print();
-  setTimeout(() => document.body.classList.remove("print-estado"), 300);
+  imprimirPlantilla("estadoCuentaPrint", "print-estado", ventana);
 });
 
 /* ---- registrar abono ---- */
