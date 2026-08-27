@@ -379,6 +379,44 @@ async function eliminarCredito(id) {
   markDirty();
 }
 
+/* Un crédito necesita saber a quién cobrarle. Si se eligió un cliente de la
+   lista usamos ese; si solo se escribió un nombre suelto, reutilizamos el
+   cliente que ya exista con ese mismo nombre y solo creamos uno nuevo si de
+   verdad no está — así cobrar al crédito desde el TPV no llena la lista de
+   clientes repetidos. */
+async function resolverClienteCredito(clienteId, nombreLibre) {
+  if (clienteId) {
+    const c = await DB.get("clientes", clienteId);
+    return { clienteId, clienteNombre: c?.nombre || nombreLibre || "Cliente", clienteTelefono: c?.telefono || "" };
+  }
+  const nombre = (nombreLibre || "").trim();
+  if (!nombre) return null;
+  const clientes = await DB.getAll("clientes");
+  const existente = clientes.find(c => (c.nombre || "").trim().toLowerCase() === nombre.toLowerCase());
+  if (existente) return { clienteId: existente.id, clienteNombre: existente.nombre, clienteTelefono: existente.telefono || "" };
+  const nuevoId = await DB.save("clientes", { nombre, telefono: "" });
+  markDirty();
+  return { clienteId: nuevoId, clienteNombre: nombre, clienteTelefono: "" };
+}
+
+/* Cobrar al crédito desde cualquier parte del sistema (TPV, servicio suelto,
+   orden de taller entregada): crea la factura pendiente y, si el cliente dejó
+   algo de entrada, registra ese abono de una vez — que es lo que hace que el
+   dinero recibido sí entre a caja y el saldo quede en lo que falta. */
+async function cobrarAlCredito({ clienteId, clienteNombre, clienteTelefono, items, abono, abonoMetodo, nota, origen, ordenId }) {
+  const { id, credito } = await registrarCredito({ clienteId, clienteNombre, clienteTelefono, items, vencimiento: null, nota });
+  if (origen || ordenId) {
+    const cred = await DB.get("creditos", id);
+    if (origen) cred.origen = origen;
+    if (ordenId) cred.ordenId = ordenId;
+    await DB.save("creditos", cred);
+  }
+  let credFinal = credito;
+  if (abono > 0) credFinal = await registrarAbonoCredito(id, abono, abonoMetodo || "efectivo");
+  markDirty();
+  return { id, credito: await DB.get("creditos", id) };
+}
+
 /* ---------------- caja chica: registrar un ingreso de una orden de taller entregada ---------------- */
 function registrarIngresoTaller(orden, total, metodoPago) {
   return new Promise((resolve, reject) => {
@@ -912,7 +950,10 @@ async function renderFinanzasCharts() {
     .filter(o => o.estado === "entregado")
     .reduce((s, o) => s + (o.items || []).reduce((ss, it) => ss + it.cantidad * it.precio, 0), 0);
   let totalRepuestos = 0, totalTrabajoRapido = 0;
-  [...ventas, ...creditos].forEach(v => (v.items || []).forEach(it => {
+  // los créditos que nacen de una orden de taller ya están contados arriba en
+  // "Taller" — incluirlos aquí otra vez inflaría las ganancias al doble.
+  const creditosNoTaller = creditos.filter(c => c.origen !== "orden");
+  [...ventas, ...creditosNoTaller].forEach(v => (v.items || []).forEach(it => {
     const sub = it.cantidad * it.precio;
     if (it.inventarioId) totalRepuestos += sub; else totalTrabajoRapido += sub;
   }));
@@ -928,7 +969,9 @@ async function renderFinanzasCharts() {
 
   // 3) Top 5 repuestos con mayor rotación (unidades vendidas por TPV)
   const rotacion = {};
-  ventas.forEach(v => v.items.forEach(it => {
+  // los repuestos vendidos al crédito también salieron del estante, así que
+  // cuentan igual que los de contado para medir rotación
+  [...ventas, ...creditos].forEach(v => (v.items || []).forEach(it => {
     if (!it.inventarioId) return;
     rotacion[it.inventarioId] = (rotacion[it.inventarioId] || 0) + it.cantidad;
   }));
@@ -1126,6 +1169,7 @@ async function renderStageContent(o) {
 
   } else if (o.estado === "entregado") {
     const total = (o.items || []).reduce((s, it) => s + it.cantidad * it.precio, 0);
+    const esCredito = o.tipoCobro === "credito";
     const garantiaDias = o.garantiaDias ?? 30;
     const venceEn = o.entregadoEn ? o.entregadoEn + garantiaDias * 86400000 : null;
     const vigente = !venceEn || Date.now() <= venceEn;
@@ -1133,13 +1177,34 @@ async function renderStageContent(o) {
     el.innerHTML = `
       <div class="card">
         <h4 class="font-display" style="font-size:0.95rem; margin-bottom:0.4rem;">Entregada</h4>
-        <p style="color:var(--text-muted); margin-bottom:0.6rem;">Total cobrado: <b style="color:var(--text);">${money(total)}</b>. Imprime la factura con el botón de abajo antes de despedir al cliente.</p>
-        <label>Método de pago</label>
-        <select id="entregaMetodoPago" style="max-width:220px;">
-          <option value="efectivo" ${o.metodoPago === "efectivo" || !o.metodoPago ? "selected" : ""}>Efectivo</option>
-          <option value="transferencia" ${o.metodoPago === "transferencia" ? "selected" : ""}>Transferencia</option>
-          <option value="tarjeta" ${o.metodoPago === "tarjeta" ? "selected" : ""}>Tarjeta</option>
-        </select>
+        <p style="color:var(--text-muted); margin-bottom:0.6rem;">Total a cobrar: <b style="color:var(--text);">${money(total)}</b>. Imprime la factura con el botón de abajo antes de despedir al cliente.</p>
+        <label>Tipo de cobro</label>
+        <div class="seg-toggle" id="entregaTipoCobro" style="max-width:320px;">
+          <button type="button" class="seg-opt ${esCredito ? "" : "active"}" data-tipo="contado">💵 Contado</button>
+          <button type="button" class="seg-opt ${esCredito ? "active" : ""}" data-tipo="credito">💳 Crédito</button>
+        </div>
+        <div id="entregaContadoBox" style="display:${esCredito ? "none" : "block"};">
+          <label>Método de pago</label>
+          <select id="entregaMetodoPago" style="max-width:220px;">
+            <option value="efectivo" ${o.metodoPago === "efectivo" || !o.metodoPago ? "selected" : ""}>Efectivo</option>
+            <option value="transferencia" ${o.metodoPago === "transferencia" ? "selected" : ""}>Transferencia</option>
+            <option value="tarjeta" ${o.metodoPago === "tarjeta" ? "selected" : ""}>Tarjeta</option>
+          </select>
+        </div>
+        <div id="entregaCreditoBox" style="display:${esCredito ? "block" : "none"};">
+          <label>¿Abonó algo ahora? (L.)</label>
+          <input type="number" id="entregaAbono" min="0" step="0.01" style="max-width:220px;" placeholder="0.00" value="${o.abonoInicial || ""}">
+          <div id="entregaAbonoMetodoBox" style="display:${(o.abonoInicial || 0) > 0 ? "block" : "none"};">
+            <label>Método del abono</label>
+            <select id="entregaAbonoMetodo" style="max-width:220px;">
+              <option value="efectivo" ${o.abonoMetodo === "efectivo" || !o.abonoMetodo ? "selected" : ""}>Efectivo</option>
+              <option value="transferencia" ${o.abonoMetodo === "transferencia" ? "selected" : ""}>Transferencia</option>
+              <option value="tarjeta" ${o.abonoMetodo === "tarjeta" ? "selected" : ""}>Tarjeta</option>
+            </select>
+          </div>
+          <div class="saldo-aviso" style="max-width:320px;"><span>Queda debiendo</span><b id="entregaSaldo">${money(Math.max(0, total - (o.abonoInicial || 0)))}</b></div>
+          <p class="hint" style="margin:0;">Al finalizar el trabajo se creará la factura pendiente en Créditos.</p>
+        </div>
       </div>
       <div class="card" style="margin-top:1rem;">
         <h4 class="font-display" style="font-size:0.95rem; margin-bottom:0.4rem;">Garantía</h4>
@@ -1155,6 +1220,24 @@ async function renderStageContent(o) {
       </div>`;
     document.getElementById("entregaMetodoPago").addEventListener("change", (e) => {
       updateOrder(o.id, ord => { ord.metodoPago = e.target.value; });
+    });
+    document.getElementById("entregaTipoCobro").querySelectorAll(".seg-opt").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        const tipo = btn.dataset.tipo;
+        const ord = await updateOrder(o.id, x => { x.tipoCobro = tipo; });
+        renderStageContent(ord);
+      });
+    });
+    document.getElementById("entregaAbono").addEventListener("input", (e) => {
+      const abono = Number(e.target.value) || 0;
+      document.getElementById("entregaSaldo").textContent = money(Math.max(0, total - abono));
+      document.getElementById("entregaAbonoMetodoBox").style.display = abono > 0 ? "block" : "none";
+    });
+    document.getElementById("entregaAbono").addEventListener("change", (e) => {
+      updateOrder(o.id, ord => { ord.abonoInicial = Number(e.target.value) || 0; });
+    });
+    document.getElementById("entregaAbonoMetodo").addEventListener("change", (e) => {
+      updateOrder(o.id, ord => { ord.abonoMetodo = e.target.value; });
     });
     document.getElementById("garantiaDiasInput").addEventListener("change", async (e) => {
       const dias = Number(e.target.value) || 0;
@@ -1417,8 +1500,34 @@ document.getElementById("btnAvanzar").addEventListener("click", async () => {
     });
     const margen = total > 0 ? ((total - costo) / total) * 100 : null;
     const ord = await updateOrder(o.id, x => { x.finalizada = true; x.finalizadoEn = Date.now(); x.margen = margen; });
-    if (total > 0) await registrarIngresoTaller(ord, total, ord.metodoPago || "efectivo");
-    toast("Trabajo finalizado y guardado como registro");
+
+    if (total > 0 && ord.tipoCobro === "credito") {
+      // al crédito NO entra dinero a caja todavía: se crea la factura pendiente
+      // y, si dejó algo de entrada, ese abono sí se registra como ingreso.
+      const cliente = await DB.get("clientes", ord.clienteId);
+      const abono = Math.min(Number(ord.abonoInicial) || 0, total);
+      try {
+        const { id: credId, credito } = await cobrarAlCredito({
+          clienteId: ord.clienteId,
+          clienteNombre: cliente?.nombre || "Cliente",
+          clienteTelefono: cliente?.telefono || "",
+          // inventarioId en null a propósito: el repuesto ya salió del stock
+          // cuando se agregó a la orden, volver a descontarlo lo restaría dos veces
+          items: (ord.items || []).map(it => ({ inventarioId: null, nombre: it.nombre, cantidad: it.cantidad, precio: it.precio })),
+          abono, abonoMetodo: ord.abonoMetodo || "efectivo",
+          nota: `Orden de taller #${ord.id}`, origen: "orden", ordenId: ord.id,
+        });
+        await updateOrder(ord.id, x => { x.creditoId = credId; });
+        toast(abono > 0
+          ? `Crédito #${credId} creado — abonó ${money(abono)}, queda debiendo ${money(credito.saldo)}`
+          : `Crédito #${credId} creado — queda debiendo ${money(credito.saldo)}`);
+      } catch (err) {
+        toast("No se pudo crear el crédito: " + err.message, "off");
+      }
+    } else {
+      if (total > 0) await registrarIngresoTaller(ord, total, ord.metodoPago || "efectivo");
+      toast("Trabajo finalizado y guardado como registro");
+    }
     renderOrdersList();
     renderDashboard();
     openOrder(ord.id);
@@ -2290,6 +2399,7 @@ function renderPosCarrito() {
   const total = posCarrito.reduce((s, it) => s + it.cantidad * it.precio, 0);
   document.getElementById("posTotal").textContent = money(total);
   actualizarCambioPOS();
+  if (posTipoCobro === "credito") actualizarCajaCreditoPOS();
 }
 
 function actualizarCambioPOS() {
@@ -2312,6 +2422,11 @@ function abrirModalServicioPOS() {
   document.getElementById("servicioPOSCliente").value = posClienteLibre;
   document.getElementById("servicioPOSMetodo").value = "efectivo";
   document.getElementById("servicioPOSEfectivoRecibido").value = "";
+  document.getElementById("servicioPOSAbono").value = "";
+  servicioPOSTipo = "contado";
+  document.getElementById("servicioPOSTipoCobro").querySelectorAll(".seg-opt")
+    .forEach(b => b.classList.toggle("active", b.dataset.tipo === "contado"));
+  aplicarTipoCobroServicioPOS();
   document.getElementById("modalServicioPOS").classList.add("active");
   actualizarCambioServicioPOS();
   setTimeout(() => document.getElementById("servicioPOSNombre").focus(), 50);
@@ -2335,6 +2450,50 @@ function actualizarCambioServicioPOS() {
   document.getElementById(id).addEventListener("change", actualizarCambioServicioPOS);
 });
 
+/* ---- Contado vs Crédito dentro del modal "Cobrar servicio" ---- */
+let servicioPOSTipo = "contado";
+
+// total = lo que ya hay en el carrito + el servicio que se está escribiendo
+function totalServicioPOS() {
+  const cantidad = Number(document.getElementById("servicioPOSCantidad").value) || 0;
+  const precio = Number(document.getElementById("servicioPOSPrecio").value) || 0;
+  return totalPosCarrito() + cantidad * precio;
+}
+
+function actualizarSaldoServicioPOS() {
+  const abono = Number(document.getElementById("servicioPOSAbono").value) || 0;
+  document.getElementById("servicioPOSSaldo").textContent = money(Math.max(0, totalServicioPOS() - abono));
+  document.getElementById("servicioPOSAbonoMetodoBox").style.display = abono > 0 ? "block" : "none";
+}
+
+function aplicarTipoCobroServicioPOS() {
+  const credito = servicioPOSTipo === "credito";
+  document.getElementById("servicioPOSContadoBox").style.display = credito ? "none" : "block";
+  document.getElementById("servicioPOSCreditoBox").style.display = credito ? "block" : "none";
+  document.getElementById("btnCobrarServicioPOS").textContent = credito ? "💳 Registrar crédito" : "💵 Cobrar ahora";
+  if (credito) actualizarSaldoServicioPOS();
+}
+
+document.getElementById("servicioPOSTipoCobro").querySelectorAll(".seg-opt").forEach(btn => {
+  btn.addEventListener("click", () => {
+    servicioPOSTipo = btn.dataset.tipo;
+    document.getElementById("servicioPOSTipoCobro").querySelectorAll(".seg-opt").forEach(b => b.classList.toggle("active", b === btn));
+    aplicarTipoCobroServicioPOS();
+  });
+});
+["servicioPOSAbono", "servicioPOSCantidad", "servicioPOSPrecio"].forEach(id => {
+  document.getElementById(id).addEventListener("input", () => { if (servicioPOSTipo === "credito") actualizarSaldoServicioPOS(); });
+});
+
+/* El nombre escrito en el modal es una decisión explícita para ESTA factura,
+   así que gana sobre el cliente que hubiera quedado elegido en la lista de una
+   venta anterior — si no, el crédito se le cargaba al cliente equivocado. */
+function tomarClienteDelModalServicio() {
+  const escrito = document.getElementById("servicioPOSCliente").value.trim();
+  posClienteLibre = escrito;
+  if (escrito) document.getElementById("posCliente").value = "";
+}
+
 function validarServicioPOS() {
   const nombre = document.getElementById("servicioPOSNombre").value.trim();
   const cantidad = Number(document.getElementById("servicioPOSCantidad").value) || 1;
@@ -2350,7 +2509,7 @@ alHacerClicUnaVez(document.getElementById("btnGuardarServicioPOS"), async () => 
   if (!item) return;
   // inventarioId: null → registrarVentaRapida lo trata como ítem manual sin tocar stock
   posCarrito.push({ inventarioId: null, ...item });
-  posClienteLibre = document.getElementById("servicioPOSCliente").value.trim();
+  tomarClienteDelModalServicio();
   cerrarModalServicioPOS();
   renderPosCarrito();
   toast(`"${item.nombre}" agregado al carrito`);
@@ -2359,15 +2518,63 @@ alHacerClicUnaVez(document.getElementById("btnGuardarServicioPOS"), async () => 
 alHacerClicUnaVez(document.getElementById("btnCobrarServicioPOS"), async () => {
   const item = validarServicioPOS();
   if (!item) return;
+
+  if (servicioPOSTipo === "credito") {
+    tomarClienteDelModalServicio();
+    const sel = document.getElementById("posCliente");
+    if (!sel.value && !posClienteLibre) { toast("Escribe el nombre del cliente para el crédito", "off"); return; }
+    const abono = Number(document.getElementById("servicioPOSAbono").value) || 0;
+    if (abono > totalServicioPOS() + 0.01) { toast("El abono no puede ser mayor al total", "off"); return; }
+    // se agrega al carrito solo después de validar, para que un reintento no lo duplique
+    posCarrito.push({ inventarioId: null, ...item });
+    document.getElementById("posAbonoInicial").value = abono || "";
+    document.getElementById("posAbonoMetodo").value = document.getElementById("servicioPOSAbonoMetodo").value;
+    const ok = await cobrarCreditoPOS();
+    if (ok) cerrarModalServicioPOS();
+    else posCarrito.pop(); // no se registró: devolvemos el carrito como estaba
+    return;
+  }
+
   const metodoPago = document.getElementById("servicioPOSMetodo").value;
   const efectivoRecibido = Number(document.getElementById("servicioPOSEfectivoRecibido").value) || 0;
   const totalConServicio = posCarrito.reduce((s, it) => s + it.cantidad * it.precio, 0) + item.cantidad * item.precio;
   if (metodoPago === "efectivo" && efectivoRecibido < totalConServicio) { toast("El efectivo recibido es menor que el total", "off"); return; }
   posCarrito.push({ inventarioId: null, ...item });
-  posClienteLibre = document.getElementById("servicioPOSCliente").value.trim();
+  tomarClienteDelModalServicio();
   const ok = await cobrarVentaPOS(metodoPago, efectivoRecibido);
   if (ok) cerrarModalServicioPOS();
 });
+
+/* ---- Contado vs Crédito en el TPV ---- */
+let posTipoCobro = "contado";
+
+function totalPosCarrito() { return posCarrito.reduce((s, it) => s + it.cantidad * it.precio, 0); }
+
+function actualizarCajaCreditoPOS() {
+  const total = totalPosCarrito();
+  const abono = Number(document.getElementById("posAbonoInicial").value) || 0;
+  document.getElementById("posSaldoCredito").textContent = money(Math.max(0, total - abono));
+  document.getElementById("posAbonoMetodoBox").style.display = abono > 0 ? "block" : "none";
+}
+
+function aplicarTipoCobroPOS() {
+  const credito = posTipoCobro === "credito";
+  document.getElementById("posContadoBox").style.display = credito ? "none" : "block";
+  document.getElementById("posCreditoBox").style.display = credito ? "block" : "none";
+  // al crédito hay que saber a quién cobrarle, así que el cliente deja de ser opcional
+  document.getElementById("posClienteLabel").textContent = credito ? "Cliente (obligatorio para crédito)" : "Cliente (opcional)";
+  document.getElementById("btnCobrar").textContent = credito ? "Registrar crédito" : "Cobrar";
+  if (credito) actualizarCajaCreditoPOS();
+}
+
+document.getElementById("posTipoCobro").querySelectorAll(".seg-opt").forEach(btn => {
+  btn.addEventListener("click", () => {
+    posTipoCobro = btn.dataset.tipo;
+    document.getElementById("posTipoCobro").querySelectorAll(".seg-opt").forEach(b => b.classList.toggle("active", b === btn));
+    aplicarTipoCobroPOS();
+  });
+});
+document.getElementById("posAbonoInicial").addEventListener("input", actualizarCajaCreditoPOS);
 
 document.getElementById("posBuscar").addEventListener("input", (e) => { posBusqueda = e.target.value; renderPOS(); });
 document.getElementById("posCliente").addEventListener("change", (e) => {
@@ -2378,6 +2585,45 @@ document.getElementById("posEfectivoRecibido").addEventListener("input", actuali
 
 // lógica compartida por el botón "Cobrar" del carrito y "Cobrar ahora" del modal
 // de servicio — cobra TODO lo que haya en posCarrito en ese momento.
+// cobra el carrito al crédito: crea la factura pendiente en Créditos con lo
+// abonado y lo que resta, en vez de registrar una venta cobrada.
+async function cobrarCreditoPOS() {
+  if (!posCarrito.length) { toast("El carrito está vacío", "off"); return false; }
+  const total = totalPosCarrito();
+  const abono = Number(document.getElementById("posAbonoInicial").value) || 0;
+  if (abono < 0) { toast("El abono no puede ser negativo", "off"); return false; }
+  if (abono > total + 0.01) { toast(`El abono no puede ser mayor al total (${money(total)})`, "off"); return false; }
+
+  const sel = document.getElementById("posCliente");
+  const cli = await resolverClienteCredito(sel.value ? Number(sel.value) : null, posClienteLibre);
+  if (!cli) { toast("Para vender al crédito elige un cliente o escribe su nombre", "off"); return false; }
+
+  try {
+    const { id, credito } = await cobrarAlCredito({
+      ...cli,
+      items: posCarrito.map(it => ({ inventarioId: it.inventarioId, nombre: it.nombre, cantidad: it.cantidad, precio: it.precio })),
+      abono, abonoMetodo: document.getElementById("posAbonoMetodo").value,
+      nota: "Venta al crédito desde el TPV", origen: "pos",
+    });
+    ultimoCreditoPOS = credito;
+    imprimirFacturaCredito(credito);
+    toast(abono > 0
+      ? `Crédito #${id} registrado — abonó ${money(abono)}, queda debiendo ${money(credito.saldo)}`
+      : `Crédito #${id} registrado — queda debiendo ${money(credito.saldo)}`);
+    posCarrito = [];
+    posClienteLibre = "";
+    document.getElementById("posAbonoInicial").value = "";
+    renderPOS();
+    renderDashboard();
+    aplicarTipoCobroPOS();
+    return true;
+  } catch (err) {
+    toast("No se pudo registrar el crédito: " + err.message, "off");
+    return false;
+  }
+}
+let ultimoCreditoPOS = null;
+
 async function cobrarVentaPOS(metodoPago, efectivoRecibido) {
   if (!posCarrito.length) { toast("El carrito está vacío", "off"); return false; }
   const total = posCarrito.reduce((s, it) => s + it.cantidad * it.precio, 0);
@@ -2415,6 +2661,7 @@ async function cobrarVentaPOS(metodoPago, efectivoRecibido) {
 }
 
 alHacerClicUnaVez(document.getElementById("btnCobrar"), async () => {
+  if (posTipoCobro === "credito") { await cobrarCreditoPOS(); return; }
   const metodoPago = document.getElementById("posMetodo").value;
   const efectivoRecibido = Number(document.getElementById("posEfectivoRecibido").value) || 0;
   await cobrarVentaPOS(metodoPago, efectivoRecibido);

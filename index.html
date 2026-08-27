@@ -726,6 +726,26 @@
   /* TPV / Venta rápida */
   .pos-layout { display: grid; grid-template-columns: 1fr 340px; gap: 1rem; align-items: start; }
   @media (max-width: 900px) { .pos-layout { grid-template-columns: 1fr; } }
+  /* selector Contado / Crédito: dos opciones grandes y visibles, porque es la
+     decisión que cambia a dónde va la factura y hay que poder tocarla rápido
+     en el mostrador sin abrir una lista desplegable. */
+  .seg-toggle { display: grid; grid-template-columns: 1fr 1fr; gap: 0.4rem; margin-bottom: 0.9rem; }
+  .seg-opt {
+    border: 1px solid var(--border); background: var(--panel); color: var(--text-muted);
+    border-radius: 0.55rem; padding: 0.55rem 0.5rem; font-weight: 600; font-size: 0.85rem;
+    cursor: pointer; font-family: inherit; transition: border-color .15s, background .15s, color .15s;
+  }
+  .seg-opt:hover { border-color: var(--red-border); }
+  .seg-opt.active { background: var(--red-soft); border-color: var(--red-border); color: var(--red); }
+  .seg-opt:focus-visible { outline: 2px solid var(--red-border); outline-offset: 1px; }
+  /* la línea de "queda debiendo" es el dato que el cliente pregunta de una vez */
+  .saldo-aviso {
+    display: flex; justify-content: space-between; align-items: baseline; gap: 0.5rem;
+    background: var(--amber-soft); border: 1px solid rgba(245,165,36,0.32); border-radius: 0.55rem;
+    padding: 0.5rem 0.7rem; margin-bottom: 0.9rem; font-size: 0.85rem;
+  }
+  .saldo-aviso b { font-family: 'Teko', sans-serif; font-size: 1.35rem; color: var(--amber); font-variant-numeric: tabular-nums; }
+
   .pos-buscar-row { display: flex; gap: 0.5rem; align-items: stretch; }
   .pos-buscar-row input { flex: 1; min-width: 0; }
   .pos-buscar-row #btnAgregarServicioPOS { flex: none; white-space: nowrap; padding: 0.55rem 1.2rem; font-size: 0.85rem; }
@@ -1063,20 +1083,43 @@
           <div id="posCarrito"><div class="empty" style="padding:1rem 0;">Toca un producto para agregarlo</div></div>
           <div class="pos-total-row"><span>Total</span><span class="big" id="posTotal">L. 0.00</span></div>
 
-          <label>Cliente (opcional)</label>
+          <label id="posClienteLabel">Cliente (opcional)</label>
           <select id="posCliente"><option value="">Cliente de mostrador</option></select>
 
-          <label>Método de pago</label>
-          <select id="posMetodo">
-            <option value="efectivo">Efectivo</option>
-            <option value="transferencia">Transferencia</option>
-            <option value="tarjeta">Tarjeta</option>
-          </select>
+          <label>Tipo de cobro</label>
+          <div class="seg-toggle" id="posTipoCobro">
+            <button type="button" class="seg-opt active" data-tipo="contado">💵 Contado</button>
+            <button type="button" class="seg-opt" data-tipo="credito">💳 Crédito</button>
+          </div>
 
-          <div id="posEfectivoBox">
-            <label>Efectivo recibido</label>
-            <input type="number" id="posEfectivoRecibido" min="0" step="0.01">
-            <p class="hint" style="margin-top:-0.5rem;">Cambio a devolver: <b id="posCambio">L. 0.00</b></p>
+          <div id="posContadoBox">
+            <label>Método de pago</label>
+            <select id="posMetodo">
+              <option value="efectivo">Efectivo</option>
+              <option value="transferencia">Transferencia</option>
+              <option value="tarjeta">Tarjeta</option>
+            </select>
+
+            <div id="posEfectivoBox">
+              <label>Efectivo recibido</label>
+              <input type="number" id="posEfectivoRecibido" min="0" step="0.01">
+              <p class="hint" style="margin-top:-0.5rem;">Cambio a devolver: <b id="posCambio">L. 0.00</b></p>
+            </div>
+          </div>
+
+          <div id="posCreditoBox" style="display:none;">
+            <label>¿Abonó algo ahora? (L.)</label>
+            <input type="number" id="posAbonoInicial" min="0" step="0.01" placeholder="0.00">
+            <p class="hint" style="margin-top:-0.5rem;">Déjalo vacío o en 0 si se lo lleva sin abonar nada.</p>
+            <div id="posAbonoMetodoBox" style="display:none;">
+              <label>Método del abono</label>
+              <select id="posAbonoMetodo">
+                <option value="efectivo">Efectivo</option>
+                <option value="transferencia">Transferencia</option>
+                <option value="tarjeta">Tarjeta</option>
+              </select>
+            </div>
+            <div class="saldo-aviso"><span>Queda debiendo</span><b id="posSaldoCredito">L. 0.00</b></div>
           </div>
 
           <button class="btn primary" id="btnCobrar" style="width:100%;">Cobrar</button>
@@ -1507,16 +1550,38 @@
       <div><label>Cantidad</label><input type="number" id="servicioPOSCantidad" value="1" min="1"></div>
       <div><label>Precio (L.)</label><input type="number" id="servicioPOSPrecio" step="0.01" min="0"></div>
     </div>
-    <label>Método de pago</label>
-    <select id="servicioPOSMetodo">
-      <option value="efectivo">Efectivo</option>
-      <option value="transferencia">Transferencia</option>
-      <option value="tarjeta">Tarjeta</option>
-    </select>
-    <div id="servicioPOSEfectivoBox">
-      <label>Efectivo recibido</label>
-      <input type="number" id="servicioPOSEfectivoRecibido" min="0" step="0.01">
-      <p class="hint" style="margin-top:-0.5rem;">Cambio a devolver: <b id="servicioPOSCambio">L. 0.00</b></p>
+    <label>Tipo de cobro</label>
+    <div class="seg-toggle" id="servicioPOSTipoCobro">
+      <button type="button" class="seg-opt active" data-tipo="contado">💵 Contado</button>
+      <button type="button" class="seg-opt" data-tipo="credito">💳 Crédito</button>
+    </div>
+
+    <div id="servicioPOSContadoBox">
+      <label>Método de pago</label>
+      <select id="servicioPOSMetodo">
+        <option value="efectivo">Efectivo</option>
+        <option value="transferencia">Transferencia</option>
+        <option value="tarjeta">Tarjeta</option>
+      </select>
+      <div id="servicioPOSEfectivoBox">
+        <label>Efectivo recibido</label>
+        <input type="number" id="servicioPOSEfectivoRecibido" min="0" step="0.01">
+        <p class="hint" style="margin-top:-0.5rem;">Cambio a devolver: <b id="servicioPOSCambio">L. 0.00</b></p>
+      </div>
+    </div>
+
+    <div id="servicioPOSCreditoBox" style="display:none;">
+      <label>¿Abonó algo ahora? (L.)</label>
+      <input type="number" id="servicioPOSAbono" min="0" step="0.01" placeholder="0.00">
+      <div id="servicioPOSAbonoMetodoBox" style="display:none;">
+        <label>Método del abono</label>
+        <select id="servicioPOSAbonoMetodo">
+          <option value="efectivo">Efectivo</option>
+          <option value="transferencia">Transferencia</option>
+          <option value="tarjeta">Tarjeta</option>
+        </select>
+      </div>
+      <div class="saldo-aviso"><span>Queda debiendo</span><b id="servicioPOSSaldo">L. 0.00</b></div>
     </div>
     <div class="modal-actions">
       <button class="btn ghost" id="btnCancelarServicioPOS">Cancelar</button>
@@ -1740,6 +1805,6 @@
      sw.js) — es la forma más universal de forzar que CUALQUIER navegador
      pida el archivo de nuevo aunque ya tenga guardada una copia vieja en su
      propio caché HTTP, sin depender de que respete el Service Worker. -->
-<script src="app.js?v=3.4.0"></script>
+<script src="app.js?v=3.5.1"></script>
 </body>
 </html>
