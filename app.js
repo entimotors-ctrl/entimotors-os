@@ -1723,11 +1723,15 @@ function generarSlotsDelDia() {
 
 // solo se ofrecen horas libres para ese mecánico ese día, así ya no se puede
 // ni seleccionar un horario que otro cliente ya apartó.
-async function slotsDisponibles(fecha, mecanico) {
+async function slotsDisponibles(fecha, mecanico, excluirCitaId = null) {
   const todos = generarSlotsDelDia();
   if (!fecha || !mecanico) return todos;
   const citas = await DB.getAll("citas");
-  const ocupadas = new Set(citas.filter(c => c.fecha === fecha && c.mecanico === mecanico).map(c => c.hora));
+  const ocupadas = new Set(citas
+    // al mover una cita, su propio horario actual no debe contar como ocupado;
+    // y una cita ya cerrada (atendida o no asistida) tampoco bloquea el hueco.
+    .filter(c => c.id !== excluirCitaId && !citaCerrada(c) && c.fecha === fecha && c.mecanico === mecanico)
+    .map(c => c.hora));
   return todos.filter(h => !ocupadas.has(h));
 }
 
@@ -1759,6 +1763,111 @@ async function checkCitaConflicto(fecha, hora, mecanico) {
     { titulo: "Choque de horario", textoOk: "Agendar de todas formas" }
   );
 }
+/* ---- mover una cita a otro día ----
+   Guarda el historial del cambio (de cuándo a cuándo y por qué) en vez de solo
+   pisar la fecha: si un cliente reclama "pero si mi cita era el martes", ahí
+   queda registrado que se movió y por qué motivo. */
+let citaAMover = null;
+
+async function refreshMoverHoraOptions() {
+  const sel = document.getElementById("moverHora");
+  const valorPrevio = sel.value;
+  const fecha = document.getElementById("moverFecha").value;
+  const mecanico = document.getElementById("moverMecanico").value;
+  if (!fecha) { sel.innerHTML = `<option value="">Elige una fecha primero</option>`; return; }
+  const libres = await slotsDisponibles(fecha, mecanico, citaAMover?.id ?? null);
+  sel.innerHTML = libres.length
+    ? libres.map(h => `<option value="${h}">${h}</option>`).join("")
+    : `<option value="">Sin horarios disponibles ese día — elige otra fecha</option>`;
+  if (libres.includes(valorPrevio)) sel.value = valorPrevio;
+}
+
+async function abrirModalMoverCita(citaId) {
+  const cita = await DB.get("citas", citaId);
+  if (!cita) return;
+  citaAMover = cita;
+
+  const cliente = cita.clienteId ? await DB.get("clientes", cita.clienteId) : null;
+  const nombre = cliente?.nombre || cita.nombreTmp || "Cliente";
+  const telefono = cliente?.telefono || cita.telefonoTmp || "";
+  const { dt } = citaWhenInfo(cita);
+
+  document.getElementById("moverCitaActualTexto").textContent =
+    `${nombre} — ahora está para el ${dt.toLocaleDateString("es-HN")} a las ${cita.hora} con ${cita.mecanico}.`;
+  document.getElementById("moverAvisoSinTel").style.display = telefono ? "none" : "block";
+
+  document.getElementById("moverMecanico").innerHTML = TEAM.map(t => `<option value="${esc(t.nombre)}">${esc(t.nombre)}</option>`).join("");
+  document.getElementById("moverMecanico").value = cita.mecanico;
+  document.getElementById("moverMotivo").value = "cliente";
+  document.getElementById("moverFecha").value = cita.fecha;
+  await refreshMoverHoraOptions();
+  document.getElementById("moverHora").value = cita.hora;
+
+  document.getElementById("modalMoverCita").classList.add("active");
+}
+
+document.getElementById("moverFecha").addEventListener("change", refreshMoverHoraOptions);
+document.getElementById("moverMecanico").addEventListener("change", refreshMoverHoraOptions);
+document.getElementById("btnCancelarMover").addEventListener("click", () => {
+  citaAMover = null;
+  document.getElementById("modalMoverCita").classList.remove("active");
+});
+
+const MOTIVO_MOVER_TEXTO = {
+  cliente: "",  // fue el propio cliente quien pidió el cambio: no hace falta explicárselo
+  mecanico: " El mecánico no estará disponible ese día.",
+  taller: " Tuvimos que hacer un ajuste en la agenda del taller.",
+};
+
+alHacerClicUnaVez(document.getElementById("btnConfirmarMover"), async () => {
+  const cita = citaAMover;
+  if (!cita) return;
+
+  const fecha = document.getElementById("moverFecha").value;
+  const hora = document.getElementById("moverHora").value;
+  const mecanico = document.getElementById("moverMecanico").value;
+  const motivo = document.getElementById("moverMotivo").value;
+
+  if (!fecha) { toast("Elige la nueva fecha", "off"); return; }
+  if (!hora) { toast("Elige la nueva hora", "off"); return; }
+  if (fecha === cita.fecha && hora === cita.hora && mecanico === cita.mecanico) {
+    toast("No cambiaste nada: elige otra fecha, hora o mecánico", "off");
+    return;
+  }
+  if (!(await checkCitaConflicto(fecha, hora, mecanico))) return;
+
+  const cliente = cita.clienteId ? await DB.get("clientes", cita.clienteId) : null;
+  const nombre = cliente?.nombre || cita.nombreTmp || "Cliente";
+  const telefono = cliente?.telefono || cita.telefonoTmp || "";
+
+  // la ventana de WhatsApp se abre desde el propio clic, antes de guardar: si
+  // se abriera después del await, el celular la bloquearía por "gesto vencido".
+  const ventanaWA = telefono ? abrirVentanaWA() : null;
+
+  const antes = { fecha: cita.fecha, hora: cita.hora, mecanico: cita.mecanico };
+  await DB.save("citas", {
+    ...cita, fecha, hora, mecanico,
+    // si estaba marcada como no asistida, moverla la vuelve a poner en juego
+    estado: cita.estado === "ausente" ? undefined : cita.estado,
+    cerradaEn: cita.estado === "ausente" ? undefined : cita.cerradaEn,
+    // se vuelve a avisar en la fecha nueva, así que el recordatorio se reinicia
+    recordatorioEnviado: false,
+    reprogramaciones: (cita.reprogramaciones || []).concat([{ de: antes, a: { fecha, hora, mecanico }, motivo, fechaISO: new Date().toISOString() }]),
+  });
+  markDirty();
+
+  const dtAntes = new Date(`${antes.fecha}T${antes.hora}`);
+  const dtNueva = new Date(`${fecha}T${hora}`);
+  const texto = `Hola ${nombre}, tu cita en ENTIMOTORS del ${dtAntes.toLocaleDateString("es-HN")} a las ${antes.hora} fue movida para el ${dtNueva.toLocaleDateString("es-HN")} a las ${hora}.${MOTIVO_MOVER_TEXTO[motivo] || ""} ¡Te esperamos!`;
+  if (telefono) navegarWA(ventanaWA, telefono, texto);
+
+  citaAMover = null;
+  document.getElementById("modalMoverCita").classList.remove("active");
+  toast(telefono ? "Cita movida y aviso abierto en WhatsApp" : "Cita movida");
+  renderCitasList();
+  renderDashboard();
+});
+
 function citaWhenInfo(cita) {
   const now = new Date();
   const dt = new Date(`${cita.fecha}T${cita.hora || "00:00"}`);
@@ -1833,14 +1942,17 @@ async function renderCitasList() {
       acciones = `<button type="button" class="btn ghost small" data-action="ver-orden" data-orden="${c.ordenId}">Ver orden #${c.ordenId} →</button>`;
     } else if (c.estado === "ausente") {
       acciones = `<button type="button" class="btn ghost small" data-action="reabrir" data-id="${c.id}">Reabrir</button>
+        <button type="button" class="btn ghost small" data-action="mover" data-id="${c.id}">📅 Mover</button>
         <button type="button" class="btn ghost small danger" data-action="eliminar" data-id="${c.id}" data-tel="" data-nombre="${esc(nombre)}" title="Eliminar cita" aria-label="Eliminar cita">🗑</button>`;
     } else if (diffDays <= 0) {
       // ya llegó el día (o ya pasó): toca decidir si vino o no
       acciones = `<button class="btn primary small" data-action="llego" data-id="${c.id}">✅ Llegó</button>
         <button type="button" class="btn ghost small" data-action="ausente" data-id="${c.id}">🚫 No llegó</button>
+        <button type="button" class="btn ghost small" data-action="mover" data-id="${c.id}">📅 Mover</button>
         <button type="button" class="btn ghost small danger" data-action="eliminar" data-id="${c.id}" data-tel="${esc(telefono)}" data-nombre="${esc(nombre)}" title="Eliminar cita" aria-label="Eliminar cita">🗑</button>`;
     } else {
       acciones = `<button class="btn wa small" data-action="recordar" data-id="${c.id}" data-tel="${esc(telefono)}" data-nombre="${esc(nombre)}">${c.recordatorioEnviado ? "Recordatorio enviado ✓" : "Enviar recordatorio"}</button>
+        <button type="button" class="btn ghost small" data-action="mover" data-id="${c.id}">📅 Mover</button>
         <button type="button" class="btn ghost small danger" data-action="eliminar" data-id="${c.id}" data-tel="${esc(telefono)}" data-nombre="${esc(nombre)}" title="Eliminar cita" aria-label="Eliminar cita">🗑</button>`;
     }
 
@@ -1848,6 +1960,11 @@ async function renderCitasList() {
     if (c.estado === "atendida") etiqueta = '<span class="mant-badge ok">Atendida</span>';
     else if (c.estado === "ausente") etiqueta = '<span class="mant-badge due">No llegó</span>';
     else if (diffDays < 0) etiqueta = '<span class="mant-badge due">Ya pasó — ciérrala</span>';
+    const veces = (c.reprogramaciones || []).length;
+    if (veces) {
+      const desde = new Date(`${c.reprogramaciones[0].de.fecha}T${c.reprogramaciones[0].de.hora}`);
+      etiqueta += ` <span class="mant-badge soon" title="Movida desde el ${desde.toLocaleDateString("es-HN")} a las ${c.reprogramaciones[0].de.hora}">🔁 Movida${veces > 1 ? ` ${veces}×` : ""}</span>`;
+    }
 
     return `
       <div class="cita-row${citaCerrada(c) ? " cita-cerrada" : ""}" data-id="${c.id}">
@@ -1856,7 +1973,7 @@ async function renderCitasList() {
           <div class="who">${esc(nombre)} ${c.origen === "web" ? '<span class="mant-badge soon">Desde la web</span>' : ""} ${etiqueta}</div>
           <div class="meta">${esc(c.motivo || "Sin motivo especificado")} · mecánico: ${esc(c.mecanico)}</div>
         </div>
-        ${acciones}
+        <div class="cita-acciones">${acciones}</div>
       </div>`;
   }).join("");
 
@@ -1865,6 +1982,13 @@ async function renderCitasList() {
     btn.addEventListener("click", async (e) => {
       e.stopPropagation();
       await abrirOrdenDesdeCita(Number(btn.dataset.id));
+    });
+  });
+
+  list.querySelectorAll('[data-action="mover"]').forEach(btn => {
+    btn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      await abrirModalMoverCita(Number(btn.dataset.id));
     });
   });
 

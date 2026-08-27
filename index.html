@@ -522,6 +522,13 @@
   /* las citas ya cerradas (atendidas o no asistidas) se ven apagadas: están
      ahí como historial, no como algo que haya que atender */
   .cita-row.cita-cerrada { opacity: 0.62; }
+  .cita-acciones { display: flex; gap: 0.4rem; flex-wrap: wrap; align-items: center; }
+  /* en celular los botones pasan a su propio renglón y se reparten el ancho,
+     para que no quede uno suelto colgando debajo de los otros tres */
+  @media (max-width: 560px) {
+    .cita-acciones { width: 100%; }
+    .cita-acciones .btn { flex: 1 1 auto; justify-content: center; }
+  }
   .desde-cita-aviso {
     display: flex; align-items: center; gap: 0.5rem; font-size: 0.85rem;
     background: var(--amber-soft); border: 1px solid rgba(245,165,36,0.32);
@@ -1736,6 +1743,35 @@
   </div>
 </div>
 
+<!-- Modal: mover una cita a otro día -->
+<div class="modal-bg" id="modalMoverCita">
+  <div class="modal">
+    <h3>Mover cita</h3>
+    <div class="desde-cita-aviso" id="moverCitaActual"><span>📅</span><span id="moverCitaActualTexto"></span></div>
+
+    <label>¿Por qué se mueve?</label>
+    <select id="moverMotivo">
+      <option value="cliente">El cliente no puede</option>
+      <option value="mecanico">El mecánico no está disponible</option>
+      <option value="taller">Por el taller (otro motivo)</option>
+    </select>
+
+    <div class="field-row" style="grid-template-columns:1fr 1fr;">
+      <div><label>Nueva fecha</label><input type="date" id="moverFecha"></div>
+      <div><label>Nueva hora</label><select id="moverHora"><option value="">Elige una fecha primero</option></select></div>
+    </div>
+    <label>Mecánico</label>
+    <select id="moverMecanico"></select>
+
+    <p class="hint" id="moverAvisoSinTel" style="display:none;">Este cliente no tiene teléfono guardado, así que no se le podrá avisar por WhatsApp.</p>
+
+    <div class="modal-actions">
+      <button class="btn ghost" id="btnCancelarMover">Cancelar</button>
+      <button class="btn primary" id="btnConfirmarMover">Mover y avisar</button>
+    </div>
+  </div>
+</div>
+
 <!-- Plantilla de impresión de factura (oculta, solo se ve al imprimir) -->
 <div id="facturaPrint">
   <img src="icons/logo-watermark.png" alt="" class="factura-watermark">
@@ -1818,6 +1854,6 @@
      sw.js) — es la forma más universal de forzar que CUALQUIER navegador
      pida el archivo de nuevo aunque ya tenga guardada una copia vieja en su
      propio caché HTTP, sin depender de que respete el Service Worker. -->
-<script src="app.js?v=3.6.0"></script>
+<script src="app.js?v=3.7.1"></script>
 </body>
 </html>
