@@ -232,6 +232,51 @@
   .pill.pendiente { background: var(--red-soft); color: var(--red); }
   .pill.parcial { background: var(--amber-soft); color: var(--amber); }
   .pill.pagado { background: var(--green-soft); color: var(--green); }
+  .pill.aceptada { background: var(--green-soft); color: var(--green); }
+  .pill.rechazada { background: var(--panel-strong); color: var(--text-faint); }
+  .pill.vencida { background: var(--panel-strong); color: var(--text-faint); }
+  .pill.por-vencer { background: var(--amber-soft); color: var(--amber); }
+
+  /* ---- cotizaciones ---- */
+  .cot-row {
+    display: flex; align-items: center; gap: 0.8rem; flex-wrap: wrap;
+    background: var(--bg-raise); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 0.85rem 1rem; margin-bottom: 0.6rem; cursor: pointer;
+    transition: border-color .15s, transform .15s;
+  }
+  .cot-row:hover { border-color: var(--red-border); transform: translateX(2px); }
+  .cot-row .cot-info { flex: 1 1 200px; min-width: 0; }
+  .cot-row .cot-quien { font-weight: 700; font-size: 0.95rem; }
+  .cot-row .cot-meta { font-size: 0.78rem; color: var(--text-faint); margin-top: 0.15rem; }
+  .cot-row .cot-monto { font-family: 'Teko', sans-serif; font-size: 1.35rem; font-weight: 700; }
+  /* la fecha de vencimiento es EL dato de una cotización: si venció, el precio
+     ya no se respeta, así que se marca en ámbar/rojo y no en gris de relleno */
+  .cot-vence { font-size: 0.75rem; font-weight: 600; }
+  .cot-vence.urge { color: var(--amber); }
+  .cot-vence.fuera { color: var(--text-faint); text-decoration: line-through; }
+
+  .cot-items-edit { border: 1px solid var(--border); border-radius: 0.6rem; overflow: hidden; margin-bottom: 0.9rem; }
+  .cot-item-fila { display: flex; align-items: center; gap: 0.6rem; padding: 0.55rem 0.7rem; font-size: 0.85rem; }
+  .cot-item-fila + .cot-item-fila { border-top: 1px solid var(--border); }
+  .cot-item-fila .nom { flex: 1 1 auto; min-width: 0; }
+  .cot-item-fila .nom small { display: block; color: var(--text-faint); font-size: 0.72rem; }
+  .cot-item-fila .sub { font-variant-numeric: tabular-nums; font-weight: 600; }
+  .cot-item-fila button { background: none; border: none; color: var(--text-faint); cursor: pointer; font-size: 0.9rem; padding: 0.2rem; }
+  .cot-item-fila button:hover { color: var(--red); }
+  .cot-vacia { padding: 0.9rem 0.7rem; text-align: center; color: var(--text-faint); font-size: 0.83rem; }
+
+  .cot-totales { display: grid; gap: 0.25rem; margin-bottom: 0.9rem; font-size: 0.88rem; }
+  .cot-totales div { display: flex; justify-content: space-between; }
+  .cot-totales .grande { font-size: 1.05rem; font-weight: 700; border-top: 1px solid var(--border); padding-top: 0.45rem; margin-top: 0.2rem; }
+
+  /* aviso de vigencia dentro del detalle */
+  .cot-vigencia {
+    display: flex; justify-content: space-between; align-items: baseline; gap: 0.5rem;
+    border-radius: 0.55rem; padding: 0.5rem 0.7rem; margin-bottom: 0.9rem; font-size: 0.85rem;
+    background: var(--green-soft); border: 1px solid rgba(46,160,90,0.3);
+  }
+  .cot-vigencia.urge { background: var(--amber-soft); border-color: rgba(245,165,36,0.32); }
+  .cot-vigencia.fuera { background: var(--panel-strong); border-color: var(--border); color: var(--text-faint); }
   .order-row .amount { font-variant-numeric: tabular-nums; font-weight: 600; flex: none; }
   .order-row .meta.mech { flex: none; }
 
@@ -559,6 +604,7 @@
 
   /* ---- impresión de factura ---- */
   #facturaPrint { display: none; }
+  #cotizacionPrint { display: none; }
   .factura-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 1.5rem; }
   .factura-marca { display: flex; align-items: center; gap: 0.6rem; }
   .factura-logo { width: 40px; height: 40px; border-radius: 0.4rem; object-fit: cover; }
@@ -649,6 +695,14 @@
       display: block !important; position: absolute; top: 0; left: 0; width: 100%; padding: 2cm; color: #111; background: #fff;
       -webkit-print-color-adjust: exact; print-color-adjust: exact;
     }
+    body.print-cotizacion #facturaPrint, body.print-cotizacion #facturaPrint * { visibility: hidden !important; display: none !important; }
+    body.print-cotizacion #cotizacionPrint, body.print-cotizacion #cotizacionPrint * { visibility: visible !important; }
+    body.print-cotizacion #cotizacionPrint {
+      display: block !important; position: absolute; top: 0; left: 0; width: 100%; padding: 2cm; color: #111; background: #fff;
+      -webkit-print-color-adjust: exact; print-color-adjust: exact;
+    }
+    body.print-cotizacion table { color: #111; }
+    body.print-cotizacion th, body.print-cotizacion td { border-color: #ccc !important; }
     body.print-estado table { color: #111; }
     body.print-estado th, body.print-estado td { border-color: #ccc !important; }
     /* cada factura del estado de cuenta procura no partirse a la mitad entre páginas */
@@ -753,6 +807,34 @@
   .seg-opt:hover { border-color: var(--red-border); }
   .seg-opt.active { background: var(--red-soft); border-color: var(--red-border); color: var(--red); }
   .seg-opt:focus-visible { outline: 2px solid var(--red-border); outline-offset: 1px; }
+
+  /* ---- enviar un documento como archivo (imagen o PDF) ----
+     Compartir la factura con el botón del navegador manda solo la *dirección*,
+     y esa dirección la publica el service worker únicamente dentro del teléfono
+     que la generó: al que la recibe le llega un enlace roto. Por eso aquí se
+     arma un archivo de verdad, que se abre en cualquier teléfono o PC. */
+  .compartir-formato .seg-opt { display: flex; flex-direction: column; gap: 0.1rem; line-height: 1.25; }
+  .compartir-formato .seg-opt small { font-weight: 500; font-size: 0.7rem; opacity: 0.72; }
+
+  .compartir-preview {
+    display: flex; align-items: center; justify-content: center; text-align: center;
+    min-height: 150px; padding: 0.8rem; margin-bottom: 0.9rem;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 0.6rem;
+  }
+  .compartir-preview img { max-height: 220px; max-width: 100%; border-radius: 0.25rem;
+                           box-shadow: 0 8px 22px -10px rgba(0,0,0,0.7); }
+  .compartir-estado { display: flex; align-items: center; justify-content: center; gap: 0.55rem;
+                      font-size: 0.83rem; color: var(--text-muted); }
+  .compartir-estado.error { color: var(--red); display: block; }
+  .compartir-spinner { width: 15px; height: 15px; flex: none; border-radius: 50%;
+                       border: 2px solid var(--border); border-top-color: var(--red);
+                       animation: compartir-giro 0.7s linear infinite; }
+  @keyframes compartir-giro { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) { .compartir-spinner { animation-duration: 2.5s; } }
+  .compartir-archivo { display: flex; align-items: center; gap: 0.7rem; text-align: left; }
+  .compartir-archivo .ico { font-size: 2.1rem; line-height: 1; }
+  .compartir-archivo b { display: block; font-size: 0.85rem; word-break: break-all; }
+  .compartir-archivo span.peso { font-size: 0.75rem; color: var(--text-faint); }
   /* la línea de "queda debiendo" es el dato que el cliente pregunta de una vez */
   .saldo-aviso {
     display: flex; justify-content: space-between; align-items: baseline; gap: 0.5rem;
@@ -908,6 +990,7 @@
     <button class="nav-item active" data-view="dashboard"><span class="sw"></span>Página principal</button>
     <button class="nav-item" data-view="pos"><span class="sw"></span>Venta rápida (TPV)</button>
     <button class="nav-item" data-view="ordenes"><span class="sw"></span>Órdenes de servicio</button>
+    <button class="nav-item" data-view="cotizaciones"><span class="sw"></span>Cotizaciones<span class="badge" id="cotizacionesBadge" style="display:none;"></span></button>
     <button class="nav-item" data-view="citas"><span class="sw"></span>Citas<span class="badge" id="citasBadge" style="display:none;"></span></button>
     <button class="nav-item" data-view="clientes"><span class="sw"></span>Clientes y motos</button>
     <button class="nav-item" data-view="inventario"><span class="sw"></span>Inventario</button>
@@ -938,12 +1021,13 @@
           <span class="qa-group-label">Taller</span>
           <div class="qa-grid">
             <button type="button" class="qa-btn" data-view="pos"><span class="qa-top"><span class="qa-ic">🛒</span><span class="qa-num">1</span></span><span class="qa-lbl">Venta rápida (TPV)</span></button>
-            <button type="button" class="qa-btn" data-view="ordenes"><span class="qa-top"><span class="qa-ic">🧾</span><span class="qa-num">2</span></span><span class="qa-lbl">Órdenes de servicio</span></button>
-            <button type="button" class="qa-btn" data-view="citas"><span class="qa-top"><span class="qa-ic">📅</span><span class="qa-num">3</span></span><span class="qa-lbl">Citas</span></button>
-            <button type="button" class="qa-btn" data-view="clientes"><span class="qa-top"><span class="qa-ic">🏍️</span><span class="qa-num">4</span></span><span class="qa-lbl">Clientes y motos</span></button>
-            <button type="button" class="qa-btn" data-view="inventario"><span class="qa-top"><span class="qa-ic">📦</span><span class="qa-num">5</span></span><span class="qa-lbl">Inventario</span></button>
-            <button type="button" class="qa-btn" data-view="finanzas"><span class="qa-top"><span class="qa-ic">💰</span><span class="qa-num">6</span></span><span class="qa-lbl">Finanzas y caja</span></button>
-            <button type="button" class="qa-btn" data-view="creditos"><span class="qa-top"><span class="qa-ic">💳</span><span class="qa-num">7</span></span><span class="qa-lbl">Créditos</span></button>
+            <button type="button" class="qa-btn" data-view="cotizaciones"><span class="qa-top"><span class="qa-ic">📝</span><span class="qa-num">2</span></span><span class="qa-lbl">Cotizaciones</span></button>
+            <button type="button" class="qa-btn" data-view="ordenes"><span class="qa-top"><span class="qa-ic">🧾</span><span class="qa-num">3</span></span><span class="qa-lbl">Órdenes de servicio</span></button>
+            <button type="button" class="qa-btn" data-view="citas"><span class="qa-top"><span class="qa-ic">📅</span><span class="qa-num">4</span></span><span class="qa-lbl">Citas</span></button>
+            <button type="button" class="qa-btn" data-view="clientes"><span class="qa-top"><span class="qa-ic">🏍️</span><span class="qa-num">5</span></span><span class="qa-lbl">Clientes y motos</span></button>
+            <button type="button" class="qa-btn" data-view="inventario"><span class="qa-top"><span class="qa-ic">📦</span><span class="qa-num">6</span></span><span class="qa-lbl">Inventario</span></button>
+            <button type="button" class="qa-btn" data-view="finanzas"><span class="qa-top"><span class="qa-ic">💰</span><span class="qa-num">7</span></span><span class="qa-lbl">Finanzas y caja</span></button>
+            <button type="button" class="qa-btn" data-view="creditos"><span class="qa-top"><span class="qa-ic">💳</span><span class="qa-num">8</span></span><span class="qa-lbl">Créditos</span></button>
           </div>
         </div>
         <div class="qa-group qa-group-dark">
@@ -953,8 +1037,8 @@
             <span class="qa-tool t4">🔩</span><span class="qa-tool t5">🔧</span><span class="qa-tool t6">⚙️</span>
           </div>
           <div class="qa-grid">
-            <button type="button" class="qa-btn" data-view="web-cms"><span class="qa-top"><span class="qa-ic">🌐</span><span class="qa-num">8</span></span><span class="qa-lbl">Gestor de la web</span></button>
-            <button type="button" class="qa-btn" data-view="ajustes"><span class="qa-top"><span class="qa-ic">⚙️</span><span class="qa-num">9</span></span><span class="qa-lbl">Ajustes</span></button>
+            <button type="button" class="qa-btn" data-view="web-cms"><span class="qa-top"><span class="qa-ic">🌐</span><span class="qa-num">9</span></span><span class="qa-lbl">Gestor de la web</span></button>
+            <button type="button" class="qa-btn" data-view="ajustes"><span class="qa-top"><span class="qa-ic">⚙️</span><span class="qa-num">10</span></span><span class="qa-lbl">Ajustes</span></button>
           </div>
         </div>
       </div>
@@ -967,6 +1051,19 @@
         <span class="demo-flag">Datos de ejemplo · conecta una analítica real para ver números de verdad</span>
       </div>
       <div class="widget-grid" id="webWidgetGrid"></div>
+    </section>
+
+    <!-- COTIZACIONES -->
+    <section class="view" id="view-cotizaciones">
+      <div class="view-head">
+        <div>
+          <h2>Cotizaciones</h2>
+          <p>El precio que le pasas al cliente antes de tocar la moto. Si la acepta, se convierte en orden de servicio con un botón.</p>
+        </div>
+        <button class="btn primary" id="btnNuevaCotizacion">+ Nueva cotización</button>
+      </div>
+      <div class="widget-row" id="cotizacionesWidgetRow"></div>
+      <div id="cotizacionesLista"></div>
     </section>
 
     <!-- ORDENES -->
@@ -1018,6 +1115,7 @@
         <span class="mant-badge ok" id="finalizadoBadge" style="display:none;"></span>
         <div style="display:flex; gap:0.5rem; flex-wrap:wrap;">
           <button class="btn wa" id="btnEnviarProgresoWA">📲 Progreso por WhatsApp</button>
+          <button class="btn wa" id="btnEnviarFacturaWA" style="display:none;">📲 Enviar factura</button>
           <button class="btn ghost" id="btnImprimirFactura" style="display:none;">🖨 Imprimir factura</button>
           <button class="btn ghost" id="btnRetroceder">&larr; Retroceder etapa</button>
           <button class="btn primary" id="btnAvanzar">Avanzar a la siguiente etapa &rarr;</button>
@@ -1138,7 +1236,10 @@
           </div>
 
           <button class="btn primary" id="btnCobrar" style="width:100%;">Cobrar</button>
-          <button class="btn small ghost" id="btnReimprimirTicket" style="width:100%; margin-top:0.5rem; display:none;">🖨️ Reimprimir último ticket</button>
+          <div id="ticketAcciones" style="display:none; grid-template-columns:1fr 1fr; gap:0.5rem; margin-top:0.5rem;">
+            <button class="btn small wa" id="btnEnviarTicket">📲 Enviar ticket</button>
+            <button class="btn small ghost" id="btnReimprimirTicket">🖨️ Reimprimir</button>
+          </div>
         </div>
       </div>
     </section>
@@ -1389,6 +1490,127 @@
   </div>
 </div>
 
+<!-- Modal: crear / editar una cotización -->
+<div class="modal-bg" id="modalCotizacion">
+  <div class="modal">
+    <h3 id="cotizacionModalTitulo">Nueva cotización</h3>
+    <p class="hint">Es un presupuesto, todavía no toca inventario ni caja.</p>
+
+    <label>Buscar cliente por nombre o placa</label>
+    <div class="autocomplete-wrap">
+      <input type="text" id="cotBuscarCliente" placeholder="Ej. Carlos Reyes o HAX-4471" autocomplete="off">
+      <div class="autocomplete-list" id="cotBuscarClienteList"></div>
+    </div>
+    <div id="cotClienteChipWrap"></div>
+    <p class="hint">si no aparece, escribe los datos aquí abajo:</p>
+    <div class="field-row" style="grid-template-columns:1fr 1fr;">
+      <div><label>Nombre</label><input type="text" id="cotNombre"></div>
+      <div><label>Teléfono</label><input type="tel" id="cotTelefono" placeholder="9704-9635"></div>
+    </div>
+    <div class="field-row">
+      <div><label>Marca</label><input type="text" id="cotMarca" placeholder="Honda"></div>
+      <div><label>Modelo</label><input type="text" id="cotModelo" placeholder="CB190R"></div>
+      <div><label>Placa</label><input type="text" id="cotPlaca"></div>
+    </div>
+
+    <label>Qué se le va a hacer / falla detectada</label>
+    <textarea id="cotDiagnostico" rows="3" placeholder="Ej. Cambio de pastillas delanteras y purga del sistema de frenos."></textarea>
+
+    <label>Repuestos y mano de obra</label>
+    <div class="cot-items-edit" id="cotItemsEdit"></div>
+    <button type="button" class="btn ghost small" id="btnAgregarItemCot" style="margin-bottom:0.9rem;">+ Agregar repuesto o mano de obra</button>
+
+    <div class="cot-totales" id="cotTotalesEdit"></div>
+
+    <!-- La vigencia es lo que protege al taller: los repuestos suben de precio,
+         y pasada esta fecha el presupuesto hay que rehacerlo. -->
+    <label>Este precio se respeta por</label>
+    <select id="cotValidez">
+      <option value="7">7 días — repuestos importados o precio que se mueve</option>
+      <option value="15" selected>15 días — lo normal (recomendado)</option>
+      <option value="30">30 días — trabajos grandes, cliente que necesita tiempo</option>
+    </select>
+    <p class="hint" id="cotVenceAviso"></p>
+
+    <label>Condiciones o notas (opcional)</label>
+    <textarea id="cotNotas" rows="2" placeholder="Ej. No incluye repuestos que aparezcan al desarmar. Entrega estimada: 2 días."></textarea>
+
+    <div class="modal-actions">
+      <button class="btn ghost" id="btnCancelarCotizacion">Cancelar</button>
+      <button class="btn primary" id="btnGuardarCotizacion">Guardar cotización</button>
+    </div>
+  </div>
+</div>
+
+<!-- Modal: agregar un renglón a la cotización -->
+<div class="modal-bg" id="modalItemCot">
+  <div class="modal">
+    <h3>Agregar a la cotización</h3>
+    <label>Tipo</label>
+    <select id="cotItemTipo">
+      <option value="manual">Escribirlo a mano</option>
+      <option value="inventario">Tomarlo del inventario</option>
+    </select>
+    <div id="cotItemManualBox">
+      <label>Descripción</label>
+      <input type="text" id="cotItemNombre" placeholder="Ej. Mano de obra, pastillas delanteras…">
+    </div>
+    <div id="cotItemInvBox" style="display:none;">
+      <label>Repuesto</label>
+      <select id="cotItemInvSelect"></select>
+      <p class="hint" style="margin-top:-0.5rem;">Cotizar no descuenta stock. Se descuenta cuando la cotización se convierta en orden.</p>
+    </div>
+    <div class="field-row" style="grid-template-columns:1fr 1fr;">
+      <div><label>Cantidad</label><input type="number" id="cotItemCantidad" value="1" min="1"></div>
+      <div><label>Precio unitario (L.)</label><input type="number" id="cotItemPrecio" step="0.01" min="0"></div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn ghost" id="btnCancelarItemCot">Cancelar</button>
+      <button class="btn primary" id="btnGuardarItemCot">Agregar</button>
+    </div>
+  </div>
+</div>
+
+<!-- Modal: detalle de una cotización, con todas sus acciones -->
+<div class="modal-bg" id="modalCotDetalle">
+  <div class="modal">
+    <h3 id="cotDetTitulo">Cotización</h3>
+    <p class="hint" id="cotDetSub"></p>
+
+    <div class="cot-vigencia" id="cotDetVigencia"><span id="cotDetVigenciaTexto"></span><b id="cotDetVigenciaFecha"></b></div>
+
+    <div id="cotDetDiagnosticoWrap" style="margin-bottom:0.9rem;">
+      <div class="fin-section-label">Trabajo cotizado</div>
+      <p style="font-size:0.88rem; color:var(--text-muted); margin:0.3rem 0 0;" id="cotDetDiagnostico"></p>
+    </div>
+
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>Ítem</th><th class="num">Cant.</th><th class="num">Precio</th><th class="num">Subtotal</th></tr></thead>
+        <tbody id="cotDetItems"></tbody>
+      </table>
+    </div>
+    <div class="cot-totales" id="cotDetTotales"></div>
+    <p class="hint" id="cotDetNotas" style="display:none;"></p>
+    <p class="hint" id="cotDetConvertida" style="display:none;"></p>
+
+    <div class="modal-actions" style="justify-content:flex-start; flex-wrap:wrap;">
+      <button type="button" class="btn wa small" id="btnCotEnviarWA">📲 Enviar</button>
+      <button type="button" class="btn ghost small" id="btnCotImprimir">🖨️ Imprimir</button>
+      <button type="button" class="btn ghost small" id="btnCotEditar">✏️ Editar</button>
+      <button type="button" class="btn ghost small" id="btnCotRenovar">🔄 Renovar vigencia</button>
+    </div>
+    <div class="modal-actions" style="justify-content:flex-start; flex-wrap:wrap;">
+      <button type="button" class="btn primary small" id="btnCotAceptar">✅ Aceptó — crear orden</button>
+      <button type="button" class="btn ghost small" id="btnCotRechazar">✕ No aceptó</button>
+      <button type="button" class="btn ghost small danger" id="btnCotEliminar">🗑</button>
+    </div>
+    <div class="modal-actions">
+      <button class="btn ghost" id="btnCerrarCotDetalle">Cerrar</button>
+    </div>
+  </div>
+</div>
+
 <!-- Modal: nuevo cliente -->
 <div class="modal-bg" id="modalCliente">
   <div class="modal">
@@ -1506,6 +1728,7 @@
     <div class="modal-actions" style="justify-content:flex-start; flex-wrap:wrap;">
       <button type="button" class="btn wa small" id="btnDetRecordar">Recordar saldo</button>
       <button type="button" class="btn ghost small" id="btnDetEstadoCuenta">🖨️ Estado de cuenta</button>
+      <button type="button" class="btn wa small" id="btnDetEnviarEstadoCuenta">📲 Enviar estado de cuenta</button>
     </div>
     <div class="modal-actions">
       <button class="btn ghost" id="btnCerrarCreditoDetalle">Cerrar</button>
@@ -1815,6 +2038,79 @@
   </div>
 </div>
 
+<!-- Modal: enviar un documento como archivo.
+     Es la única forma que funciona siempre: mandar el enlace de la factura no
+     sirve porque esa dirección solo existe dentro del teléfono que la generó. -->
+<div class="modal-bg" id="modalCompartirDoc">
+  <div class="modal">
+    <h3 id="compartirDocTitulo">Enviar factura</h3>
+    <p class="hint">Se manda como archivo, así se abre en cualquier teléfono o computadora.</p>
+
+    <div class="seg-toggle compartir-formato" id="compartirDocFormato">
+      <button type="button" class="seg-opt active" data-formato="imagen">🖼️ Imagen<small>Se ve en el chat</small></button>
+      <button type="button" class="seg-opt" data-formato="pdf">📄 PDF<small>Formal, para imprimir</small></button>
+    </div>
+
+    <div class="compartir-preview">
+      <div class="compartir-estado" id="compartirDocEstado"><span class="compartir-spinner"></span> Preparando el documento…</div>
+      <img id="compartirDocImg" alt="Vista previa del documento" style="display:none;">
+      <div class="compartir-archivo" id="compartirDocArchivo" style="display:none;">
+        <span class="ico">📄</span>
+        <span><b id="compartirDocNombre"></b><span class="peso" id="compartirDocPeso"></span></span>
+      </div>
+    </div>
+
+    <div class="modal-actions" style="flex-wrap:wrap; justify-content:flex-start;">
+      <button type="button" class="btn wa" id="btnCompartirDocEnviar" disabled>📲 Enviar</button>
+      <button type="button" class="btn ghost" id="btnCompartirDocDescargar" disabled>⬇️ Descargar</button>
+      <button type="button" class="btn ghost" id="btnCompartirDocCerrar" style="margin-left:auto;">Cerrar</button>
+    </div>
+  </div>
+</div>
+
+<!-- Plantilla de impresión de la cotización -->
+<div id="cotizacionPrint">
+  <div class="factura-header">
+    <div class="factura-marca">
+      <img src="icons/icon-192.png" alt="" class="factura-logo">
+      <div class="marca">ENTI<span style="color:#e11d48;">MOTORS</span></div>
+    </div>
+    <div class="factura-meta">
+      <div>Cotización #<span id="cotPrintId"></span></div>
+      <div id="cotPrintFecha"></div>
+    </div>
+  </div>
+
+  <div class="factura-block">
+    <b>Cliente</b>
+    <span id="cotPrintCliente"></span><span id="cotPrintTelefono"></span>
+  </div>
+  <div class="factura-block" id="cotPrintMotoBlock">
+    <b>Moto</b>
+    <span id="cotPrintMoto"></span>
+  </div>
+  <div class="factura-block" id="cotPrintDiagBlock">
+    <b>Trabajo cotizado</b>
+    <span id="cotPrintDiagnostico"></span>
+  </div>
+
+  <table>
+    <thead><tr><th>Ítem</th><th class="num">Cant.</th><th class="num">Precio</th><th class="num">Subtotal</th></tr></thead>
+    <tbody id="cotPrintItems"></tbody>
+  </table>
+
+  <div class="factura-total">Total estimado: <span id="cotPrintTotal"></span></div>
+
+  <!-- lo que protege al taller: hasta cuándo se respeta este precio -->
+  <div class="cot-print-vigencia">
+    <b>Este precio se respeta hasta el <span id="cotPrintVence"></span></b>
+    <span id="cotPrintValidezDias"></span>
+  </div>
+
+  <p class="factura-nota" id="cotPrintNotas"></p>
+  <p class="factura-nota">Es un presupuesto estimado, no una factura. Si al desarmar aparece algo más, se le avisa antes de seguir.</p>
+</div>
+
 <!-- Plantilla de impresión de factura (oculta, solo se ve al imprimir) -->
 <div id="facturaPrint">
   <img src="icons/logo-watermark.png" alt="" class="factura-watermark">
@@ -1857,7 +2153,7 @@
   </div>
   <div class="factura-block">
     <b>Cliente</b>
-    <span id="credFacCliente"></span> — <span id="credFacTelefono"></span>
+    <span id="credFacCliente"></span><span id="credFacTelefono"></span>
   </div>
   <table>
     <thead><tr><th>Ítem</th><th class="num">Cant.</th><th class="num">Precio</th><th class="num">Subtotal</th></tr></thead>
@@ -1884,7 +2180,7 @@
   </div>
   <div class="factura-block">
     <b>Cliente</b>
-    <span id="edcCliente"></span> — <span id="edcTelefono"></span>
+    <span id="edcCliente"></span><span id="edcTelefono"></span>
   </div>
   <div id="edcFacturas"></div>
   <div class="factura-total">Total a crédito: <span id="edcTotal"></span></div>
@@ -1897,6 +2193,6 @@
      sw.js) — es la forma más universal de forzar que CUALQUIER navegador
      pida el archivo de nuevo aunque ya tenga guardada una copia vieja en su
      propio caché HTTP, sin depender de que respete el Service Worker. -->
-<script src="app.js?v=3.9.2"></script>
+<script src="app.js?v=3.11.0"></script>
 </body>
 </html>

@@ -2,8 +2,16 @@
 // cambiando la app todos los días, "caché primero" deja a los dispositivos ya
 // instalados atascados en una versión vieja para siempre — network-first evita
 // eso y de todos modos cae al caché cuando de verdad no hay señal.
-const CACHE_NAME = "entimotors-v3.9.2";
-const SHELL = ["./", "./index.html", "./app.js?v=3.9.2", "./manifest.json", "./icons/icon-192.png", "./icons/logo-watermark-doc.png"];
+const CACHE_NAME = "entimotors-v3.11.0";
+const SHELL = ["./", "./index.html", "./app.js?v=3.11.0", "./manifest.json", "./icons/icon-192.png", "./icons/logo-watermark-doc.png"];
+
+// Librerías que convierten la factura en imagen/PDF para poder mandarla por
+// WhatsApp. Van aparte del SHELL y con .catch(): si el CDN no responde, la app
+// se tiene que instalar igual — sin ellas solo se pierde el botón de enviar.
+const EXTRAS = [
+  "https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js",
+  "https://cdn.jsdelivr.net/npm/jspdf@2.5.2/dist/jspdf.umd.min.js",
+];
 
 self.addEventListener("install", (event) => {
   // cache.addAll() no deja pasar { cache: "no-store" } — sin eso, el propio
@@ -11,7 +19,12 @@ self.addEventListener("install", (event) => {
   // dejar precacheado un index.html/app.js viejo, aunque CACHE_NAME cambiara.
   event.waitUntil(
     caches.open(CACHE_NAME).then((cache) =>
-      Promise.all(SHELL.map((url) => fetch(url, { cache: "no-store" }).then((res) => cache.put(url, res))))
+      Promise.all([
+        ...SHELL.map((url) => fetch(url, { cache: "no-store" }).then((res) => cache.put(url, res))),
+        // cache.add() rechaza las respuestas opacas (status 0) que devuelve un CDN
+        // sin CORS, así que se hace el fetch a mano y se guarda con put().
+        ...EXTRAS.map((url) => fetch(url, { mode: "no-cors" }).then((res) => cache.put(url, res)).catch(() => {})),
+      ])
     )
   );
   self.skipWaiting();

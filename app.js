@@ -93,7 +93,7 @@ function navegarWA(ventana, phoneRaw, text) {
 /* ---------------- IndexedDB helper mínimo ---------------- */
 function openDb() {
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open("entimotors_os_demo", 4);
+    const req = indexedDB.open("entimotors_os_demo", 5);
     req.onupgradeneeded = (e) => {
       const d = req.result;
       const t = req.transaction;
@@ -123,6 +123,15 @@ function openDb() {
       }
       if (!d.objectStoreNames.contains("creditos")) {
         const s = d.createObjectStore("creditos", { keyPath: "id", autoIncrement: true });
+        s.createIndex("by_fecha", "fechaISO");
+        s.createIndex("by_cliente", "clienteId");
+        s.createIndex("by_estado", "estado");
+      }
+      // Cotizaciones: el presupuesto que se le pasa al cliente ANTES de tocar la
+      // moto. No mueve inventario ni caja — solo cuando se acepta y se convierte
+      // en orden de servicio pasa a ser trabajo de verdad.
+      if (!d.objectStoreNames.contains("cotizaciones")) {
+        const s = d.createObjectStore("cotizaciones", { keyPath: "id", autoIncrement: true });
         s.createIndex("by_fecha", "fechaISO");
         s.createIndex("by_cliente", "clienteId");
         s.createIndex("by_estado", "estado");
@@ -217,7 +226,7 @@ const DB = {
     });
   },
 };
-const ALL_STORES = ["clientes", "motos", "ordenes", "inventario", "citas", "ventas_rapidas", "caja_movimientos", "creditos", "web_cms", "categorias_inv"];
+const ALL_STORES = ["clientes", "motos", "ordenes", "inventario", "citas", "cotizaciones", "ventas_rapidas", "caja_movimientos", "creditos", "web_cms", "categorias_inv"];
 async function updateOrder(id, mutator) {
   const o = await DB.get("ordenes", id);
   mutator(o);
@@ -634,6 +643,14 @@ const CSS_IMPRESION = `
   .factura-total:first-of-type { border-top: 2px solid #1a1613; padding-top: 0.7rem; margin-top: 1rem;
                                  font-size: 1.15rem; }
 
+  /* la vigencia de una cotización es el dato que evita discusiones después:
+     va enmarcado, no como un renglón más de letra chica */
+  .cot-print-vigencia { margin-top: 1.2rem; padding: 0.7rem 0.9rem; border: 2px solid #1a1613;
+                        border-radius: 0.4rem; display: flex; justify-content: space-between;
+                        align-items: baseline; gap: 0.8rem; font-size: 0.9rem; }
+  .cot-print-vigencia span { color: #5c5349; font-size: 0.8rem; }
+  .factura-nota { margin-top: 0.7rem; font-size: 0.78rem; color: #8a8078; line-height: 1.5; }
+
   .edc-factura { margin-bottom: 1.4rem; break-inside: avoid; page-break-inside: avoid; }
   .edc-factura-head { font-size: 0.92rem; font-weight: 700; margin-bottom: 0.2rem;
                       border-bottom: 2px solid #1a1613; padding-bottom: 0.25rem; }
@@ -665,7 +682,7 @@ const CSS_TICKET = `
 
 /* Arma el documento completo, autocontenido: sus propios estilos, la marca de
    agua y un <base> para que las rutas relativas de los logos no salgan rotas. */
-function armarDocumentoImpresion(idPlantilla) {
+function armarDocumentoImpresion(idPlantilla, { conBarra = true } = {}) {
   const contenido = document.getElementById(idPlantilla).innerHTML;
   const esTicket = idPlantilla === "ticketPrint";
   const base = location.href.replace(/[^/]*$/, "");
@@ -677,10 +694,10 @@ function armarDocumentoImpresion(idPlantilla) {
 <title>ENTIMOTORS</title>
 <style>${CSS_IMPRESION}${esTicket ? CSS_TICKET : ""}</style>
 </head><body>
-<div class="barra-imprimir">
+${conBarra ? `<div class="barra-imprimir">
   <button type="button" onclick="window.print()">🖨️ Imprimir o guardar PDF</button>
   <span class="ayuda">o usa el botón Compartir del navegador</span>
-</div>
+</div>` : ""}
 <div class="doc">
   <img class="marca-agua" src="icons/logo-watermark-doc.png" alt="">
   ${contenido}
@@ -727,6 +744,255 @@ function imprimirPlantilla(idPlantilla, claseBody, ventana) {
       ventana.document.close();
     });
 }
+
+/* ================= ENVIAR UN DOCUMENTO COMO ARCHIVO =================
+   Compartir la factura con el botón del navegador manda solo la *dirección*, y
+   esa dirección (impresion.html) la publica el service worker únicamente dentro
+   del teléfono que la generó: al que la recibe le llega un enlace roto. Y si en
+   vez de eso la guardan desde el menú Compartir, el iPhone escribe un
+   .webarchive, que no abre ningún Android ni ninguna PC. En los dos casos "le
+   llega pero no la puede abrir".
+
+   Lo único que funciona siempre es generar un archivo de verdad —una imagen o
+   un PDF— y entregárselo al menú de compartir del sistema, que ya trae WhatsApp
+   adentro. Una imagen además llega visible dentro del chat, sin que el cliente
+   tenga que abrir nada. */
+
+const CDN_HTML2CANVAS = "https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js";
+const CDN_JSPDF = "https://cdn.jsdelivr.net/npm/jspdf@2.5.2/dist/jspdf.umd.min.js";
+
+const scriptsExternos = new Map();
+function cargarScriptExterno(url) {
+  if (!scriptsExternos.has(url)) {
+    scriptsExternos.set(url, new Promise((resolve, reject) => {
+      const el = document.createElement("script");
+      el.src = url;
+      el.onload = () => resolve();
+      // se borra del mapa para que un segundo intento (ya con señal) vuelva a probar
+      el.onerror = () => { scriptsExternos.delete(url); el.remove(); reject(new Error("no se pudo descargar " + url)); };
+      document.head.appendChild(el);
+    }));
+  }
+  return scriptsExternos.get(url);
+}
+
+function nombreArchivoLimpio(texto) {
+  return (texto || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-zA-Z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40) || "cliente";
+}
+
+/* Dibuja el documento en un <iframe> aparte y lo captura. Va en iframe —y no en
+   un div escondido— para que use exactamente los mismos estilos que la versión
+   impresa, sin que el CSS oscuro de la app se le meta encima. */
+async function renderizarDocumentoACanvas(idPlantilla) {
+  const esTicket = idPlantilla === "ticketPrint";
+  const ancho = esTicket ? 360 : 794; // 794 px = el ancho de una hoja A4 a 96 dpi
+  const marco = document.createElement("iframe");
+  marco.setAttribute("aria-hidden", "true");
+  marco.setAttribute("tabindex", "-1");
+  // fuera de la pantalla, pero renderizado: con display:none el navegador no
+  // calcula el diseño y la captura saldría en blanco.
+  marco.style.cssText = `position:fixed; top:0; left:-20000px; border:0; opacity:0;
+                         pointer-events:none; width:${ancho}px; height:2200px;`;
+  document.body.appendChild(marco);
+
+  try {
+    const doc = marco.contentDocument;
+    doc.open();
+    doc.write(armarDocumentoImpresion(idPlantilla, { conBarra: false }));
+    doc.close();
+
+    // sin esperar a las imágenes, la marca de agua y el logo salen en blanco
+    await Promise.all([...doc.images].map((img) =>
+      img.complete ? Promise.resolve() : new Promise((listo) => { img.onload = img.onerror = listo; })
+    ));
+    if (doc.fonts?.ready) await doc.fonts.ready;
+
+    const hoja = doc.querySelector(".doc");
+    const alto = Math.max(hoja.scrollHeight, doc.body.scrollHeight) + 40;
+    marco.style.height = `${alto}px`;
+    // dos cuadros para que el navegador termine de reacomodar con la altura nueva
+    await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+
+    await cargarScriptExterno(CDN_HTML2CANVAS);
+    return await window.html2canvas(hoja, {
+      backgroundColor: "#ffffff",
+      scale: esTicket ? 4 : 2, // el ticket es angosto, necesita más resolución para leerse
+      useCORS: true,
+      logging: false,
+      windowWidth: ancho,
+      windowHeight: alto,
+    });
+  } finally {
+    marco.remove();
+  }
+}
+
+function canvasABlob(canvas, tipo, calidad) {
+  return new Promise((resolve, reject) => {
+    canvas.toBlob((b) => (b ? resolve(b) : reject(new Error("no se pudo generar la imagen"))), tipo, calidad);
+  });
+}
+
+async function canvasAPdf(canvas, esTicket) {
+  await cargarScriptExterno(CDN_JSPDF);
+  const { jsPDF } = window.jspdf;
+  const imagen = canvas.toDataURL("image/jpeg", 0.92);
+
+  if (esTicket) {
+    // el ticket no es una hoja A4: el PDF se hace del tamaño exacto del rollo
+    const ancho = 58, alto = (canvas.height / canvas.width) * ancho;
+    const pdf = new jsPDF({ unit: "mm", format: [ancho, alto], orientation: "portrait" });
+    pdf.addImage(imagen, "JPEG", 0, 0, ancho, alto);
+    return pdf.output("blob");
+  }
+
+  const MARGEN = 8, ANCHO = 210 - MARGEN * 2, ALTO_PAGINA = 297 - MARGEN * 2;
+  const pdf = new jsPDF({ unit: "mm", format: "a4", orientation: "portrait" });
+  const altoTotal = (canvas.height / canvas.width) * ANCHO;
+
+  if (altoTotal <= ALTO_PAGINA) {
+    pdf.addImage(imagen, "JPEG", MARGEN, MARGEN, ANCHO, altoTotal);
+    return pdf.output("blob");
+  }
+
+  // más largo que una hoja (un estado de cuenta con varias facturas): se corta
+  // en franjas del alto de una página, una por página.
+  const pxPorPagina = Math.floor((ALTO_PAGINA / ANCHO) * canvas.width);
+  const franja = document.createElement("canvas");
+  franja.width = canvas.width;
+  const ctx = franja.getContext("2d");
+  for (let y = 0, pagina = 0; y < canvas.height; y += pxPorPagina, pagina++) {
+    const altoFranja = Math.min(pxPorPagina, canvas.height - y);
+    franja.height = altoFranja;
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, franja.width, altoFranja);
+    ctx.drawImage(canvas, 0, y, canvas.width, altoFranja, 0, 0, canvas.width, altoFranja);
+    if (pagina > 0) pdf.addPage();
+    pdf.addImage(franja.toDataURL("image/jpeg", 0.92), "JPEG", MARGEN, MARGEN, ANCHO, (altoFranja / canvas.width) * ANCHO);
+  }
+  return pdf.output("blob");
+}
+
+/* El archivo se prepara al abrir el modal, no al tocar "Enviar": el navegador
+   solo abre el menú de compartir mientras el toque sigue "fresco", y armar la
+   imagen tarda un segundo. Para cuando la persona toca Enviar, ya está hecho.
+   De paso ve una vista previa de lo que va a mandar. */
+let docCompartir = null; // { idPlantilla, nombreBase, titulo, texto, formato, archivo }
+
+function abrirCompartirDoc(datos) {
+  if (!datos) return;
+  docCompartir = { ...datos, formato: "imagen", archivo: null };
+  document.getElementById("compartirDocTitulo").textContent = datos.titulo;
+  document.querySelectorAll("#compartirDocFormato .seg-opt").forEach((b) =>
+    b.classList.toggle("active", b.dataset.formato === "imagen"));
+  document.getElementById("modalCompartirDoc").classList.add("active");
+  prepararArchivoCompartir();
+}
+
+function cerrarCompartirDoc() {
+  docCompartir = null;
+  const img = document.getElementById("compartirDocImg");
+  if (img.src.startsWith("blob:")) URL.revokeObjectURL(img.src);
+  img.removeAttribute("src");
+  document.getElementById("modalCompartirDoc").classList.remove("active");
+}
+
+async function prepararArchivoCompartir() {
+  const ctx = docCompartir;
+  if (!ctx) return;
+  const estado = document.getElementById("compartirDocEstado");
+  const img = document.getElementById("compartirDocImg");
+  const ficha = document.getElementById("compartirDocArchivo");
+  const btnEnviar = document.getElementById("btnCompartirDocEnviar");
+  const btnBajar = document.getElementById("btnCompartirDocDescargar");
+
+  btnEnviar.disabled = btnBajar.disabled = true;
+  img.style.display = ficha.style.display = "none";
+  if (img.src.startsWith("blob:")) URL.revokeObjectURL(img.src);
+  img.removeAttribute("src");
+  estado.style.display = "flex";
+  estado.classList.remove("error");
+  estado.innerHTML = `<span class="compartir-spinner"></span> Preparando ${ctx.formato === "pdf" ? "el PDF" : "la imagen"}…`;
+
+  try {
+    const canvas = await renderizarDocumentoACanvas(ctx.idPlantilla);
+    // si mientras tanto cambiaron de formato o cerraron, este resultado ya no sirve
+    if (docCompartir !== ctx) return;
+
+    const esPdf = ctx.formato === "pdf";
+    const blob = esPdf
+      ? await canvasAPdf(canvas, ctx.idPlantilla === "ticketPrint")
+      : await canvasABlob(canvas, "image/jpeg", 0.92);
+    if (docCompartir !== ctx) return;
+
+    const nombre = `${ctx.nombreBase}.${esPdf ? "pdf" : "jpg"}`;
+    ctx.archivo = new File([blob], nombre, { type: esPdf ? "application/pdf" : "image/jpeg" });
+
+    estado.style.display = "none";
+    if (esPdf) {
+      document.getElementById("compartirDocNombre").textContent = nombre;
+      document.getElementById("compartirDocPeso").textContent = `${Math.max(1, Math.round(blob.size / 1024))} KB · listo para enviar`;
+      ficha.style.display = "flex";
+    } else {
+      img.src = URL.createObjectURL(blob);
+      img.style.display = "block";
+    }
+    btnEnviar.disabled = btnBajar.disabled = false;
+  } catch (err) {
+    if (docCompartir !== ctx) return;
+    estado.style.display = "block";
+    estado.classList.add("error");
+    estado.textContent = navigator.onLine
+      ? "No se pudo preparar el archivo. Puedes usar el botón de imprimir."
+      : "La primera vez hace falta internet para preparar el archivo. Conéctate y vuelve a intentarlo.";
+  }
+}
+
+document.getElementById("compartirDocFormato").addEventListener("click", (e) => {
+  const btn = e.target.closest(".seg-opt");
+  if (!btn || !docCompartir || btn.dataset.formato === docCompartir.formato) return;
+  document.querySelectorAll("#compartirDocFormato .seg-opt").forEach((b) => b.classList.toggle("active", b === btn));
+  // objeto nuevo a propósito: así la preparación anterior se descarta sola
+  docCompartir = { ...docCompartir, formato: btn.dataset.formato, archivo: null };
+  prepararArchivoCompartir();
+});
+
+function descargarArchivoCompartir() {
+  const archivo = docCompartir?.archivo;
+  if (!archivo) return;
+  const url = URL.createObjectURL(archivo);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = archivo.name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+
+document.getElementById("btnCompartirDocEnviar").addEventListener("click", () => {
+  const ctx = docCompartir;
+  if (!ctx?.archivo) return;
+  // ni un solo await antes de share(): el navegador solo lo permite mientras el
+  // toque sigue vigente (el mismo motivo por el que WhatsApp e imprimir se
+  // abren de inmediato). Por eso el archivo ya viene preparado de antes.
+  if (navigator.canShare?.({ files: [ctx.archivo] })) {
+    navigator.share({ files: [ctx.archivo], title: ctx.titulo, text: ctx.texto })
+      .then(() => { cerrarCompartirDoc(); toast("Documento enviado"); })
+      .catch((err) => {
+        if (err?.name === "AbortError") return; // canceló el menú, no es un error
+        toast("No se pudo abrir el menú de compartir — descárgalo y adjúntalo", "off");
+      });
+    return;
+  }
+  // navegadores que no comparten archivos (PC sobre todo): se descarga y se adjunta a mano
+  descargarArchivoCompartir();
+  toast("Este navegador no comparte archivos: se descargó para que lo adjuntes", "off");
+});
+
+document.getElementById("btnCompartirDocDescargar").addEventListener("click", descargarArchivoCompartir);
+document.getElementById("btnCompartirDocCerrar").addEventListener("click", cerrarCompartirDoc);
 
 let deferredInstallPrompt = null;
 window.addEventListener("beforeinstallprompt", (e) => {
@@ -855,7 +1121,9 @@ document.getElementById("buscarGlobalInput").addEventListener("input", async (e)
   const box = document.getElementById("buscarGlobalResultados");
   if (!q) { box.innerHTML = ""; return; }
 
-  const [clientes, motos, ordenes, inventario] = await Promise.all([DB.getAll("clientes"), DB.getAll("motos"), DB.getAll("ordenes"), DB.getAll("inventario")]);
+  const [clientes, motos, ordenes, inventario, cotizaciones] = await Promise.all([
+    DB.getAll("clientes"), DB.getAll("motos"), DB.getAll("ordenes"), DB.getAll("inventario"), DB.getAll("cotizaciones"),
+  ]);
   const resultados = [];
 
   clientes.filter(c => c.nombre.toLowerCase().includes(q) || (c.telefono || "").includes(q)).forEach(c => {
@@ -880,9 +1148,21 @@ document.getElementById("buscarGlobalInput").addEventListener("input", async (e)
       onClick: () => { cerrarBuscadorGlobal(); showView("ordenes"); openOrder(o.id); },
     });
   });
+  cotizaciones.filter(c => (c.clienteNombre || "").toLowerCase().includes(q)
+      || (c.diagnostico || "").toLowerCase().includes(q)
+      || (c.motoDesc || "").toLowerCase().includes(q)).forEach(c => {
+    const est = estadoCotizacion(c);
+    resultados.push({
+      ic: "📝", tipo: "Cotización", titulo: `Cotización #${c.id} — ${c.clienteNombre}`,
+      sub: `${COT_ESTADO_LABEL[est]} · ${money(totalCotizacion(c))}`,
+      onClick: () => { cerrarBuscadorGlobal(); showView("cotizaciones"); renderCotizaciones(); abrirCotizacionDetalle(c.id); },
+    });
+  });
   inventario.filter(r => r.nombre.toLowerCase().includes(q) || (r.codigoBarras || "").toLowerCase().includes(q)).forEach(r => {
     resultados.push({
-      ic: "📦", tipo: "Repuesto", titulo: r.nombre, sub: `${r.cantidad} en stock · ${money(r.precio)}`,
+      // precioVenta es el campo al día; precio queda de respaldo para los
+      // registros viejos que se importaron antes de que existiera
+      ic: "📦", tipo: "Repuesto", titulo: r.nombre, sub: `${r.cantidad} en stock · ${money(r.precioVenta ?? r.precio)}`,
       onClick: () => { cerrarBuscadorGlobal(); showView("inventario"); renderInventario(); openRepuestoDetalle(r.id); },
     });
   });
@@ -899,7 +1179,9 @@ document.getElementById("buscarGlobalInput").addEventListener("input", async (e)
 
 /* ================= centro de notificaciones ================= */
 async function renderNotificaciones() {
-  const [citasAll, motos, inventario] = await Promise.all([DB.getAll("citas"), DB.getAll("motos"), DB.getAll("inventario")]);
+  const [citasAll, motos, inventario, cotizaciones] = await Promise.all([
+    DB.getAll("citas"), DB.getAll("motos"), DB.getAll("inventario"), DB.getAll("cotizaciones"),
+  ]);
   const avisos = [];
 
   citasAll.filter(c => !citaCerrada(c) && citaWhenInfo(c).diffDays === 0).forEach(c => {
@@ -910,6 +1192,16 @@ async function renderNotificaciones() {
   });
   inventario.filter(r => r.cantidad <= (r.stockMinimo ?? 3)).forEach(r => {
     avisos.push({ ic: "📦", titulo: `Stock bajo: ${r.nombre}`, sub: `Quedan ${r.cantidad}`, onClick: () => { showView("inventario"); renderInventario(); } });
+  });
+  // una cotización a punto de vencer es plata que se puede perder por no llamar
+  cotizaciones.filter(c => estadoCotizacion(c) === "pendiente" && diasParaVencer(c) <= DIAS_AVISO_VENCIMIENTO).forEach(c => {
+    const dias = diasParaVencer(c);
+    avisos.push({
+      ic: "📝",
+      titulo: `Cotización por vencer: ${c.clienteNombre}`,
+      sub: `${money(totalCotizacion(c))} · ${dias <= 0 ? "vence hoy" : dias === 1 ? "vence mañana" : `vence en ${dias} días`}`,
+      onClick: () => { showView("cotizaciones"); renderCotizaciones(); abrirCotizacionDetalle(c.id); },
+    });
   });
 
   const badge = document.getElementById("notifBadge");
@@ -944,6 +1236,7 @@ document.addEventListener("click", (e) => {
 const renderByView = {
   dashboard: () => renderDashboard(),
   ordenes: () => renderOrdersList(),
+  cotizaciones: () => renderCotizaciones(),
   citas: () => renderCitasList(),
   clientes: () => renderClientes(),
   inventario: () => renderInventario(),
@@ -996,8 +1289,9 @@ function renderWidgetRow(containerId, items) {
 
 /* ================= DASHBOARD ================= */
 async function renderDashboard() {
-  const [ordenes, motos, clientes, inventario, citas] = await Promise.all([
+  const [ordenes, motos, clientes, inventario, citas, cotizaciones] = await Promise.all([
     DB.getAll("ordenes"), DB.getAll("motos"), DB.getAll("clientes"), DB.getAll("inventario"), DB.getAll("citas"),
+    DB.getAll("cotizaciones"),
   ]);
 
   const activas = ordenes.filter(o => o.estado !== "entregado").length;
@@ -1005,6 +1299,8 @@ async function renderDashboard() {
   const citasHoy = citas.filter(c => c.fecha === hoyStr && !citaCerrada(c)).length;
   const mantenimientos = countMantenimientos(motos);
   const repuestosBajos = inventario.filter(r => r.cantidad <= 3).length;
+  // solo las que siguen vivas: una cotización vencida ya no es trabajo por cerrar
+  const cotizacionesVivas = cotizaciones.filter(c => estadoCotizacion(c) === "pendiente");
 
   const now = new Date();
   const ingresosMes = ordenes
@@ -1013,6 +1309,7 @@ async function renderDashboard() {
 
   renderWidgetRow("widgetRow", [
     { ic: "🧾", val: activas, lbl: "Órdenes activas", goto: "ordenes" },
+    { ic: "📝", val: cotizacionesVivas.length, lbl: "Cotizaciones vivas", goto: "cotizaciones" },
     { ic: "📅", val: citasHoy, lbl: "Citas hoy", goto: "citas" },
     { ic: "🛠️", val: mantenimientos, lbl: "Mantenimientos", goto: "clientes" },
     { ic: "📦", val: repuestosBajos, lbl: "Stock bajo", goto: "inventario" },
@@ -1029,6 +1326,11 @@ async function renderDashboard() {
       <span class="big">${money(ingresosMes)}</span>
       <span class="sub">De órdenes entregadas en ${esc(now.toLocaleDateString("es-HN", { month: "long" }))}</span>
     </div>
+    <button type="button" class="widget-card" id="cardCotizaciones" style="text-align:left; font-family:inherit; cursor:pointer;">
+      <span class="eyebrow">Cotizado sin cerrar</span>
+      <span class="big">${money(cotizacionesVivas.reduce((s, c) => s + totalCotizacion(c), 0))}</span>
+      <span class="sub">${cotizacionesVivas.length} esperando respuesta del cliente</span>
+    </button>
     <button type="button" class="widget-card ${mantenimientos > 0 ? "tint-amber" : ""}" id="cardMantenimientos" style="text-align:left; font-family:inherit; cursor:pointer;">
       <span class="eyebrow">Mantenimientos</span>
       <span class="big">${mantenimientos}</span>
@@ -1040,6 +1342,11 @@ async function renderDashboard() {
       <div class="seg-legend">${porEtapa.map(s => `<span><span class="dot" style="background:${stageColor[s.key]}"></span>${esc(s.label)} <b>${s.count}</b></span>`).join("")}</div>
     </div>
   `;
+  document.getElementById("cardCotizaciones").addEventListener("click", () => {
+    showView("cotizaciones");
+    document.querySelectorAll(".nav-item[data-view]").forEach(b => b.classList.toggle("active", b.dataset.view === "cotizaciones"));
+    renderCotizaciones();
+  });
   document.getElementById("cardMantenimientos").addEventListener("click", () => {
     showView("clientes");
     document.querySelectorAll(".nav-item[data-view]").forEach(b => b.classList.toggle("active", b.dataset.view === "clientes"));
@@ -1249,6 +1556,7 @@ function updateActionBar(o) {
   const badge = document.getElementById("finalizadoBadge");
 
   btnFactura.style.display = isLast ? "inline-flex" : "none";
+  document.getElementById("btnEnviarFacturaWA").style.display = isLast ? "inline-flex" : "none";
 
   if (o.finalizada) {
     btnAvanzar.style.display = "none";
@@ -1845,27 +2153,630 @@ document.getElementById("btnEnviarProgresoWA").addEventListener("click", () => {
   navegarWA(ventana, cliente.telefono, texto);
 });
 
-/* ---- imprimir factura ---- */
-document.getElementById("btnImprimirFactura").addEventListener("click", () => {
-  const ventana = abrirVentanaImpresion(); // sincrónico, antes que nada
+/* ---- factura de la orden: imprimirla o mandarla como archivo ----
+   Llenar la plantilla es lo mismo en los dos casos, así que va aparte y
+   devuelve además cómo se debe llamar el archivo y qué texto lo acompaña. */
+function llenarFacturaOrden() {
   // sincrónico a propósito: usa lo que openOrder() ya dejó en currentOrderCache
   // en vez de volver a leer con await — así el clic sigue "fresco" para que el
   // navegador permita el diálogo de impresión (ver nota en currentOrderCache).
   const { o, moto, cliente } = currentOrderCache;
   const items = o.items || [];
   const total = items.reduce((s, it) => s + it.cantidad * it.precio, 0);
+  const motoDesc = `${moto.marca} ${moto.modelo}`.trim();
 
   document.getElementById("facOrdenId").textContent = o.id;
   document.getElementById("facFecha").textContent = new Date().toLocaleDateString();
   document.getElementById("facCliente").textContent = cliente.nombre;
   document.getElementById("facTelefono").textContent = cliente.telefono || "—";
-  document.getElementById("facMoto").textContent = `${moto.marca} ${moto.modelo} · placa ${moto.placa || "s/p"} · ${moto.km || 0} km`;
+  document.getElementById("facMoto").textContent = `${motoDesc} · placa ${moto.placa || "s/p"} · ${moto.km || 0} km`;
   document.getElementById("facItems").innerHTML = items.length
     ? items.map(it => `<tr><td>${esc(it.nombre)}</td><td class="num">${it.cantidad}</td><td class="num">${money(it.precio)}</td><td class="num">${money(it.cantidad * it.precio)}</td></tr>`).join("")
     : `<tr><td colspan="4">Sin ítems</td></tr>`;
   document.getElementById("facTotal").textContent = money(total);
 
+  return {
+    idPlantilla: "facturaPrint",
+    nombreBase: `Factura-orden-${o.id}-${nombreArchivoLimpio(cliente.nombre)}`,
+    titulo: `Factura de la orden #${o.id}`,
+    texto: `Hola ${cliente.nombre}, aquí está la factura del trabajo en tu ${motoDesc} — ENTIMOTORS. Total ${money(total)}.`,
+  };
+}
+
+document.getElementById("btnImprimirFactura").addEventListener("click", () => {
+  const ventana = abrirVentanaImpresion(); // sincrónico, antes que nada
+  llenarFacturaOrden();
   imprimirPlantilla("facturaPrint", null, ventana);
+});
+
+document.getElementById("btnEnviarFacturaWA").addEventListener("click", () => {
+  abrirCompartirDoc(llenarFacturaOrden());
+});
+
+/* ================= COTIZACIONES =================
+   Una cotización es el precio que se le pasa al cliente ANTES de tocar la moto.
+   No mueve inventario ni caja: solo cuando el cliente acepta se convierte en
+   orden de servicio y ahí sí empieza a contar como trabajo real.
+
+   Lo que de verdad hace útil una cotización es la VIGENCIA. Los repuestos suben
+   de precio, así que un presupuesto sin fecha de caducidad es una promesa que el
+   taller no puede sostener. La ley española (que es la referencia más clara que
+   existe sobre esto) obliga a que un presupuesto de taller valga mínimo 12 días
+   hábiles; la práctica común del oficio recomienda entre 15 y 30 días. Por eso
+   el sistema ofrece 7 / 15 / 30 y deja 15 como valor por defecto: es el punto
+   donde el cliente tiene tiempo de decidir y conseguir el dinero, sin que al
+   taller le coma el margen una subida de precios.
+
+   El estado "vencida" NO se guarda: se calcula comparando la fecha de hoy con la
+   de vencimiento. Así una cotización se vence sola aunque nadie abra el sistema
+   ese día, y renovarle la vigencia la revive sin tener que tocar nada más. */
+
+const VALIDEZ_OPCIONES = [7, 15, 30];
+const VALIDEZ_POR_DEFECTO = 15;
+const DIAS_AVISO_VENCIMIENTO = 3; // a partir de aquí se marca "por vencer"
+
+const COT_ESTADO_LABEL = {
+  pendiente: "Pendiente",
+  aceptada: "Aceptada",
+  rechazada: "No aceptó",
+  vencida: "Vencida",
+};
+
+function totalCotizacion(cot) {
+  return (cot.items || []).reduce((s, it) => s + it.cantidad * it.precio, 0);
+}
+
+function fechaVencimiento(fechaISO, dias) {
+  const d = new Date(fechaISO);
+  d.setDate(d.getDate() + Number(dias || VALIDEZ_POR_DEFECTO));
+  d.setHours(23, 59, 59, 999); // vale todo el último día, no hasta la hora exacta
+  return d.toISOString();
+}
+
+/* Se comparan días de calendario, no horas: si no, una cotización hecha a las
+   11 de la noche con 15 días de vigencia decía "16 días más" por culpa de la
+   hora suelta que sobraba en la resta. */
+function diasParaVencer(cot) {
+  const aMedianoche = (fecha) => { const d = new Date(fecha); d.setHours(0, 0, 0, 0); return d.getTime(); };
+  return Math.round((aMedianoche(cot.venceISO) - aMedianoche(Date.now())) / 86400000);
+}
+
+/* El estado que se muestra: los guardados mandan, salvo "pendiente", que se
+   vuelve "vencida" solo por el paso del tiempo. */
+function estadoCotizacion(cot) {
+  if (cot.estado !== "pendiente") return cot.estado;
+  return new Date(cot.venceISO).getTime() < Date.now() ? "vencida" : "pendiente";
+}
+
+function textoVigencia(cot) {
+  const estado = estadoCotizacion(cot);
+  const fecha = new Date(cot.venceISO).toLocaleDateString("es-HN");
+  if (estado === "aceptada") return { clase: "", texto: "Aceptada — pasó a la orden de servicio", fecha: cot.ordenId ? `#${cot.ordenId}` : "" };
+  if (estado === "rechazada") return { clase: "fuera", texto: "El cliente no la aceptó", fecha: "" };
+  if (estado === "vencida") return { clase: "fuera", texto: "Venció el", fecha };
+  const dias = diasParaVencer(cot);
+  if (dias <= DIAS_AVISO_VENCIMIENTO) {
+    const cuando = dias <= 0 ? "Vence hoy" : dias === 1 ? "Vence mañana" : `Vence en ${dias} días`;
+    return { clase: "urge", texto: `${cuando},`, fecha };
+  }
+  return { clase: "", texto: `Este precio se respeta ${dias} días más, hasta el`, fecha };
+}
+
+let cotizacionesCache = {};   // id -> cotización, para no releer la BD en cada clic
+let cotizacionesFiltro = "pendientes";
+let cotizacionDetalleId = null;
+
+async function renderCotizaciones() {
+  const todas = await DB.getAll("cotizaciones");
+  cotizacionesCache = Object.fromEntries(todas.map(c => [c.id, c]));
+
+  const conEstado = todas.map(c => ({ ...c, _estado: estadoCotizacion(c) }));
+  const pendientes = conEstado.filter(c => c._estado === "pendiente");
+  const porVencer = pendientes.filter(c => diasParaVencer(c) <= DIAS_AVISO_VENCIMIENTO);
+  const aceptadas = conEstado.filter(c => c._estado === "aceptada");
+  const vencidas = conEstado.filter(c => c._estado === "vencida");
+
+  const fijarFiltro = (f) => () => { cotizacionesFiltro = cotizacionesFiltro === f ? "todas" : f; renderCotizaciones(); };
+  renderWidgetRow("cotizacionesWidgetRow", [
+    { ic: "📝", val: pendientes.length, lbl: "Pendientes", active: cotizacionesFiltro === "pendientes", onClick: fijarFiltro("pendientes") },
+    { ic: "⏳", val: porVencer.length, lbl: "Por vencer", active: cotizacionesFiltro === "porvencer", onClick: fijarFiltro("porvencer") },
+    { ic: "✅", val: aceptadas.length, lbl: "Aceptadas", active: cotizacionesFiltro === "aceptadas", onClick: fijarFiltro("aceptadas") },
+    { ic: "📋", val: todas.length, lbl: "Todas", active: cotizacionesFiltro === "todas", onClick: () => { cotizacionesFiltro = "todas"; renderCotizaciones(); } },
+  ]);
+
+  // el badge del menú avisa de lo único que corre prisa: lo que está por vencer
+  const badge = document.getElementById("cotizacionesBadge");
+  badge.textContent = porVencer.length;
+  badge.style.display = porVencer.length ? "inline-flex" : "none";
+
+  const porFiltro = {
+    pendientes, aceptadas,
+    porvencer: porVencer,
+    vencidas,
+    todas: conEstado,
+  };
+  let lista = porFiltro[cotizacionesFiltro] || conEstado;
+  lista = [...lista].sort((a, b) => b.id - a.id);
+
+  const cont = document.getElementById("cotizacionesLista");
+  if (!lista.length) {
+    cont.innerHTML = todas.length
+      ? `<div class="empty">Ninguna cotización coincide con este filtro.</div>`
+      : `<div class="empty">Todavía no hay cotizaciones.<br><button class="btn primary small" id="btnEmptyNuevaCot" style="margin-top:0.8rem;">+ Crear la primera</button></div>`;
+    document.getElementById("btnEmptyNuevaCot")?.addEventListener("click", () => document.getElementById("btnNuevaCotizacion").click());
+    return;
+  }
+
+  cont.innerHTML = lista.map(c => {
+    const vig = textoVigencia(c);
+    const dias = diasParaVencer(c);
+    const claseVence = c._estado === "vencida" || c._estado === "rechazada" ? "fuera"
+      : (c._estado === "pendiente" && dias <= DIAS_AVISO_VENCIMIENTO ? "urge" : "");
+    const pill = c._estado === "pendiente" && dias <= DIAS_AVISO_VENCIMIENTO ? "por-vencer" : c._estado;
+    const etiqueta = c._estado === "pendiente" && dias <= DIAS_AVISO_VENCIMIENTO ? "Por vencer" : COT_ESTADO_LABEL[c._estado];
+    return `
+      <div class="cot-row" data-id="${c.id}">
+        <span class="pill ${pill}">${etiqueta}</span>
+        <div class="cot-info">
+          <div class="cot-quien">${esc(c.clienteNombre || "Cliente")}</div>
+          <div class="cot-meta">cotización #${c.id} · ${esc(c.motoDesc || "sin moto")}${c.ordenId ? ` · orden #${c.ordenId}` : ""}</div>
+          <div class="cot-vence ${claseVence}">${esc(vig.texto)} ${esc(vig.fecha)}</div>
+        </div>
+        <span class="cot-monto">${money(totalCotizacion(c))}</span>
+      </div>`;
+  }).join("");
+
+  cont.querySelectorAll(".cot-row").forEach(row => {
+    row.addEventListener("click", () => abrirCotizacionDetalle(Number(row.dataset.id)));
+  });
+}
+
+/* ---- crear / editar ---- */
+let cotClienteSel = null;   // { clienteId, motoId|null } si se eligió uno existente
+let cotItems = [];          // los renglones que se están editando
+let cotEditandoId = null;   // null = nueva
+
+function renderCotClienteChip() {
+  const wrap = document.getElementById("cotClienteChipWrap");
+  wrap.innerHTML = cotClienteSel
+    ? `<span class="selected-chip">Cliente existente seleccionado <button type="button" id="btnQuitarCotClienteSel" title="Quitar selección" aria-label="Quitar cliente seleccionado">✕</button></span>`
+    : "";
+  document.getElementById("btnQuitarCotClienteSel")?.addEventListener("click", () => {
+    cotClienteSel = null;
+    document.getElementById("cotBuscarCliente").value = "";
+    renderCotClienteChip();
+  });
+}
+
+wireAutocompleteCliente(document.getElementById("cotBuscarCliente"), document.getElementById("cotBuscarClienteList"), (cliente, moto) => {
+  cotClienteSel = { clienteId: cliente.id, motoId: moto?.id || null };
+  document.getElementById("cotNombre").value = cliente.nombre;
+  document.getElementById("cotTelefono").value = cliente.telefono || "";
+  document.getElementById("cotMarca").value = moto?.marca || "";
+  document.getElementById("cotModelo").value = moto?.modelo || "";
+  document.getElementById("cotPlaca").value = moto?.placa || "";
+  renderCotClienteChip();
+});
+document.getElementById("cotBuscarCliente").addEventListener("input", () => { cotClienteSel = null; renderCotClienteChip(); });
+
+function renderCotItemsEdit() {
+  const cont = document.getElementById("cotItemsEdit");
+  cont.innerHTML = cotItems.length
+    ? cotItems.map((it, i) => `
+      <div class="cot-item-fila">
+        <span class="nom">${esc(it.nombre)}<small>${it.cantidad} × ${money(it.precio)}${it.inventarioId ? " · del inventario" : ""}</small></span>
+        <span class="sub">${money(it.cantidad * it.precio)}</span>
+        <button type="button" data-quitar="${i}" title="Quitar" aria-label="Quitar ${esc(it.nombre)}">🗑</button>
+      </div>`).join("")
+    : `<div class="cot-vacia">Sin renglones todavía — agrega los repuestos y la mano de obra.</div>`;
+
+  cont.querySelectorAll("[data-quitar]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      cotItems.splice(Number(btn.dataset.quitar), 1);
+      renderCotItemsEdit();
+    });
+  });
+
+  const total = cotItems.reduce((s, it) => s + it.cantidad * it.precio, 0);
+  const repuestos = cotItems.filter(it => it.inventarioId).reduce((s, it) => s + it.cantidad * it.precio, 0);
+  document.getElementById("cotTotalesEdit").innerHTML = `
+    ${repuestos ? `<div><span>Repuestos</span><span>${money(repuestos)}</span></div>
+    <div><span>Otros y mano de obra</span><span>${money(total - repuestos)}</span></div>` : ""}
+    <div class="grande"><span>Total estimado</span><span>${money(total)}</span></div>`;
+}
+
+function actualizarAvisoVigencia() {
+  const dias = Number(document.getElementById("cotValidez").value) || VALIDEZ_POR_DEFECTO;
+  const hasta = new Date(fechaVencimiento(new Date().toISOString(), dias));
+  document.getElementById("cotVenceAviso").textContent =
+    `Se respeta hasta el ${hasta.toLocaleDateString("es-HN")}. Después de esa fecha hay que rehacerla porque los repuestos cambian de precio.`;
+}
+document.getElementById("cotValidez").addEventListener("change", actualizarAvisoVigencia);
+
+function abrirModalCotizacion(cot) {
+  cotEditandoId = cot?.id ?? null;
+  cotItems = cot ? (cot.items || []).map(it => ({ ...it })) : [];
+  cotClienteSel = cot?.clienteId ? { clienteId: cot.clienteId, motoId: cot.motoId || null } : null;
+
+  document.getElementById("cotizacionModalTitulo").textContent = cot ? `Editar cotización #${cot.id}` : "Nueva cotización";
+  document.getElementById("btnGuardarCotizacion").textContent = cot ? "Guardar cambios" : "Guardar cotización";
+  document.getElementById("cotBuscarCliente").value = cot?.clienteNombre || "";
+  document.getElementById("cotNombre").value = cot?.clienteNombre || "";
+  document.getElementById("cotTelefono").value = cot?.clienteTelefono || "";
+  document.getElementById("cotMarca").value = cot?.moto?.marca || "";
+  document.getElementById("cotModelo").value = cot?.moto?.modelo || "";
+  document.getElementById("cotPlaca").value = cot?.moto?.placa || "";
+  document.getElementById("cotDiagnostico").value = cot?.diagnostico || "";
+  document.getElementById("cotNotas").value = cot?.notas || "";
+  document.getElementById("cotValidez").value = String(cot?.validezDias || VALIDEZ_POR_DEFECTO);
+
+  renderCotClienteChip();
+  renderCotItemsEdit();
+  actualizarAvisoVigencia();
+  document.getElementById("modalCotizacion").classList.add("active");
+}
+
+document.getElementById("btnNuevaCotizacion").addEventListener("click", () => abrirModalCotizacion(null));
+document.getElementById("btnCancelarCotizacion").addEventListener("click", () => {
+  document.getElementById("modalCotizacion").classList.remove("active");
+  cotEditandoId = null;
+});
+
+/* ---- el modal de agregar un renglón ---- */
+document.getElementById("btnAgregarItemCot").addEventListener("click", async () => {
+  document.getElementById("cotItemTipo").value = "manual";
+  document.getElementById("cotItemNombre").value = "";
+  document.getElementById("cotItemCantidad").value = "1";
+  document.getElementById("cotItemPrecio").value = "";
+  aplicarTipoItemCot();
+
+  const inv = (await DB.getAll("inventario")).sort((a, b) => a.nombre.localeCompare(b.nombre));
+  document.getElementById("cotItemInvSelect").innerHTML = inv.length
+    ? inv.map(r => `<option value="${r.id}" data-precio="${r.precioVenta || 0}">${esc(r.nombre)} — ${money(r.precioVenta || 0)} (${r.cantidad} en stock)</option>`).join("")
+    : `<option value="">No hay repuestos en el inventario</option>`;
+
+  document.getElementById("modalItemCot").classList.add("active");
+});
+
+function aplicarTipoItemCot() {
+  const desdeInv = document.getElementById("cotItemTipo").value === "inventario";
+  document.getElementById("cotItemManualBox").style.display = desdeInv ? "none" : "block";
+  document.getElementById("cotItemInvBox").style.display = desdeInv ? "block" : "none";
+  if (desdeInv) copiarPrecioDelInventarioCot();
+}
+document.getElementById("cotItemTipo").addEventListener("change", aplicarTipoItemCot);
+
+// al elegir un repuesto se copia su precio de venta, que es justo lo que se
+// quiere cotizar — pero queda editable por si se le hace un descuento
+function copiarPrecioDelInventarioCot() {
+  const sel = document.getElementById("cotItemInvSelect");
+  const opt = sel.options[sel.selectedIndex];
+  if (opt?.dataset.precio) document.getElementById("cotItemPrecio").value = opt.dataset.precio;
+}
+document.getElementById("cotItemInvSelect").addEventListener("change", copiarPrecioDelInventarioCot);
+
+document.getElementById("btnCancelarItemCot").addEventListener("click", () => {
+  document.getElementById("modalItemCot").classList.remove("active");
+});
+
+document.getElementById("btnGuardarItemCot").addEventListener("click", () => {
+  const cantidad = Number(document.getElementById("cotItemCantidad").value) || 0;
+  const precio = Number(document.getElementById("cotItemPrecio").value) || 0;
+  if (cantidad <= 0) { toast("La cantidad debe ser mayor a cero", "off"); return; }
+  if (precio < 0) { toast("El precio no puede ser negativo", "off"); return; }
+
+  const desdeInv = document.getElementById("cotItemTipo").value === "inventario";
+  let nombre, inventarioId = null;
+  if (desdeInv) {
+    const sel = document.getElementById("cotItemInvSelect");
+    if (!sel.value) { toast("Elige un repuesto del inventario", "off"); return; }
+    inventarioId = Number(sel.value);
+    nombre = sel.options[sel.selectedIndex].textContent.split(" — ")[0];
+  } else {
+    nombre = document.getElementById("cotItemNombre").value.trim();
+    if (!nombre) { toast("Falta la descripción del renglón", "off"); return; }
+  }
+
+  cotItems.push({ nombre, cantidad, precio, inventarioId });
+  renderCotItemsEdit();
+  document.getElementById("modalItemCot").classList.remove("active");
+});
+
+/* ---- guardar ---- */
+alHacerClicUnaVez(document.getElementById("btnGuardarCotizacion"), async () => {
+  const nombre = document.getElementById("cotNombre").value.trim() || document.getElementById("cotBuscarCliente").value.trim();
+  if (!nombre) { toast("Falta el nombre del cliente", "off"); return; }
+  if (!cotItems.length) { toast("Agrega al menos un repuesto o la mano de obra", "off"); return; }
+
+  const moto = {
+    marca: document.getElementById("cotMarca").value.trim(),
+    modelo: document.getElementById("cotModelo").value.trim(),
+    placa: document.getElementById("cotPlaca").value.trim(),
+  };
+  const motoDesc = [`${moto.marca} ${moto.modelo}`.trim(), moto.placa ? `placa ${moto.placa}` : ""]
+    .filter(Boolean).join(" · ");
+
+  const validezDias = Number(document.getElementById("cotValidez").value) || VALIDEZ_POR_DEFECTO;
+  const anterior = cotEditandoId ? await DB.get("cotizaciones", cotEditandoId) : null;
+  // al editar se conserva la fecha original: cambiar el precio no debe regalarle
+  // otros 15 días al cliente sin que el taller lo decida (para eso está Renovar)
+  const fechaISO = anterior?.fechaISO || new Date().toISOString();
+
+  const registro = {
+    ...(anterior || {}),
+    clienteId: cotClienteSel?.clienteId ?? null,
+    clienteNombre: nombre,
+    clienteTelefono: document.getElementById("cotTelefono").value.trim(),
+    motoId: cotClienteSel?.motoId ?? null,
+    moto, motoDesc,
+    diagnostico: document.getElementById("cotDiagnostico").value.trim(),
+    notas: document.getElementById("cotNotas").value.trim(),
+    items: cotItems.map(it => ({ ...it })),
+    validezDias,
+    fechaISO,
+    venceISO: fechaVencimiento(fechaISO, validezDias),
+    estado: anterior?.estado || "pendiente",
+    ordenId: anterior?.ordenId ?? null,
+    creadoPor: anterior?.creadoPor || currentUser?.nombre || "—",
+  };
+  if (cotEditandoId) registro.id = cotEditandoId;
+
+  const id = await DB.save("cotizaciones", registro);
+  markDirty();
+  document.getElementById("modalCotizacion").classList.remove("active");
+  toast(cotEditandoId ? "Cotización actualizada" : `Cotización #${id} creada`);
+  cotEditandoId = null;
+  await renderCotizaciones();
+  renderDashboard();
+  abrirCotizacionDetalle(id);
+});
+
+/* ---- detalle ---- */
+async function abrirCotizacionDetalle(id) {
+  const cot = await DB.get("cotizaciones", id);
+  if (!cot) return;
+  cotizacionDetalleId = id;
+  cotizacionesCache[id] = cot;
+
+  const estado = estadoCotizacion(cot);
+  const total = totalCotizacion(cot);
+
+  document.getElementById("cotDetTitulo").textContent = `Cotización #${cot.id}`;
+  document.getElementById("cotDetSub").innerHTML =
+    `${esc(cot.clienteNombre)}${cot.clienteTelefono ? " · " + esc(cot.clienteTelefono) : ""} · ${esc(cot.motoDesc || "sin moto")} · hecha el ${new Date(cot.fechaISO).toLocaleDateString("es-HN")} · <span class="pill ${estado}">${COT_ESTADO_LABEL[estado]}</span>`;
+
+  const vig = textoVigencia(cot);
+  const caja = document.getElementById("cotDetVigencia");
+  caja.className = `cot-vigencia ${vig.clase}`;
+  document.getElementById("cotDetVigenciaTexto").textContent = vig.texto;
+  document.getElementById("cotDetVigenciaFecha").textContent = vig.fecha;
+
+  const diagWrap = document.getElementById("cotDetDiagnosticoWrap");
+  diagWrap.style.display = cot.diagnostico ? "block" : "none";
+  document.getElementById("cotDetDiagnostico").textContent = cot.diagnostico || "";
+
+  document.getElementById("cotDetItems").innerHTML = (cot.items || []).map(it => `
+    <tr><td>${esc(it.nombre)}</td><td class="num">${it.cantidad}</td><td class="num">${money(it.precio)}</td><td class="num">${money(it.cantidad * it.precio)}</td></tr>
+  `).join("");
+
+  const repuestos = (cot.items || []).filter(it => it.inventarioId).reduce((s, it) => s + it.cantidad * it.precio, 0);
+  document.getElementById("cotDetTotales").innerHTML = `
+    ${repuestos ? `<div><span>Repuestos</span><span>${money(repuestos)}</span></div>
+    <div><span>Otros y mano de obra</span><span>${money(total - repuestos)}</span></div>` : ""}
+    <div class="grande"><span>Total estimado</span><span>${money(total)}</span></div>`;
+
+  const notas = document.getElementById("cotDetNotas");
+  notas.style.display = cot.notas ? "block" : "none";
+  notas.textContent = cot.notas ? `Condiciones: ${cot.notas}` : "";
+
+  const convertida = document.getElementById("cotDetConvertida");
+  convertida.style.display = cot.ordenId ? "block" : "none";
+  convertida.textContent = cot.ordenId ? `Ya se convirtió en la orden de servicio #${cot.ordenId}.` : "";
+
+  // una cotización ya aceptada no se vuelve a aceptar ni a editar: lo que manda
+  // a partir de ahí es la orden de servicio
+  const yaCerrada = estado === "aceptada";
+  document.getElementById("btnCotAceptar").style.display = yaCerrada ? "none" : "inline-flex";
+  document.getElementById("btnCotAceptar").textContent = estado === "vencida" ? "✅ Aceptó — revisar precios y crear orden" : "✅ Aceptó — crear orden";
+  document.getElementById("btnCotEditar").style.display = yaCerrada ? "none" : "inline-flex";
+  document.getElementById("btnCotRechazar").style.display = (estado === "pendiente" || estado === "vencida") ? "inline-flex" : "none";
+  document.getElementById("btnCotRenovar").style.display = (estado === "vencida" || estado === "rechazada") ? "inline-flex" : "none";
+  document.getElementById("btnCotEnviarWA").style.display = yaCerrada ? "none" : "inline-flex";
+
+  document.getElementById("modalCotDetalle").classList.add("active");
+}
+
+function cerrarCotDetalle() {
+  document.getElementById("modalCotDetalle").classList.remove("active");
+  cotizacionDetalleId = null;
+}
+document.getElementById("btnCerrarCotDetalle").addEventListener("click", cerrarCotDetalle);
+
+document.getElementById("btnCotEditar").addEventListener("click", async () => {
+  const cot = await DB.get("cotizaciones", cotizacionDetalleId);
+  if (!cot) return;
+  cerrarCotDetalle();
+  abrirModalCotizacion(cot);
+});
+
+/* Renovar la vigencia: se le corre la fecha desde hoy con los mismos días. Es lo
+   que se hace cuando el cliente vuelve tarde y los precios no cambiaron. */
+document.getElementById("btnCotRenovar").addEventListener("click", async () => {
+  const cot = await DB.get("cotizaciones", cotizacionDetalleId);
+  if (!cot) return;
+  const ok = await showConfirm(
+    `Se le vuelven a dar ${cot.validezDias} días desde hoy. Revisa antes que los precios de los repuestos sigan igual.`,
+    { titulo: "Renovar la vigencia", textoOk: "Renovar" }
+  );
+  if (!ok) return;
+  cot.fechaISO = new Date().toISOString();
+  cot.venceISO = fechaVencimiento(cot.fechaISO, cot.validezDias);
+  cot.estado = "pendiente";
+  await DB.save("cotizaciones", cot);
+  markDirty();
+  toast(`Vigente otra vez hasta el ${new Date(cot.venceISO).toLocaleDateString("es-HN")}`);
+  await renderCotizaciones();
+  abrirCotizacionDetalle(cot.id);
+});
+
+document.getElementById("btnCotRechazar").addEventListener("click", async () => {
+  const cot = await DB.get("cotizaciones", cotizacionDetalleId);
+  if (!cot) return;
+  const ok = await showConfirm(
+    "Queda guardada en el historial como no aceptada. Siempre podrás renovarla si el cliente cambia de opinión.",
+    { titulo: "Marcar como no aceptada", textoOk: "Marcar" }
+  );
+  if (!ok) return;
+  cot.estado = "rechazada";
+  cot.cerradaEn = Date.now();
+  await DB.save("cotizaciones", cot);
+  markDirty();
+  toast("Cotización marcada como no aceptada");
+  await renderCotizaciones();
+  abrirCotizacionDetalle(cot.id);
+});
+
+document.getElementById("btnCotEliminar").addEventListener("click", () => {
+  const id = cotizacionDetalleId;
+  requestAdminCode(async () => {
+    await DB.delete("cotizaciones", id);
+    markDirty();
+    toast("Cotización eliminada");
+    cerrarCotDetalle();
+    await renderCotizaciones();
+    renderDashboard();
+  });
+});
+
+/* ---- el cliente aceptó: se vuelve orden de servicio ----
+   Los repuestos que salieron del inventario se descuentan AQUÍ, no al cotizar:
+   cotizar no aparta nada, así que hasta este momento el stock nunca se tocó. Si
+   de algo ya no hay existencias, el renglón igual pasa a la orden pero como ítem
+   manual, y se le avisa al taller — es preferible eso a dejar el inventario en
+   negativo o a bloquear una orden que el cliente ya aprobó. */
+alHacerClicUnaVez(document.getElementById("btnCotAceptar"), async () => {
+  const cot = await DB.get("cotizaciones", cotizacionDetalleId);
+  if (!cot) return;
+  if (cot.ordenId) { toast(`Esta cotización ya es la orden #${cot.ordenId}`, "off"); return; }
+
+  // aceptar una cotización vencida es válido, pero el taller tiene que confirmar
+  // a mano que los precios no se movieron desde que la hizo
+  if (estadoCotizacion(cot) === "vencida") {
+    const seguir = await showConfirm(
+      `Esta cotización venció el ${new Date(cot.venceISO).toLocaleDateString("es-HN")}. Revisa que los precios de los repuestos sigan igual antes de crear la orden.`,
+      { titulo: "La cotización está vencida", textoOk: "Los precios siguen igual" }
+    );
+    if (!seguir) return;
+    cot.fechaISO = new Date().toISOString();
+    cot.venceISO = fechaVencimiento(cot.fechaISO, cot.validezDias);
+  }
+
+  let clienteId = cot.clienteId;
+  let motoId = cot.motoId;
+
+  if (!clienteId) {
+    if (!(await checkDuplicateBeforeCreate(cot.clienteNombre, cot.clienteTelefono))) return;
+    clienteId = await DB.save("clientes", { nombre: cot.clienteNombre, telefono: cot.clienteTelefono || "" });
+    markDirty();
+  }
+  if (!motoId) {
+    motoId = await DB.save("motos", {
+      clienteId,
+      marca: cot.moto?.marca || "—",
+      modelo: cot.moto?.modelo || "",
+      placa: cot.moto?.placa || "",
+      km: 0,
+    });
+    markDirty();
+  }
+
+  const inventario = await DB.getAll("inventario");
+  const items = [];
+  const sinStock = [];
+  let descontados = 0;
+
+  for (const it of (cot.items || [])) {
+    const rep = it.inventarioId ? inventario.find(r => r.id === it.inventarioId) : null;
+    if (rep && rep.cantidad >= it.cantidad) {
+      rep.cantidad -= it.cantidad;
+      await DB.save("inventario", rep);
+      descontados++;
+      items.push({ nombre: it.nombre, cantidad: it.cantidad, precio: it.precio, origenInventarioId: rep.id });
+    } else {
+      if (rep) sinStock.push(it.nombre);
+      items.push({ nombre: it.nombre, cantidad: it.cantidad, precio: it.precio, origenInventarioId: null });
+    }
+  }
+  if (descontados) markDirty();
+
+  const ordenId = await DB.save("ordenes", {
+    clienteId, motoId, estado: "recibido",
+    falla: cot.diagnostico || `Trabajo cotizado en la cotización #${cot.id}`,
+    items, fotos: [], aprobacion: null,
+    diagnostico: null, reparacionNotas: "", calidadChecklist: null,
+    mecanico: currentUser?.nombre || "—",
+    citaId: null, citaFechaISO: null,
+    cotizacionId: cot.id,
+    creadoEn: Date.now(),
+  });
+  markDirty();
+
+  cot.estado = "aceptada";
+  cot.ordenId = ordenId;
+  cot.aceptadaEn = Date.now();
+  await DB.save("cotizaciones", cot);
+  markDirty();
+
+  cerrarCotDetalle();
+  toast(sinStock.length
+    ? `Orden #${ordenId} creada · sin stock de: ${sinStock.join(", ")}`
+    : `Orden #${ordenId} creada desde la cotización`, sinStock.length ? "off" : undefined);
+  await renderCotizaciones();
+  await renderOrdersList();
+  renderDashboard();
+  openOrder(ordenId);
+});
+
+/* ---- imprimir y enviar ---- */
+function llenarCotizacionPrint(cot) {
+  if (!cot) return null;
+  const total = totalCotizacion(cot);
+  const vence = new Date(cot.venceISO);
+
+  document.getElementById("cotPrintId").textContent = cot.id;
+  document.getElementById("cotPrintFecha").textContent = new Date(cot.fechaISO).toLocaleDateString("es-HN");
+  document.getElementById("cotPrintCliente").textContent = cot.clienteNombre || "Cliente";
+  document.getElementById("cotPrintTelefono").textContent = cot.clienteTelefono ? ` — ${cot.clienteTelefono}` : "";
+  document.getElementById("cotPrintMotoBlock").style.display = cot.motoDesc ? "block" : "none";
+  document.getElementById("cotPrintMoto").textContent = cot.motoDesc || "";
+  document.getElementById("cotPrintDiagBlock").style.display = cot.diagnostico ? "block" : "none";
+  document.getElementById("cotPrintDiagnostico").textContent = cot.diagnostico || "";
+  document.getElementById("cotPrintItems").innerHTML = (cot.items || []).map(it => `
+    <tr><td>${esc(it.nombre)}</td><td class="num">${it.cantidad}</td><td class="num">${money(it.precio)}</td><td class="num">${money(it.cantidad * it.precio)}</td></tr>
+  `).join("");
+  document.getElementById("cotPrintTotal").textContent = money(total);
+  document.getElementById("cotPrintVence").textContent = vence.toLocaleDateString("es-HN");
+  document.getElementById("cotPrintValidezDias").textContent = `(${cot.validezDias} días desde que se hizo)`;
+  const notas = document.getElementById("cotPrintNotas");
+  notas.style.display = cot.notas ? "block" : "none";
+  notas.textContent = cot.notas ? `Condiciones: ${cot.notas}` : "";
+
+  return {
+    idPlantilla: "cotizacionPrint",
+    nombreBase: `Cotizacion-${cot.id}-${nombreArchivoLimpio(cot.clienteNombre)}`,
+    titulo: `Cotización #${cot.id}`,
+    texto: `Hola ${cot.clienteNombre}, aquí está la cotización de ENTIMOTORS por ${money(total)}. Este precio se respeta hasta el ${vence.toLocaleDateString("es-HN")}.`,
+  };
+}
+
+document.getElementById("btnCotImprimir").addEventListener("click", () => {
+  const ventana = abrirVentanaImpresion(); // sincrónico, antes que nada
+  if (!llenarCotizacionPrint(cotizacionesCache[cotizacionDetalleId])) { ventana?.close(); return; }
+  imprimirPlantilla("cotizacionPrint", "print-cotizacion", ventana);
+});
+
+document.getElementById("btnCotEnviarWA").addEventListener("click", () => {
+  abrirCompartirDoc(llenarCotizacionPrint(cotizacionesCache[cotizacionDetalleId]));
 });
 
 /* ================= CITAS ================= */
@@ -2860,7 +3771,15 @@ document.getElementById("csvInput").addEventListener("change", async (e) => {
   for (const row of rows) {
     const [nombre, cantidad, precio, modelo] = row.split(",").map(s => (s || "").trim());
     if (!nombre || nombre.toLowerCase() === "nombre") continue;
-    await DB.save("inventario", { nombre, modelo: modelo || "", cantidad: Number(cantidad) || 0, precio: Number(precio) || 0 });
+    // precio y precioVenta van juntos a propósito: el TPV y el inventario leen
+    // "precio", pero el selector de repuestos de órdenes y cotizaciones lee
+    // "precioVenta" — guardar solo uno dejaba lo importado ofreciéndose a L. 0.00.
+    const precioNum = Number(precio) || 0;
+    await DB.save("inventario", {
+      nombre, modelo: modelo || "", cantidad: Number(cantidad) || 0,
+      precio: precioNum, precioVenta: precioNum,
+      costoCompra: 0, stockMinimo: 3, codigoBarras: "", categoriaId: null, publicarEnWeb: false,
+    });
     count++;
   }
   markDirty();
@@ -3210,7 +4129,7 @@ async function cobrarVentaPOS(metodoPago, efectivoRecibido) {
     });
     markDirty();
     ultimoTicket = { id, venta };
-    document.getElementById("btnReimprimirTicket").style.display = "block";
+    document.getElementById("ticketAcciones").style.display = "grid";
     imprimirTicketPOS(id, venta, abrirVentanaImpresion());
     toast(`Venta #${id} registrada por ${money(total)}`);
     posCarrito = [];
@@ -3241,7 +4160,12 @@ document.getElementById("btnReimprimirTicket").addEventListener("click", () => {
   imprimirTicketPOS(ultimoTicket.id, ultimoTicket.venta, abrirVentanaImpresion());
 });
 
-function imprimirTicketPOS(ventaId, venta, ventana) {
+document.getElementById("btnEnviarTicket").addEventListener("click", () => {
+  if (!ultimoTicket) return;
+  abrirCompartirDoc(llenarTicketPOS(ultimoTicket.id, ultimoTicket.venta));
+});
+
+function llenarTicketPOS(ventaId, venta) {
   document.getElementById("ticketFecha").textContent = new Date(venta.fechaISO).toLocaleString("es-HN");
   const clienteRow = document.getElementById("ticketClienteRow");
   if (venta.clienteNombre) {
@@ -3257,6 +4181,17 @@ function imprimirTicketPOS(ventaId, venta, ventana) {
   document.getElementById("ticketMetodo").textContent = { efectivo: "Efectivo", transferencia: "Transferencia", tarjeta: "Tarjeta" }[venta.metodoPago] || venta.metodoPago;
   document.getElementById("ticketCambioRow").style.display = venta.metodoPago === "efectivo" ? "flex" : "none";
   document.getElementById("ticketCambio").textContent = money(venta.cambio || 0);
+
+  return {
+    idPlantilla: "ticketPrint",
+    nombreBase: `Ticket-${ventaId}-ENTIMOTORS`,
+    titulo: `Ticket de venta #${ventaId}`,
+    texto: `Gracias por tu compra en ENTIMOTORS. Total ${money(venta.total)}.`,
+  };
+}
+
+function imprimirTicketPOS(ventaId, venta, ventana) {
+  llenarTicketPOS(ventaId, venta);
   imprimirPlantilla("ticketPrint", "print-ticket", ventana);
 }
 
@@ -3511,18 +4446,32 @@ document.getElementById("creditosFiltro").querySelectorAll(".cat-chip").forEach(
   });
 });
 
-function imprimirFacturaCredito(cred, ventana) {
-  if (!cred) { ventana?.close(); return; }
+function llenarFacturaCredito(cred) {
+  if (!cred) return null;
   document.getElementById("credFacId").textContent = cred.id;
   document.getElementById("credFacFecha").textContent = new Date(cred.fechaISO).toLocaleDateString("es-HN");
   document.getElementById("credFacCliente").textContent = cred.clienteNombre || "Cliente de mostrador";
-  document.getElementById("credFacTelefono").textContent = cred.clienteTelefono || "";
+  document.getElementById("credFacTelefono").textContent = cred.clienteTelefono ? ` — ${cred.clienteTelefono}` : "";
   document.getElementById("credFacItems").innerHTML = cred.items.map(it => `
     <tr><td>${esc(it.nombre)}</td><td class="num">${it.cantidad}</td><td class="num">${money(it.precio)}</td><td class="num">${money(it.cantidad * it.precio)}</td></tr>
   `).join("");
   document.getElementById("credFacTotal").textContent = money(cred.total);
   document.getElementById("credFacAbonado").textContent = money(cred.abonado);
   document.getElementById("credFacSaldo").textContent = money(cred.saldo);
+
+  const nombre = cred.clienteNombre || "Cliente de mostrador";
+  return {
+    idPlantilla: "creditoPrint",
+    nombreBase: `Credito-${cred.id}-${nombreArchivoLimpio(nombre)}`,
+    titulo: `Factura a crédito #${cred.id}`,
+    texto: cred.saldo > 0.01
+      ? `Hola ${nombre}, aquí está tu factura a crédito de ENTIMOTORS. Total ${money(cred.total)} · abonado ${money(cred.abonado)} · queda debiendo ${money(cred.saldo)}.`
+      : `Hola ${nombre}, aquí está tu factura de ENTIMOTORS, ya cancelada por completo. Total ${money(cred.total)}.`,
+  };
+}
+
+function imprimirFacturaCredito(cred, ventana) {
+  if (!llenarFacturaCredito(cred)) { ventana?.close(); return; }
   imprimirPlantilla("creditoPrint", "print-credito", ventana);
 }
 
@@ -3568,6 +4517,7 @@ function abrirCreditoDetalle(clave) {
       ${c.nota ? `<p class="hint" style="margin:0.4rem 0 0;">Nota: ${esc(c.nota)}</p>` : ""}
       <div class="cred-factura-acciones">
         ${c.estado !== "pagado" ? `<button type="button" class="btn small" data-act="abonar">Abonar</button>` : ""}
+        <button type="button" class="btn wa small" data-act="enviar">📲 Enviar</button>
         <button type="button" class="btn ghost small" data-act="imprimir">🖨️ Factura</button>
         ${c.abonado === 0 ? `<button type="button" class="btn ghost small danger" data-act="eliminar">🗑</button>` : ""}
       </div>
@@ -3591,6 +4541,7 @@ document.getElementById("credDetLista").addEventListener("click", (e) => {
   const act = btn.dataset.act;
 
   if (act === "imprimir") { imprimirFacturaCredito(creditosCache[id], abrirVentanaImpresion()); return; }
+  if (act === "enviar") { abrirCompartirDoc(llenarFacturaCredito(creditosCache[id])); return; }
   if (act === "abonar") {
     document.getElementById("modalCreditoDetalle").classList.remove("active");
     abrirModalAbonoCredito(id);
@@ -3624,13 +4575,12 @@ document.getElementById("btnDetRecordar").addEventListener("click", () => {
 });
 
 // estado de cuenta: todas las facturas del cliente en un solo documento
-document.getElementById("btnDetEstadoCuenta").addEventListener("click", () => {
-  const ventana = abrirVentanaImpresion(); // sincrónico, antes que nada
+function llenarEstadoCuenta() {
   const g = creditosPorCliente[creditoDetalleClave];
-  if (!g) { ventana?.close(); return; }
+  if (!g) return null;
   document.getElementById("edcFecha").textContent = new Date().toLocaleDateString("es-HN");
   document.getElementById("edcCliente").textContent = g.nombre;
-  document.getElementById("edcTelefono").textContent = g.telefono || "";
+  document.getElementById("edcTelefono").textContent = g.telefono ? ` — ${g.telefono}` : "";
   document.getElementById("edcFacturas").innerHTML = g.creditos.map(c => `
     <div class="edc-factura">
       <div class="edc-factura-head">Crédito #${c.id} — ${new Date(c.fechaISO).toLocaleDateString("es-HN")}</div>
@@ -3646,7 +4596,23 @@ document.getElementById("btnDetEstadoCuenta").addEventListener("click", () => {
   document.getElementById("edcTotal").textContent = money(g.total);
   document.getElementById("edcAbonado").textContent = money(g.abonado);
   document.getElementById("edcSaldo").textContent = money(g.saldo);
+
+  return {
+    idPlantilla: "estadoCuentaPrint",
+    nombreBase: `Estado-de-cuenta-${nombreArchivoLimpio(g.nombre)}`,
+    titulo: `Estado de cuenta de ${g.nombre}`,
+    texto: `Hola ${g.nombre}, aquí está tu estado de cuenta con ENTIMOTORS: ${g.creditos.length} factura${g.creditos.length === 1 ? "" : "s"} · saldo pendiente ${money(g.saldo)}.`,
+  };
+}
+
+document.getElementById("btnDetEstadoCuenta").addEventListener("click", () => {
+  const ventana = abrirVentanaImpresion(); // sincrónico, antes que nada
+  if (!llenarEstadoCuenta()) { ventana?.close(); return; }
   imprimirPlantilla("estadoCuentaPrint", "print-estado", ventana);
+});
+
+document.getElementById("btnDetEnviarEstadoCuenta").addEventListener("click", () => {
+  abrirCompartirDoc(llenarEstadoCuenta());
 });
 
 /* ---- registrar abono ---- */
@@ -4206,6 +5172,7 @@ async function continuarArranque(modo) {
   await renderClientes();
   await renderInventario();
   await renderCitasList();
+  await renderCotizaciones();
   await renderPOS();
   await renderFinanzas();
   await renderWebCMS();
