@@ -233,6 +233,8 @@
   .pill.parcial { background: var(--amber-soft); color: var(--amber); }
   .pill.pagado { background: var(--green-soft); color: var(--green); }
   .pill.aceptada { background: var(--green-soft); color: var(--green); }
+  /* candado de los movimientos de caja que respaldan otra operación */
+  .mov-ligado { color: var(--text-faint); font-size: 0.85rem; cursor: help; }
   .pill.rechazada { background: var(--panel-strong); color: var(--text-faint); }
   .pill.vencida { background: var(--panel-strong); color: var(--text-faint); }
   .pill.por-vencer { background: var(--amber-soft); color: var(--amber); }
@@ -331,6 +333,14 @@
 
   .modal-bg { position: fixed; inset: 0; background: rgba(0,0,0,0.55); display: none; align-items: center; justify-content: center; z-index: 40; padding: 1rem; }
   .modal-bg.active { display: flex; }
+  /* Los modales de confirmación se abren DESDE otros modales, así que tienen que
+     quedar por encima siempre. Con el mismo z-index mandaba el orden del HTML:
+     cualquier modal escrito más abajo en el archivo tapaba al del código de
+     administrador y al de confirmar, y la persona no podía ni escribir el código
+     ni tocar el botón — la acción quedaba muerta sin ningún mensaje.
+     Le pasaba al aviso de choque de horario al mover una cita, y a cualquier
+     confirmación que se pidiera desde un modal declarado más abajo. */
+  #modalAdminCode, #modalConfirm, #modalPrompt { z-index: 60; }
   .modal { background: var(--bg-raise); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); max-width: 480px; width: 100%; padding: 1.4rem; max-height: 88vh; overflow-y: auto; }
   .modal h3 { font-family: 'Teko', sans-serif; text-transform: uppercase; font-size: 1.3rem; margin-bottom: 0.8rem; }
   .modal-actions { display: flex; justify-content: flex-end; gap: 0.5rem; margin-top: 0.6rem; }
@@ -834,6 +844,29 @@
   .compartir-archivo { display: flex; align-items: center; gap: 0.7rem; text-align: left; }
   .compartir-archivo .ico { font-size: 2.1rem; line-height: 1; }
   .compartir-archivo b { display: block; font-size: 0.85rem; word-break: break-all; }
+
+  /* ---- respaldo, restauración y aviso de versión ---- */
+  .respaldo-estado {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 0.55rem;
+    padding: 0.7rem 0.85rem; margin-bottom: 0.9rem; font-size: 0.83rem; line-height: 1.5;
+  }
+  .respaldo-estado.ok { background: var(--green-soft); border-color: rgba(46,160,90,0.32); }
+  .respaldo-estado.mal { background: var(--red-soft); border-color: var(--red-border); }
+  .respaldo-estado b { color: var(--text); }
+  .respaldo-conteos {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(118px, 1fr));
+    gap: 0.25rem 0.8rem; margin-top: 0.5rem;
+  }
+  .respaldo-conteos span { display: flex; justify-content: space-between; gap: 0.5rem; font-size: 0.78rem; }
+  .respaldo-conteos span b { font-variant-numeric: tabular-nums; }
+  .respaldo-conteos span.nuevo b { color: var(--green); }
+
+  .aviso-fuerte {
+    background: var(--amber-soft); border: 1px solid rgba(245,165,36,0.32);
+    border-radius: 0.55rem; padding: 0.7rem 0.85rem; margin-bottom: 0.9rem;
+    font-size: 0.83rem; line-height: 1.5;
+  }
+  .aviso-fuerte.peligro { background: var(--red-soft); border-color: var(--red-border); }
   .compartir-archivo span.peso { font-size: 0.75rem; color: var(--text-faint); }
   /* la línea de "queda debiendo" es el dato que el cliente pregunta de una vez */
   .saldo-aviso {
@@ -1085,6 +1118,7 @@
         <div>
           <h2 id="detalleTitulo">Orden</h2>
           <p id="detalleSub"></p>
+          <p id="detalleMecanicoWrap" style="margin:0.2rem 0 0; font-size:0.85rem; color:var(--text-muted);"></p>
         </div>
         <button class="btn ghost" id="btnVolverOrdenes">&larr; Volver</button>
       </div>
@@ -1254,6 +1288,27 @@
       <div class="fin-section-label">Resumen financiero</div>
       <div class="widget-grid" id="finanzasResumen"></div>
 
+      <div class="dash-section-head" style="margin-top:1.2rem;">
+        <h3>Rendimiento por área y mecánico</h3>
+        <span class="demo-flag">Usa el mismo rango que "Movimientos" abajo — atajo rápido o edítalo a mano</span>
+      </div>
+      <div class="pos-cats" id="finPeriodoRapido">
+        <button type="button" class="cat-chip" data-periodo="hoy">Hoy</button>
+        <button type="button" class="cat-chip" data-periodo="semana">Semana</button>
+        <button type="button" class="cat-chip" data-periodo="mes">Mes</button>
+        <button type="button" class="cat-chip" data-periodo="rango">Rango personalizado</button>
+      </div>
+      <div class="widget-grid" id="rendimientoResumen"></div>
+      <div class="card fin-table-card">
+        <div class="table-scroll">
+        <table>
+          <thead><tr><th>Mecánico</th><th class="num">Pendientes</th><th class="num">Completados</th><th class="num">Producido</th><th class="num">Promedio</th></tr></thead>
+          <tbody id="rendimientoBody"></tbody>
+        </table>
+        </div>
+        <div class="empty" id="rendimientoEmpty" style="display:none;">Sin trabajos de taller cobrados en este rango.</div>
+      </div>
+
       <div class="dash-section-head" style="margin-top:0.6rem;">
         <h3>Libro de caja</h3>
         <span class="demo-flag">Cada movimiento queda con fecha, método de pago y quién lo registró</span>
@@ -1380,15 +1435,21 @@
 
       <div class="card">
         <h3 class="font-display" style="font-size:0.95rem; margin-bottom:0.4rem;">Respaldar datos</h3>
-        <p class="hint" style="margin-top:0;">Descarga un archivo con todo lo guardado (clientes, órdenes, inventario, ventas, caja, contenido de la web). Guárdalo en un lugar seguro — en tu correo, en la nube, donde prefieras.</p>
-        <button class="btn primary small" id="btnRespaldarDatos">Descargar respaldo</button>
+        <p class="hint" style="margin-top:0;">Guarda un archivo con TODO lo de este dispositivo. Antes de dártelo se vuelve a leer y se comprueba registro por registro, así sabes que el respaldo sirve de verdad.</p>
+        <div id="respaldoEstado" class="respaldo-estado" style="display:none;"></div>
+        <div style="display:flex; gap:0.5rem; flex-wrap:wrap;">
+          <button class="btn wa small" id="btnCompartirRespaldo">📲 Compartir copia</button>
+          <button class="btn primary small" id="btnRespaldarDatos">⬇️ Descargar copia</button>
+        </div>
+        <p class="hint" style="margin:0.6rem 0 0;">Compartir abre el menú del teléfono: puedes mandártela por WhatsApp a ti mismo, guardarla en Archivos o pasársela a otra persona.</p>
+        <p class="hint" style="margin:0.35rem 0 0;" id="ultimoRespaldoInfo"></p>
       </div>
 
       <div class="card" style="margin-top:1rem;">
         <h3 class="font-display" style="font-size:0.95rem; margin-bottom:0.4rem;">Restaurar desde un respaldo</h3>
-        <p class="hint" style="margin-top:0;">Esto reemplaza TODO lo que hay ahora mismo en este dispositivo por lo que traiga el archivo. Úsalo si cambiaste de celular o si necesitas recuperar información.</p>
+        <p class="hint" style="margin-top:0;">Elige el archivo y te mostramos qué trae antes de tocar nada. Después decides si reemplaza lo que hay o si se suma.</p>
         <label class="btn small" for="inputRestaurar" style="cursor:pointer; display:inline-block;">Elegir archivo de respaldo</label>
-        <input type="file" id="inputRestaurar" accept="application/json" style="display:none;">
+        <input type="file" id="inputRestaurar" accept="application/json,.json" style="display:none;">
       </div>
 
       <div class="card" style="margin-top:1rem;">
@@ -1478,6 +1539,15 @@
       <div><label>Marca</label><input type="text" id="ordenMarca" placeholder="Honda"></div>
       <div><label>Modelo</label><input type="text" id="ordenModelo" placeholder="CB190R"></div>
       <div><label>Km actual</label><input type="number" id="ordenKm" min="0"></div>
+    </div>
+    <div class="field-row">
+      <div><label>Mecánico asignado</label><select id="ordenMecanico"></select></div>
+      <div><label>Origen del trabajo</label>
+        <select id="ordenOrigenTrabajo">
+          <option value="taller">Taller</option>
+          <option value="negocio">Negocio</option>
+        </select>
+      </div>
     </div>
     <label>Foto de la moto que va a arreglar</label>
     <input type="file" id="ordenFoto" accept="image/*">
@@ -2038,6 +2108,56 @@
   </div>
 </div>
 
+<!-- Modal: qué trae el respaldo y cómo restaurarlo.
+     Restaurar es la operación más destructiva del sistema, así que nunca ocurre
+     sin que la persona vea antes exactamente qué va a entrar y qué va a pasar
+     con lo que ya tiene. -->
+<div class="modal-bg" id="modalRestaurar">
+  <div class="modal">
+    <h3>Restaurar copia de seguridad</h3>
+    <p class="hint" id="restaurarOrigen"></p>
+
+    <div class="respaldo-estado" id="restaurarResumen"></div>
+
+    <label>¿Qué hacemos con lo que ya hay en este dispositivo?</label>
+    <div class="seg-toggle compartir-formato" id="restaurarModo">
+      <button type="button" class="seg-opt active" data-modo="reemplazar">🔄 Reemplazar<small>Queda solo lo del archivo</small></button>
+      <button type="button" class="seg-opt" data-modo="combinar">➕ Combinar<small>Se suma lo que falte</small></button>
+    </div>
+    <p class="hint" id="restaurarExplicacion"></p>
+
+    <div class="aviso-fuerte" id="restaurarAviso"></div>
+
+    <div class="modal-actions">
+      <button class="btn ghost" id="btnCancelarRestaurar">Cancelar</button>
+      <button class="btn primary" id="btnConfirmarRestaurar">Restaurar</button>
+    </div>
+  </div>
+</div>
+
+<!-- Modal: aviso de versión nueva. La app NO se actualiza sola: el cliente
+     tiene información que solo existe en este dispositivo, así que primero se
+     le ofrece la copia de seguridad y él decide cuándo dar el paso. -->
+<div class="modal-bg" id="modalVersionNueva">
+  <div class="modal">
+    <h3>Nueva versión disponible</h3>
+    <p class="hint" id="versionNuevaDetalle"></p>
+
+    <div class="respaldo-estado" id="versionNuevaEstado"></div>
+
+    <div class="aviso-fuerte">
+      Antes de actualizar conviene guardar una copia de toda la información de este
+      dispositivo. Si algo saliera mal, con esa copia se recupera todo.
+    </div>
+
+    <div class="modal-actions" style="flex-direction:column; align-items:stretch; gap:0.5rem;">
+      <button class="btn primary" id="btnCopiaYActualizar">Crear copia y actualizar</button>
+      <button class="btn" id="btnSoloCopia">Solo crear copia de seguridad</button>
+      <button class="btn ghost" id="btnActualizarDespues">Ahora no</button>
+    </div>
+  </div>
+</div>
+
 <!-- Modal: enviar un documento como archivo.
      Es la única forma que funciona siempre: mandar el enlace de la factura no
      sirve porque esa dirección solo existe dentro del teléfono que la generó. -->
@@ -2189,10 +2309,14 @@
   <div style="margin-top:1rem; font-size:0.8rem; color:#666;">Resumen de todas las facturas a crédito de este cliente.</div>
 </div>
 
+<!-- config-local.js es opcional (ignorado por Git): sin él, el login local de
+     TEAM y el código de administrador quedan deshabilitados, pero el resto de
+     la app sigue funcionando igual. Ver config-local.example.js. -->
+<script src="config-local.js?v=3.12.0"></script>
 <!-- el ?v= debe cambiar cada vez que se toque app.js (junto con CACHE_NAME en
      sw.js) — es la forma más universal de forzar que CUALQUIER navegador
      pida el archivo de nuevo aunque ya tenga guardada una copia vieja en su
      propio caché HTTP, sin depender de que respete el Service Worker. -->
-<script src="app.js?v=3.11.0"></script>
+<script src="app.js?v=3.12.0"></script>
 </body>
 </html>

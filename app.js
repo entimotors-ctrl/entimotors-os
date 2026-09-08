@@ -17,18 +17,38 @@ const STAGES = [
   { key: "entregado", label: "Entregado" },
 ];
 
-// Credenciales de demo en texto plano en el cliente: sirven para probar el flujo
-// de login de la PWA, no son autenticación real. Antes de usar esto en el taller
-// de verdad, esto debe validarse contra un backend (igual que el resto de la app).
+// Distingue cada orden entre TALLER (reparación propia del taller — lo que ha
+// sido el 100% de las órdenes hasta ahora) y NEGOCIO (una operación comercial
+// que se registra como orden pero no es trabajo de mecánica). Un registro sin
+// este campo (todo lo anterior a esta versión) se trata como "taller": es lo
+// que siempre significó una orden en este sistema.
+const ORIGENES_TRABAJO = [
+  { key: "taller", label: "Taller" },
+  { key: "negocio", label: "Negocio" },
+];
+function origenTrabajoDe(o) { return o?.origenTrabajo === "negocio" ? "negocio" : "taller"; }
+
+// Equipo del taller para el login local (sin red). Solo datos no secretos:
+// las contraseñas NO viven aquí porque este archivo se descarga completo con
+// cualquier PWA publicada. Viven en taller-demo/config-local.js (ignorado por
+// Git) — ver claveLocal() más abajo. Sin ese archivo, el login local de estos
+// usuarios queda deshabilitado y solo sirve una sesión ya guardada en este
+// dispositivo.
 const TEAM = [
-  { user: "wilkin", nombre: "Wilkin", telefono: "97049635", password: "enti2026", rol: "admin" },
-  { user: "mecanico1", nombre: "Mecánico 1", telefono: "", password: "enti2026", rol: "mecanico" },
-  { user: "mecanico2", nombre: "Mecánico 2", telefono: "", password: "enti2026", rol: "mecanico" },
+  { user: "wilkin", nombre: "Wilkin", telefono: "97049635", rol: "admin" },
+  { user: "mecanico1", nombre: "Mecánico 1", telefono: "", rol: "mecanico" },
+  { user: "mecanico2", nombre: "Mecánico 2", telefono: "", rol: "mecanico" },
   // cuenta aparte solo para pruebas — mismo dispositivo y misma base de datos que
   // "wilkin" (esto no es multi-taller: todos los usuarios ven la misma información
   // guardada en este dispositivo), rol admin para poder probar todas las secciones.
-  { user: "prueba", nombre: "Usuario de Prueba", telefono: "", password: "prueba2026", rol: "admin" },
+  { user: "prueba", nombre: "Usuario de Prueba", telefono: "", rol: "admin" },
 ];
+// Lee la contraseña local de un usuario del equipo desde config-local.js (solo
+// desarrollo, nunca se publica). Si el archivo no existe, devuelve undefined
+// y el login local de TEAM queda simplemente no disponible — no es un error.
+function claveLocal(user) {
+  return window.ENTIMOTORS_LOCAL?.teamPasswords?.[user];
+}
 // Secciones que solo el rol "admin" (dueño) puede ver — un mecánico no necesita
 // entrar a la caja, la web o los respaldos para hacer su trabajo diario.
 const VISTAS_SOLO_ADMIN = ["finanzas", "web-cms", "ajustes"];
@@ -37,10 +57,15 @@ const VISTAS_SOLO_ADMIN = ["finanzas", "web-cms", "ajustes"];
 // taller abre/cierra en otro horario o quieres citas cada X minutos.
 const HORARIO_TALLER = { horaInicio: "08:00", horaFin: "17:00", intervaloMin: 30 };
 
-// Código de administrador para acciones irreversibles (borrar una orden). Igual
-// que las contraseñas de TEAM, es un valor fijo en el cliente para probar el
-// flujo — no reemplaza un permiso real validado por un backend.
-const ADMIN_CODE = "2468";
+// Código de administrador para acciones irreversibles (borrar una orden, una
+// cotización, un movimiento de caja, un crédito; restaurar un respaldo;
+// "Borrar todo"). Es una protección local contra accidentes, NO seguridad
+// real — vive en el cliente y cualquiera con DevTools puede leerlo si
+// config-local.js está presente. El valor real vive en config-local.js
+// (ignorado por Git); sin ese archivo estas acciones no se pueden confirmar.
+function codigoAdminLocal() {
+  return window.ENTIMOTORS_LOCAL?.adminCode;
+}
 
 let db;
 let currentUser = null;
@@ -93,7 +118,7 @@ function navegarWA(ventana, phoneRaw, text) {
 /* ---------------- IndexedDB helper mínimo ---------------- */
 function openDb() {
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open("entimotors_os_demo", 5);
+    const req = indexedDB.open("entimotors_os_demo", 6);
     req.onupgradeneeded = (e) => {
       const d = req.result;
       const t = req.transaction;
@@ -136,6 +161,24 @@ function openDb() {
         s.createIndex("by_cliente", "clienteId");
         s.createIndex("by_estado", "estado");
       }
+      /* Auditoría: quién hizo qué y cuándo. Se escribe desde registrarAuditoria()
+         en las operaciones que mueven dinero o inventario. Nunca se edita: solo
+         se agrega, para que sirva de rastro. */
+      if (!d.objectStoreNames.contains("auditoria")) {
+        const s = d.createObjectStore("auditoria", { keyPath: "id", autoIncrement: true });
+        s.createIndex("by_fecha", "fechaISO");
+        s.createIndex("by_usuario", "usuario");
+        s.createIndex("by_entidad", "entidad");
+      }
+      /* Cola de sincronización (outbox): cada cambio local queda anotado aquí
+         para poder subirlo a Supabase cuando exista conexión, en orden y sin
+         perder nada. Todavía no hay servidor al que subirlo; la cola se llena
+         igual para que el día que lo haya no falte el historial. */
+      if (!d.objectStoreNames.contains("sync_cola")) {
+        const s = d.createObjectStore("sync_cola", { keyPath: "id", autoIncrement: true });
+        s.createIndex("by_estado", "estado");
+        s.createIndex("by_entidad", "entidad");
+      }
       if (!d.objectStoreNames.contains("web_cms")) d.createObjectStore("web_cms", { keyPath: "key" });
       if (!d.objectStoreNames.contains("categorias_inv")) {
         const s = d.createObjectStore("categorias_inv", { keyPath: "id", autoIncrement: true });
@@ -168,6 +211,58 @@ function openDb() {
           if (v.margen === undefined) v.margen = null;
           cur.update(v);
           cur.continue();
+        };
+      }
+      /* v6 · COSTO HISTÓRICO.
+         Hasta la v5 ni las ventas ni los créditos guardaban a cuánto había
+         costado el repuesto: la utilidad se recalculaba con el costo de HOY, así
+         que subir el precio de compra cambiaba hacia atrás la ganancia de ventas
+         ya cerradas, y borrar el repuesto la inflaba a costo cero.
+         Aquí se congela en cada renglón el costo actual como mejor estimación
+         disponible, marcado con costoEstimado:true para no presentarlo como si
+         fuera el costo real de aquel día. De aquí en adelante se guarda en el
+         momento de la venta y ya es exacto. */
+      if (oldV < 6 && oldV > 0) {
+        const costos = {};
+        invStore.openCursor().onsuccess = (ev) => {
+          const cur = ev.target.result;
+          if (cur) { costos[cur.value.id] = cur.value.costoCompra || 0; cur.continue(); return; }
+          // ya se leyeron todos los costos: ahora se sellan las ventas y créditos
+          const sellar = (store) => {
+            if (!d.objectStoreNames.contains(store)) return;
+            t.objectStore(store).openCursor().onsuccess = (e2) => {
+              const c2 = e2.target.result;
+              if (!c2) return;
+              const reg = c2.value;
+              let tocado = false;
+              (reg.items || []).forEach((it) => {
+                if (it.costoUnitario === undefined) {
+                  it.costoUnitario = it.inventarioId ? (costos[it.inventarioId] || 0) : 0;
+                  it.costoEstimado = true;
+                  tocado = true;
+                }
+              });
+              if (tocado) c2.update(reg);
+              c2.continue();
+            };
+          };
+          sellar("ventas_rapidas");
+          sellar("creditos");
+          ordenesStore.openCursor().onsuccess = (e3) => {
+            const c3 = e3.target.result;
+            if (!c3) return;
+            const o = c3.value;
+            let tocado = false;
+            (o.items || []).forEach((it) => {
+              if (it.costoUnitario === undefined) {
+                it.costoUnitario = it.origenInventarioId ? (costos[it.origenInventarioId] || 0) : 0;
+                it.costoEstimado = true;
+                tocado = true;
+              }
+            });
+            if (tocado) c3.update(o);
+            c3.continue();
+          };
         };
       }
     };
@@ -226,7 +321,16 @@ const DB = {
     });
   },
 };
-const ALL_STORES = ["clientes", "motos", "ordenes", "inventario", "citas", "cotizaciones", "ventas_rapidas", "caja_movimientos", "creditos", "web_cms", "categorias_inv"];
+const ALL_STORES = ["clientes", "motos", "ordenes", "inventario", "citas", "cotizaciones", "ventas_rapidas", "caja_movimientos", "creditos", "web_cms", "categorias_inv", "auditoria"];
+// sync_cola queda FUERA del respaldo a propósito: es un registro de "qué falta
+// subir" que solo tiene sentido en el dispositivo donde se generó. Restaurarla
+// en otro equipo reintentaría subir cambios que no le corresponden.
+const STORES_NO_RESPALDABLES = ["sync_cola"];
+// La bitácora se respalda (para no perder el historial al cambiar de equipo)
+// pero al restaurar NUNCA se reemplaza: solo se le suma lo que traiga el
+// archivo. Si restaurar pudiera borrarla, cualquiera taparía un movimiento raro
+// restaurando un respaldo viejo — y entonces la bitácora no probaría nada.
+const STORES_SOLO_AGREGAR = ["auditoria"];
 async function updateOrder(id, mutator) {
   const o = await DB.get("ordenes", id);
   mutator(o);
@@ -253,6 +357,59 @@ const PROGRESO_MENSAJES = {
   entregado: (m) => `¡tu ${m} está lista! Ya puedes pasar a recogerla.`,
 };
 
+/* ---------------- auditoría y cola de sincronización ----------------
+   registrarAuditoria() deja constancia de quién movió dinero o inventario.
+   encolarSync() anota el cambio para poder subirlo a Supabase más adelante.
+   Las dos son "mejor esfuerzo": si fallan, NUNCA deben tumbar la operación
+   real que las llamó — perder una línea de bitácora es malo, perder la venta
+   es peor. Por eso van con catch y sin await bloqueante donde importa. */
+async function registrarAuditoria(accion, entidad, entidadId, detalle) {
+  try {
+    await DB.save("auditoria", {
+      usuario: currentUser?.nombre || "—",
+      usuarioLogin: currentUser?.user || "",
+      rol: currentUser?.rol || "",
+      accion, entidad, entidadId: entidadId ?? null,
+      detalle: detalle || "",
+      fechaISO: new Date().toISOString(),
+      creadoEn: Date.now(),
+    });
+  } catch (e) { /* la bitácora nunca bloquea la operación */ }
+}
+
+async function encolarSync(entidad, entidadId, operacion, datos) {
+  try {
+    await DB.save("sync_cola", {
+      entidad, entidadId: entidadId ?? null, operacion,
+      datos: datos ?? null,
+      estado: "pendiente", intentos: 0,
+      creadoEn: Date.now(), fechaISO: new Date().toISOString(),
+    });
+  } catch (e) { /* igual que la bitácora: nunca bloquea */ }
+}
+
+/* Congela lo que costó cada renglón EN EL MOMENTO de la operación.
+   Sin esto, la utilidad de una venta de hace tres meses se recalculaba con el
+   costo de compra de hoy: subir el precio del proveedor cambiaba hacia atrás
+   ganancias ya cerradas, y borrar el repuesto las inflaba a costo cero. */
+function sellarCostoHistorico(items, inventario) {
+  return (items || []).map((it) => {
+    if (it.costoUnitario !== undefined) return it;
+    const idRep = it.inventarioId ?? it.origenInventarioId ?? null;
+    const rep = idRep ? inventario.find((r) => r.id === idRep) : null;
+    return { ...it, costoUnitario: rep ? (rep.costoCompra || 0) : 0, costoEstimado: false };
+  });
+}
+
+// El costo de un renglón: el que quedó sellado. Solo si es un registro viejo
+// (anterior a la v6) se recurre al costo actual, y se avisa de que es estimado.
+function costoDelItem(it, inventario) {
+  if (it.costoUnitario !== undefined) return it.costoUnitario;
+  const idRep = it.inventarioId ?? it.origenInventarioId ?? null;
+  const rep = idRep ? inventario.find((r) => r.id === idRep) : null;
+  return rep ? (rep.costoCompra || 0) : 0;
+}
+
 /* ---------------- venta rápida (TPV): transacción atómica multi-store ----------------
    IndexedDB ya garantiza atomicidad dentro de una misma transacción: si cualquier
    request falla, el navegador aborta TODA la transacción automáticamente (no hay
@@ -262,6 +419,8 @@ function registrarVentaRapida({ items, clienteId, clienteNombre, metodoPago, efe
     if (!items || !items.length) { reject(new Error("El carrito está vacío")); return; }
 
     const t = db.transaction(["ventas_rapidas", "inventario", "caja_movimientos"], "readwrite");
+    // el faltante que no alcanzó a descontarse, para no perderlo en silencio
+    const faltantes = [];
     const ventasStore = t.objectStore("ventas_rapidas");
     const invStore = t.objectStore("inventario");
     const cajaStore = t.objectStore("caja_movimientos");
@@ -286,16 +445,28 @@ function registrarVentaRapida({ items, clienteId, clienteNombre, metodoPago, efe
       });
     };
 
-    items.forEach((it) => {
+    items.forEach((it, i) => {
       if (!it.inventarioId) return; // ítem manual (mano de obra suelta, etc.) sin control de stock
       const getReq = invStore.get(it.inventarioId);
       getReq.onsuccess = () => {
         const rep = getReq.result;
-        if (rep) { rep.cantidad = Math.max(0, rep.cantidad - it.cantidad); invStore.put(rep); }
+        if (!rep) return;
+        // el costo se sella DENTRO de la transacción: es el dato más fiel
+        // posible del momento exacto de la venta
+        venta.items[i].costoUnitario = rep.costoCompra || 0;
+        venta.items[i].costoEstimado = false;
+        // Math.max(0, …) evita stock negativo, pero antes se tragaba la
+        // diferencia sin dejar rastro: ahora queda anotada.
+        if (rep.cantidad < it.cantidad) {
+          faltantes.push(`${rep.nombre} (pedía ${it.cantidad}, había ${rep.cantidad})`);
+        }
+        rep.cantidad = Math.max(0, rep.cantidad - it.cantidad);
+        invStore.put(rep);
+        ventasStore.put({ ...venta, id: ventaId });
       };
     });
 
-    t.oncomplete = () => resolve({ id: ventaId, total, venta });
+    t.oncomplete = () => resolve({ id: ventaId, total, venta, faltantes });
     t.onerror = () => reject(t.error);
     t.onabort = () => reject(t.error);
   });
@@ -314,6 +485,7 @@ function registrarCredito({ clienteId, clienteNombre, clienteTelefono, items, ve
     const t = db.transaction(["creditos", "inventario"], "readwrite");
     const credStore = t.objectStore("creditos");
     const invStore = t.objectStore("inventario");
+    const faltantes = [];
 
     const total = items.reduce((s, it) => s + it.cantidad * it.precio, 0);
     const fechaISO = new Date().toISOString();
@@ -328,38 +500,85 @@ function registrarCredito({ clienteId, clienteNombre, clienteTelefono, items, ve
     const credReq = credStore.add(credito);
     credReq.onsuccess = () => { credId = credReq.result; };
 
-    items.forEach((it) => {
+    items.forEach((it, i) => {
       if (!it.inventarioId) return;
       const getReq = invStore.get(it.inventarioId);
       getReq.onsuccess = () => {
         const rep = getReq.result;
-        if (rep) { rep.cantidad = Math.max(0, rep.cantidad - it.cantidad); invStore.put(rep); }
+        if (!rep) return;
+        credito.items[i].costoUnitario = rep.costoCompra || 0;
+        credito.items[i].costoEstimado = false;
+        if (rep.cantidad < it.cantidad) faltantes.push(`${rep.nombre} (pedía ${it.cantidad}, había ${rep.cantidad})`);
+        rep.cantidad = Math.max(0, rep.cantidad - it.cantidad);
+        invStore.put(rep);
+        credStore.put({ ...credito, id: credId });
       };
     });
 
-    t.oncomplete = () => resolve({ id: credId, credito });
+    t.oncomplete = () => resolve({ id: credId, credito, faltantes });
     t.onerror = () => reject(t.error);
     t.onabort = () => reject(t.error);
   });
 }
 
-async function registrarAbonoCredito(creditoId, monto, metodoPago) {
-  const cred = await DB.get("creditos", creditoId);
-  if (!cred) throw new Error("Crédito no encontrado");
-  const abonado = cred.abonado + monto;
-  const saldo = Math.max(0, cred.total - abonado);
-  cred.abonado = abonado;
-  cred.saldo = saldo;
-  cred.estado = saldo <= 0 ? "pagado" : "parcial";
-  cred.historialAbonos = (cred.historialAbonos || []).concat([{ monto, metodoPago, fechaISO: new Date().toISOString() }]);
-  await DB.save("creditos", cred);
-  await DB.save("caja_movimientos", {
-    tipo: "ingreso", categoria: "Cobro de crédito", monto, metodoPago,
-    descripcion: `Abono crédito #${creditoId} — ${cred.clienteNombre}`, creditoId,
-    fechaISO: new Date().toISOString(), creadoEn: Date.now(),
+/* El abono baja el saldo del crédito Y mete el dinero en caja. Antes eran dos
+   guardados sueltos: si el segundo fallaba —o se cerraba la pestaña entre uno y
+   otro— el crédito quedaba cobrado y la plata no aparecía en ninguna parte del
+   libro de caja. Ahora las dos escrituras van en la MISMA transacción de
+   IndexedDB: o entran las dos, o no entra ninguna.
+
+   idAbono además hace la operación idempotente: si el mismo abono se manda dos
+   veces (doble toque, reintento), la segunda se ignora en vez de cobrar doble. */
+function registrarAbonoCredito(creditoId, monto, metodoPago, idAbono) {
+  return new Promise((resolve, reject) => {
+    const t = db.transaction(["creditos", "caja_movimientos"], "readwrite");
+    const credStore = t.objectStore("creditos");
+    const fechaISO = new Date().toISOString();
+    const clave = idAbono || `${creditoId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    let resultado = null;
+    let duplicado = false;
+
+    const getReq = credStore.get(creditoId);
+    getReq.onsuccess = () => {
+      const cred = getReq.result;
+      if (!cred) { t.abort(); return; }
+
+      // ¿ya se aplicó este mismo abono? entonces no se vuelve a cobrar
+      if ((cred.historialAbonos || []).some((a) => a.idAbono && a.idAbono === clave)) {
+        duplicado = true;
+        resultado = cred;
+        return;
+      }
+
+      const abonado = cred.abonado + monto;
+      const saldo = Math.max(0, cred.total - abonado);
+      cred.abonado = abonado;
+      cred.saldo = saldo;
+      cred.estado = saldo <= 0 ? "pagado" : "parcial";
+      cred.historialAbonos = (cred.historialAbonos || []).concat([{ idAbono: clave, monto, metodoPago, fechaISO }]);
+      cred.actualizadoEn = Date.now();
+      credStore.put(cred);
+
+      t.objectStore("caja_movimientos").add({
+        tipo: "ingreso", categoria: "Cobro de crédito", monto, metodoPago,
+        descripcion: `Abono crédito #${creditoId} — ${cred.clienteNombre}`, creditoId,
+        idAbono: clave, fechaISO, creadoEn: Date.now(),
+      });
+      resultado = cred;
+    };
+
+    t.oncomplete = () => {
+      if (!resultado) { reject(new Error("Crédito no encontrado")); return; }
+      if (!duplicado) {
+        markDirty();
+        registrarAuditoria("abono", "creditos", creditoId, `${money(monto)} por ${metodoPago} · saldo ${money(resultado.saldo)}`);
+        encolarSync("creditos", creditoId, "abono", { monto, metodoPago, idAbono: clave });
+      }
+      resolve(resultado);
+    };
+    t.onerror = () => reject(t.error);
+    t.onabort = () => reject(t.error || new Error("Crédito no encontrado"));
   });
-  markDirty();
-  return cred;
 }
 
 // solo se puede eliminar un crédito que todavía no tiene abonos — si ya
@@ -449,17 +668,35 @@ function markDirty() {
   renderSyncChip();
   if (isOnline()) setTimeout(() => { pending = Math.max(0, pending - 1); renderSyncChip(); }, 900);
 }
+/* El indicador decía "En línea · sincronizado" aunque no exista ningún servidor
+   al que sincronizar: le hacía creer al taller que su información estaba a salvo
+   en algún lado cuando en realidad solo está en este teléfono. Mientras no haya
+   servidor de verdad, dice la verdad — que está guardado aquí y nada más.
+
+   HAY_SERVIDOR se pondrá en true el día que la sincronización con Supabase esté
+   conectada; hasta entonces el texto no promete nada que no esté pasando. */
+const HAY_SERVIDOR = false;
+
 function renderSyncChip() {
   const dot = document.getElementById("syncDot");
   const label = document.getElementById("syncLabel");
+
+  if (!HAY_SERVIDOR) {
+    // sin servidor la conexión a internet es irrelevante para los datos:
+    // lo único cierto es que todo vive en este dispositivo
+    dot.className = "dot off";
+    label.textContent = "Solo en este dispositivo · respalda seguido";
+    return;
+  }
+
   if (!isOnline()) {
     dot.className = "dot off";
     label.textContent = pending > 0
-      ? `Sin conexión · ${pending} cambio${pending === 1 ? "" : "s"} pendiente${pending === 1 ? "" : "s"}`
+      ? `Sin conexión · ${pending} cambio${pending === 1 ? "" : "s"} sin subir`
       : "Sin conexión · guardado en este dispositivo";
   } else if (pending > 0) {
     dot.className = "dot off";
-    label.textContent = `Sincronizando ${pending}…`;
+    label.textContent = `Subiendo ${pending}…`;
   } else {
     dot.className = "dot on";
     label.textContent = "En línea · sincronizado";
@@ -508,7 +745,7 @@ document.getElementById("btnCancelarAdminCode").addEventListener("click", () => 
 });
 document.getElementById("btnConfirmarAdminCode").addEventListener("click", async () => {
   const code = document.getElementById("adminCodeInput").value.trim();
-  if (code !== ADMIN_CODE) {
+  if (code !== codigoAdminLocal()) {
     document.getElementById("adminCodeError").textContent = "Código incorrecto.";
     return;
   }
@@ -979,7 +1216,7 @@ document.getElementById("btnCompartirDocEnviar").addEventListener("click", () =>
   // abren de inmediato). Por eso el archivo ya viene preparado de antes.
   if (navigator.canShare?.({ files: [ctx.archivo] })) {
     navigator.share({ files: [ctx.archivo], title: ctx.titulo, text: ctx.texto })
-      .then(() => { cerrarCompartirDoc(); toast("Documento enviado"); })
+      .then(() => { cerrarCompartirDoc(); toast("Documento compartido"); })
       .catch((err) => {
         if (err?.name === "AbortError") return; // canceló el menú, no es un error
         toast("No se pudo abrir el menú de compartir — descárgalo y adjúntalo", "off");
@@ -1026,10 +1263,13 @@ function wireLoginGate() {
     e.preventDefault();
     const u = document.getElementById("loginUser").value.trim().toLowerCase();
     const p = document.getElementById("loginPass").value;
-    const found = TEAM.find(t => t.user === u && t.password === p);
+    const miembro = TEAM.find(t => t.user === u);
+    const clave = miembro && claveLocal(miembro.user);
+    const found = miembro && typeof clave === "string" && clave === p ? miembro : null;
     const errEl = document.getElementById("loginError");
     if (!found) { errEl.textContent = "Usuario o contraseña incorrectos."; return; }
     errEl.textContent = "";
+    document.getElementById("loginPass").value = "";
     const session = { user: found.user, nombre: found.nombre, telefono: found.telefono, rol: found.rol };
     localStorage.setItem("enti_session", JSON.stringify(session));
     document.getElementById("gateLogin").classList.remove("active");
@@ -1498,7 +1738,7 @@ async function renderOrdersList() {
           <div class="meta">placa ${esc(moto?.placa || "s/p")} · orden #${o.id}${o.citaId ? ' · <span class="mant-badge soon">📅 Desde cita</span>' : ""}</div>
         </div>
         <span class="amount">${money(total)}</span>
-        <span class="meta mech">${esc(o.mecanico ?? "")}</span>
+        <span class="meta mech">${esc(o.mecanico || "Sin asignar")}</span>
         <button type="button" class="btn ghost small danger" data-del="${o.id}" title="Eliminar orden" aria-label="Eliminar orden">🗑</button>
       </div>`;
   }).join("");
@@ -1534,7 +1774,8 @@ async function openOrder(id) {
     ? ` · <span class="mant-badge soon">📅 Desde cita${o.citaFechaISO ? " del " + new Date(o.citaFechaISO).toLocaleDateString("es-HN") : ""}</span>`
     : "";
   document.getElementById("detalleSub").innerHTML =
-    `${esc(cliente.nombre)} · ${esc(cliente.telefono || "sin teléfono")} · placa ${esc(moto.placa || "s/p")} · asignada a ${esc(o.mecanico)}${desdeCita}`;
+    `${esc(cliente.nombre)} · ${esc(cliente.telefono || "sin teléfono")} · placa ${esc(moto.placa || "s/p")}${desdeCita}`;
+  renderDetalleMecanico(o);
   document.getElementById("detalleFalla").textContent = o.falla || "(sin descripción)";
   document.getElementById("inputKm").value = moto.km ?? "";
   document.getElementById("inputKm").previousElementSibling.textContent = o.estado === "entregado" ? "Kilometraje de salida" : "Kilometraje actual";
@@ -1546,6 +1787,33 @@ async function openOrder(id) {
   updateActionBar(o);
 
   showView("detalle");
+}
+
+// Reasignar mecánico / cambiar origen del trabajo, editable mientras la orden
+// no esté finalizada — una vez cobrada, el trabajo queda fijo, igual que su
+// monto (misma razón: no se toca un registro que ya se usó para cobrar).
+function renderDetalleMecanico(o) {
+  const wrap = document.getElementById("detalleMecanicoWrap");
+  if (o.finalizada) {
+    wrap.innerHTML = `Asignada a <b>${esc(o.mecanico || "Sin asignar")}</b> · <span class="pill ${origenTrabajoDe(o) === "negocio" ? "presupuesto" : "entregado"}">${origenTrabajoDe(o) === "negocio" ? "Negocio" : "Taller"}</span>`;
+    return;
+  }
+  wrap.innerHTML = `Asignada a
+    <select id="detalleMecanicoSel" style="display:inline-block; width:auto; padding:0.1rem 0.4rem; margin:0;"></select>
+    · <select id="detalleOrigenSel" style="display:inline-block; width:auto; padding:0.1rem 0.4rem; margin:0;">
+        <option value="taller">Taller</option><option value="negocio">Negocio</option>
+      </select>`;
+  poblarSelectMecanico("detalleMecanicoSel", o.mecanico);
+  document.getElementById("detalleOrigenSel").value = origenTrabajoDe(o);
+  document.getElementById("detalleMecanicoSel").addEventListener("change", async (e) => {
+    await updateOrder(o.id, ord => { ord.mecanico = e.target.value || ""; });
+    toast("Mecánico actualizado");
+    renderOrdersList();
+  });
+  document.getElementById("detalleOrigenSel").addEventListener("change", async (e) => {
+    await updateOrder(o.id, ord => { ord.origenTrabajo = e.target.value === "negocio" ? "negocio" : "taller"; });
+    toast("Origen del trabajo actualizado");
+  });
 }
 
 function updateActionBar(o) {
@@ -1805,7 +2073,7 @@ async function renderPresupuestoStage(o) {
     if (!sent) return;
     await updateOrder(o.id, x => { x.aprobacion = { via: "whatsapp", en: Date.now() }; });
     renderAprobacionEstado(await DB.get("ordenes", o.id));
-    toast(`Presupuesto enviado por WhatsApp a ${cliente.nombre}`);
+    toast(`WhatsApp abierto con el presupuesto para ${cliente.nombre} — falta pulsar enviar`);
   });
 
   document.getElementById("btnAprobarLocal").addEventListener("click", async () => {
@@ -1820,7 +2088,8 @@ function renderAprobacionEstado(o) {
   if (!el) return;
   if (o.aprobacion) {
     el.textContent = o.aprobacion.via === "whatsapp"
-      ? `Enviado por WhatsApp el ${new Date(o.aprobacion.en).toLocaleString()} — pendiente de confirmación del cliente.`
+      // el sistema abrió WhatsApp; que el mensaje saliera depende de la persona
+      ? `WhatsApp abierto el ${new Date(o.aprobacion.en).toLocaleString()} — pendiente de confirmación del cliente.`
       : `Aprobado en el local el ${new Date(o.aprobacion.en).toLocaleString()}.`;
   } else {
     el.textContent = "Sin enviar todavía.";
@@ -1895,6 +2164,14 @@ document.getElementById("ordenBuscarCliente").addEventListener("input", () => { 
    saber después cuántas citas se cumplieron y cuáles no. */
 let citaPendienteDeConvertir = null;
 
+// "" = sin asignar. Los registros viejos con mecánico:"—" se tratan igual que
+// "" en cualquier cálculo/agrupación (ver origenTrabajoDe y calcularProduccion).
+function poblarSelectMecanico(selectId, seleccionado) {
+  const sel = document.getElementById(selectId);
+  sel.innerHTML = '<option value="">Sin asignar</option>' + TEAM.map(t => `<option value="${esc(t.nombre)}">${esc(t.nombre)}</option>`).join("");
+  sel.value = seleccionado && TEAM.some(t => t.nombre === seleccionado) ? seleccionado : "";
+}
+
 async function abrirOrdenDesdeCita(citaId) {
   const cita = await DB.get("citas", citaId);
   if (!cita) return;
@@ -1926,6 +2203,8 @@ async function abrirOrdenDesdeCita(citaId) {
   }
   document.getElementById("ordenFalla").value = cita.motivo || "";
   renderOrdenClienteChip();
+  poblarSelectMecanico("ordenMecanico", cita.mecanico);
+  document.getElementById("ordenOrigenTrabajo").value = "taller";
 
   document.getElementById("ordenDesdeCitaAviso").style.display = "block";
   document.getElementById("ordenDesdeCitaTexto").textContent =
@@ -1941,6 +2220,8 @@ document.getElementById("btnNuevaOrden").addEventListener("click", async () => {
   renderOrdenClienteChip();
   ["ordenNombre", "ordenTelefono", "ordenPlaca", "ordenMarca", "ordenModelo", "ordenKm", "ordenFalla"].forEach(id => document.getElementById(id).value = "");
   document.getElementById("ordenFoto").value = "";
+  poblarSelectMecanico("ordenMecanico", currentUser?.nombre);
+  document.getElementById("ordenOrigenTrabajo").value = "taller";
   document.getElementById("modalOrden").classList.add("active");
 });
 document.getElementById("btnCancelarOrden").addEventListener("click", () => {
@@ -1995,8 +2276,10 @@ alHacerClicUnaVez(document.getElementById("btnCrearOrden"), async () => {
     falla: document.getElementById("ordenFalla").value.trim(),
     items: [], fotos, aprobacion: null,
     diagnostico: null, reparacionNotas: "", calidadChecklist: null,
-    // si viene de una cita, la atiende el mecánico con quien se apartó
-    mecanico: cita?.mecanico || currentUser?.nombre || "—",
+    // "" = sin asignar. El select ya viene precargado con el mecánico de la
+    // cita (si aplica) o el usuario actual — esto solo lee lo que haya quedado.
+    mecanico: document.getElementById("ordenMecanico").value || "",
+    origenTrabajo: document.getElementById("ordenOrigenTrabajo").value === "negocio" ? "negocio" : "taller",
     citaId: cita?.id || null,
     citaFechaISO: cita ? `${cita.fecha}T${cita.hora}` : null,
     creadoEn: Date.now(),
@@ -2023,48 +2306,83 @@ document.getElementById("btnVolverOrdenes").addEventListener("click", async () =
 });
 
 /* ---- avanzar / retroceder etapa ---- */
-document.getElementById("btnAvanzar").addEventListener("click", async () => {
+/* Finalizar una orden mueve dinero, así que va con dos candados:
+
+   1. alHacerClicUnaVez bloquea el botón mientras corre. Sin él, tres toques
+      seguidos —un dedo que rebota en pantalla táctil— finalizaban la orden tres
+      veces y metían TRES ingresos en caja por el mismo trabajo.
+   2. la comprobación de o.finalizada frena también el camino que el botón no
+      cubre: recargar la página y volver a tocar, o abrir la orden en otra
+      pestaña. El estado guardado manda, no el estado de la pantalla.
+
+   Y el orden importa: primero se crea el registro financiero y SOLO si sale
+   bien se marca la orden como finalizada. Antes era al revés, así que si la
+   creación del crédito fallaba la orden quedaba cerrada, el cliente debiendo, y
+   ni un solo registro de esa deuda en el sistema. */
+alHacerClicUnaVez(document.getElementById("btnAvanzar"), async () => {
   const o = await DB.get("ordenes", currentOrderId);
   const idx = STAGES.findIndex(s => s.key === o.estado);
   if (idx >= STAGES.length - 1) {
+    if (o.finalizada) {
+      toast("Esta orden ya estaba finalizada — no se vuelve a cobrar", "off");
+      openOrder(o.id);
+      return;
+    }
+
     const total = (o.items || []).reduce((s, it) => s + it.cantidad * it.precio, 0);
+    // costo sellado al agregar cada repuesto; el inventario solo se consulta
+    // para los renglones viejos que todavía no lo traen (anteriores a la v6)
     let costo = 0;
     const inv = await DB.getAll("inventario");
     (o.items || []).forEach(it => {
       if (!it.origenInventarioId) return;
-      const rep = inv.find(r => r.id === it.origenInventarioId);
-      if (rep) costo += (rep.costoCompra || 0) * it.cantidad;
+      costo += costoDelItem(it, inv) * it.cantidad;
     });
     const margen = total > 0 ? ((total - costo) / total) * 100 : null;
-    const ord = await updateOrder(o.id, x => { x.finalizada = true; x.finalizadoEn = Date.now(); x.margen = margen; });
 
-    if (total > 0 && ord.tipoCobro === "credito") {
-      // al crédito NO entra dinero a caja todavía: se crea la factura pendiente
-      // y, si dejó algo de entrada, ese abono sí se registra como ingreso.
-      const cliente = await DB.get("clientes", ord.clienteId);
-      const abono = Math.min(Number(ord.abonoInicial) || 0, total);
-      try {
+    let creditoIdCreado = null;
+    let mensaje = "Trabajo finalizado y guardado como registro";
+
+    try {
+      if (total > 0 && o.tipoCobro === "credito") {
+        // al crédito NO entra dinero a caja todavía: se crea la factura pendiente
+        // y, si dejó algo de entrada, ese abono sí se registra como ingreso.
+        const cliente = await DB.get("clientes", o.clienteId);
+        const abono = Math.min(Number(o.abonoInicial) || 0, total);
         const { id: credId, credito } = await cobrarAlCredito({
-          clienteId: ord.clienteId,
+          clienteId: o.clienteId,
           clienteNombre: cliente?.nombre || "Cliente",
           clienteTelefono: cliente?.telefono || "",
           // inventarioId en null a propósito: el repuesto ya salió del stock
           // cuando se agregó a la orden, volver a descontarlo lo restaría dos veces
-          items: (ord.items || []).map(it => ({ inventarioId: null, nombre: it.nombre, cantidad: it.cantidad, precio: it.precio })),
-          abono, abonoMetodo: ord.abonoMetodo || "efectivo",
-          nota: `Orden de taller #${ord.id}`, origen: "orden", ordenId: ord.id,
+          items: (o.items || []).map(it => ({ inventarioId: null, nombre: it.nombre, cantidad: it.cantidad, precio: it.precio, costoUnitario: it.costoUnitario })),
+          abono, abonoMetodo: o.abonoMetodo || "efectivo",
+          nota: `Orden de taller #${o.id}`, origen: "orden", ordenId: o.id,
         });
-        await updateOrder(ord.id, x => { x.creditoId = credId; });
-        toast(abono > 0
+        creditoIdCreado = credId;
+        mensaje = abono > 0
           ? `Crédito #${credId} creado — abonó ${money(abono)}, queda debiendo ${money(credito.saldo)}`
-          : `Crédito #${credId} creado — queda debiendo ${money(credito.saldo)}`);
-      } catch (err) {
-        toast("No se pudo crear el crédito: " + err.message, "off");
+          : `Crédito #${credId} creado — queda debiendo ${money(credito.saldo)}`;
+      } else if (total > 0) {
+        await registrarIngresoTaller(o, total, o.metodoPago || "efectivo");
       }
-    } else {
-      if (total > 0) await registrarIngresoTaller(ord, total, ord.metodoPago || "efectivo");
-      toast("Trabajo finalizado y guardado como registro");
+    } catch (err) {
+      // el registro financiero falló: la orden NO se cierra, para poder reintentar
+      toast("No se finalizó: no se pudo registrar el cobro (" + err.message + "). La orden sigue abierta.", "off");
+      openOrder(o.id);
+      return;
     }
+
+    const ord = await updateOrder(o.id, x => {
+      x.finalizada = true;
+      x.finalizadoEn = Date.now();
+      x.margen = margen;
+      if (creditoIdCreado) x.creditoId = creditoIdCreado;
+    });
+    registrarAuditoria("finalizar", "ordenes", ord.id, `${money(total)} · ${o.tipoCobro === "credito" ? `crédito #${creditoIdCreado}` : "contado"}`);
+    encolarSync("ordenes", ord.id, "finalizar", null);
+
+    toast(mensaje);
     renderOrdersList();
     renderDashboard();
     openOrder(ord.id);
@@ -2117,6 +2435,7 @@ alHacerClicUnaVez(document.getElementById("btnGuardarItem"), async () => {
   const fromInv = document.getElementById("itemOrigen").value === "inventario";
   let nombre;
   let origenInventarioId = null;
+  let costoUnitario = 0;
 
   // una cantidad negativa aquí, si venía de inventario, terminaba SUMANDO
   // stock en vez de restarlo (rep.cantidad -= cantidad con cantidad negativo).
@@ -2130,6 +2449,7 @@ alHacerClicUnaVez(document.getElementById("btnGuardarItem"), async () => {
     if (rep.cantidad < cantidad) { toast(`Solo quedan ${rep.cantidad} en inventario`, "off"); return; }
     nombre = rep.nombre;
     origenInventarioId = repId;
+    costoUnitario = rep.costoCompra || 0; // sellado ahora: el costo de hoy es el de esta orden
     rep.cantidad -= cantidad;
     await DB.save("inventario", rep);
     markDirty();
@@ -2138,7 +2458,10 @@ alHacerClicUnaVez(document.getElementById("btnGuardarItem"), async () => {
     if (!nombre) { toast("Falta el nombre del ítem", "off"); return; }
   }
 
-  const o = await updateOrder(currentOrderId, ord => { ord.items = (ord.items || []).concat([{ nombre, cantidad, precio, origenInventarioId }]); });
+  const o = await updateOrder(currentOrderId, ord => {
+    ord.items = (ord.items || []).concat([{ nombre, cantidad, precio, origenInventarioId, costoUnitario, costoEstimado: false }]);
+  });
+  registrarAuditoria("agregar-item", "ordenes", currentOrderId, `${nombre} x${cantidad} a ${money(precio)}`);
   document.getElementById("modalItem").classList.remove("active");
   openOrder(o.id);
 });
@@ -2701,10 +3024,12 @@ alHacerClicUnaVez(document.getElementById("btnCotAceptar"), async () => {
       rep.cantidad -= it.cantidad;
       await DB.save("inventario", rep);
       descontados++;
-      items.push({ nombre: it.nombre, cantidad: it.cantidad, precio: it.precio, origenInventarioId: rep.id });
+      // el costo se sella al convertir, no al cotizar: entre una cosa y otra
+      // pudo cambiar, y lo que cuenta para la ganancia es el de ahora
+      items.push({ nombre: it.nombre, cantidad: it.cantidad, precio: it.precio, origenInventarioId: rep.id, costoUnitario: rep.costoCompra || 0, costoEstimado: false });
     } else {
       if (rep) sinStock.push(it.nombre);
-      items.push({ nombre: it.nombre, cantidad: it.cantidad, precio: it.precio, origenInventarioId: null });
+      items.push({ nombre: it.nombre, cantidad: it.cantidad, precio: it.precio, origenInventarioId: null, costoUnitario: 0, costoEstimado: false });
     }
   }
   if (descontados) markDirty();
@@ -3039,6 +3364,10 @@ async function renderCitasList() {
       const desde = new Date(`${c.reprogramaciones[0].de.fecha}T${c.reprogramaciones[0].de.hora}`);
       etiqueta += ` <span class="mant-badge soon" title="Movida desde el ${desde.toLocaleDateString("es-HN")} a las ${c.reprogramaciones[0].de.hora}">🔁 Movida${veces > 1 ? ` ${veces}×` : ""}</span>`;
     }
+    // estado del aviso de confirmación al cliente — "abierto" nunca "enviado":
+    // no hay forma de confirmar que el mensaje de verdad salió (ver PASO 7)
+    if (c.avisoClienteWA?.estado === "abierto") etiqueta += ' <span class="mant-badge ok" title="Se abrió WhatsApp con el mensaje de confirmación">📲 Confirmación abierta</span>';
+    else if (c.avisoClienteWA?.estado === "no-disponible") etiqueta += ' <span class="mant-badge due" title="El cliente no tiene un teléfono válido guardado">📲 Sin teléfono del cliente</span>';
 
     return `
       <div class="cita-row${citaCerrada(c) ? " cita-cerrada" : ""}" data-id="${c.id}">
@@ -3195,23 +3524,49 @@ alHacerClicUnaVez(document.getElementById("btnGuardarCita"), async () => {
   // modal puede tardar segundos en cerrarse (espera a que la persona toque
   // algo), y para cuando eso resuelve, el gesto original ya expiró y
   // window.open() se bloquearía en silencio si se abriera hasta después.
+  // Se abren las DOS ventanas (mecánico y cliente) en el mismo gesto de clic;
+  // la que no se termine usando se cierra sin navegar, sin costo real.
   const mecanicoInfo = TEAM.find(t => t.nombre === mecanico);
   const ventanaWA = mecanicoInfo?.telefono ? abrirVentanaWA() : null;
+  const ventanaWACliente = (clienteId || toWaDigits(telefonoTmp)) ? abrirVentanaWA() : null;
 
-  if (!(await checkCitaConflicto(fecha, hora, mecanico))) { ventanaWA?.close(); return; }
+  if (!(await checkCitaConflicto(fecha, hora, mecanico))) { ventanaWA?.close(); ventanaWACliente?.close(); return; }
 
   const id = await DB.save("citas", { clienteId, nombreTmp, telefonoTmp, fecha, hora, motivo, mecanico, origen: "interna", recordatorioEnviado: false, creadoEn: Date.now() });
   markDirty();
   document.getElementById("modalCita").classList.remove("active");
   toast("Cita guardada");
 
-  const nombreCliente = clienteId ? (await DB.get("clientes", clienteId)).nombre : nombreTmp;
+  const clienteGuardado = clienteId ? await DB.get("clientes", clienteId) : null;
+  const nombreCliente = clienteGuardado ? clienteGuardado.nombre : nombreTmp;
+  const telefonoCliente = clienteGuardado ? (clienteGuardado.telefono || "") : telefonoTmp;
+
   const texto = `Nueva cita asignada: ${nombreCliente} el ${new Date(`${fecha}T${hora}`).toLocaleDateString()} a las ${hora}. Motivo: ${motivo || "sin especificar"}.`;
   if (mecanicoInfo?.telefono) {
     navegarWA(ventanaWA, mecanicoInfo.telefono, texto);
   } else {
     toast(`${mecanico} no tiene teléfono configurado en TEAM (app.js) — no se pudo abrir el aviso por WhatsApp`, "off");
   }
+
+  /* Confirmación al cliente. El envío 100% automático (sin que nadie toque
+     "enviar" dentro de WhatsApp) requiere WhatsApp Business API con un backend
+     propio — ENTIMOTORS no lo tiene todavía (ver comentario al inicio del
+     archivo). Esto abre WhatsApp con el mensaje ya escrito, así que el estado
+     que se guarda es "abierto", nunca "enviado": no hay forma de confirmar
+     desde aquí que el mensaje de verdad salió. */
+  const fechaLegible = new Date(`${fecha}T${hora}`).toLocaleDateString("es-HN", { day: "numeric", month: "long" });
+  const textoCliente = `Hola ${nombreCliente}, tu cita en ENTIMOTORS quedó registrada para el ${fechaLegible} a las ${hora}. ¡Te esperamos!`;
+  let avisoClienteWA;
+  if (toWaDigits(telefonoCliente)) {
+    navegarWA(ventanaWACliente, telefonoCliente, textoCliente);
+    avisoClienteWA = { estado: "abierto", en: Date.now() };
+  } else {
+    ventanaWACliente?.close();
+    avisoClienteWA = { estado: "no-disponible", en: null };
+    toast("El cliente no tiene un teléfono válido — no se pudo abrir la confirmación por WhatsApp", "off");
+  }
+  await DB.save("citas", { ...(await DB.get("citas", id)), avisoClienteWA });
+  markDirty();
 
   renderCitasList();
 });
@@ -4123,11 +4478,16 @@ async function cobrarVentaPOS(metodoPago, efectivoRecibido) {
     : (posClienteLibre || null);
 
   try {
-    const { id, venta } = await registrarVentaRapida({
+    const { id, venta, faltantes } = await registrarVentaRapida({
       items: posCarrito.map(it => ({ inventarioId: it.inventarioId, nombre: it.nombre, cantidad: it.cantidad, precio: it.precio })),
       clienteId, clienteNombre, metodoPago, efectivoRecibido,
     });
     markDirty();
+    registrarAuditoria("venta", "ventas_rapidas", id, `${money(total)} por ${metodoPago}`);
+    encolarSync("ventas_rapidas", id, "crear", null);
+    // el descuento de stock nunca deja el inventario en negativo, pero si faltaba
+    // existencia hay que decirlo en vez de tragárselo
+    if (faltantes?.length) toast(`Ojo: no había suficiente stock de ${faltantes.join(", ")} — revisa el inventario`, "off");
     ultimoTicket = { id, venta };
     document.getElementById("ticketAcciones").style.display = "grid";
     imprimirTicketPOS(id, venta, abrirVentanaImpresion());
@@ -4195,7 +4555,128 @@ function imprimirTicketPOS(ventaId, venta, ventana) {
   imprimirPlantilla("ticketPrint", "print-ticket", ventana);
 }
 
-/* ================= FINANZAS Y CAJA CHICA ================= */
+/* ================= FINANZAS Y CAJA CHICA =================
+
+   Un movimiento de caja puede ser de dos clases muy distintas:
+
+   · el que alguien escribió a mano en "Registrar movimiento" (un gasto de
+     gasolina, una compra suelta). Ese sí se puede borrar: es un apunte, y
+     borrarlo solo corrige un error de dedo.
+
+   · el que existe COMO CONTRAPARTE de otra operación: el ingreso de una venta,
+     el de un abono, el de una orden entregada. Ese no es un apunte suelto — es
+     la mitad de una operación de dos patas.
+
+   Borrar los del segundo grupo descuadraba la contabilidad en silencio: la venta
+   seguía existiendo con su inventario descontado pero su dinero desaparecía del
+   libro; peor con un abono, donde el crédito seguía diciendo "abonado L.500" y
+   en caja no había entrado nada. Para corregir uno de esos hay que deshacer la
+   operación de origen, no borrar la línea del libro. */
+
+function movimientoLigadoA(m) {
+  if (m.ventaId != null) return `la venta rápida #${m.ventaId}`;
+  if (m.idAbono != null || m.creditoId != null) return `un abono del crédito #${m.creditoId ?? "?"}`;
+  if (m.ordenId != null) return `la orden de servicio #${m.ordenId}`;
+  return null;
+}
+function movimientoEsBorrable(m) { return movimientoLigadoA(m) === null; }
+function motivoNoBorrable(m) {
+  return `No se puede borrar: este movimiento respalda ${movimientoLigadoA(m)}. Para corregirlo hay que deshacer esa operación, no la línea de caja.`;
+}
+
+/* Producción por mecánico + separación Taller/Negocio/Total.
+
+   Reglas para no duplicar ingresos (mismo espíritu que "Ganancias por línea de
+   negocio" en renderFinanzasCharts):
+
+   TALLER  = órdenes FINALIZADAS (cobradas) con origenTrabajo "taller" (o sin
+             el campo — todo registro anterior a esta versión es taller).
+   NEGOCIO = órdenes finalizadas con origenTrabajo "negocio"
+             + ventas_rapidas (el TPV siempre ha sido negocio, no necesita campo)
+             + créditos que NO nacieron de una orden (origen !== "orden": los
+               que sí nacieron de una orden ya están contados arriba, en Taller
+               o Negocio según corresponda — sumarlos aquí otra vez los duplicaría).
+
+   Se usa o.finalizada === true como condición de "cobrado", NO o.estado ===
+   "entregado": una orden puede llegar a la etapa "entregado" sin haberse
+   cobrado todavía (el cobro ocurre en un segundo toque de "Avanzar" ya en esa
+   etapa) — contarla antes de eso inflaría los números. Esto es a propósito
+   distinto del criterio de "Ganancias por línea de negocio" (que cuenta por
+   estado==="entregado" sin mirar finalizada) — ver informe de Fase 3A. */
+async function calcularProduccion(desde, hasta) {
+  const [ordenes, ventas, creditos] = await Promise.all([DB.getAll("ordenes"), DB.getAll("ventas_rapidas"), DB.getAll("creditos")]);
+  const enRango = (iso) => { const d = (iso || "").slice(0, 10); return !!d && d >= desde && d <= hasta; };
+  const totalItems = (x) => (x.items || []).reduce((s, it) => s + it.cantidad * it.precio, 0);
+  const nombreMecanico = (o) => (o.mecanico && o.mecanico !== "—") ? o.mecanico : "";
+
+  const finalizadasEnRango = ordenes.filter(o => o.finalizada && enRango(o.finalizadoEn ? new Date(o.finalizadoEn).toISOString() : null));
+  const ordenesTaller = finalizadasEnRango.filter(o => origenTrabajoDe(o) === "taller");
+  const ordenesNegocio = finalizadasEnRango.filter(o => origenTrabajoDe(o) === "negocio");
+
+  const taller = ordenesTaller.reduce((s, o) => s + totalItems(o), 0);
+  const negocioOrdenes = ordenesNegocio.reduce((s, o) => s + totalItems(o), 0);
+
+  const ventasRango = ventas.filter(v => enRango(v.fechaISO));
+  const creditosNoOrden = creditos.filter(c => c.origen !== "orden" && enRango(c.fechaISO));
+  const negocioVentas = ventasRango.reduce((s, v) => s + totalItems(v), 0) + creditosNoOrden.reduce((s, c) => s + totalItems(c), 0);
+
+  const negocio = negocioOrdenes + negocioVentas;
+  const total = taller + negocio;
+
+  // por mecánico: SOLO trabajo de taller — el negocio nunca se atribuye a un
+  // mecánico, aunque ventas_rapidas tenga su propio campo "mecanico" (quien
+  // hizo la venta en el TPV, no producción de taller — así lo pidió el cliente).
+  const porMecanico = {};
+  const asegurar = (nombre) => {
+    const k = nombre || "(sin asignar)";
+    if (!porMecanico[k]) porMecanico[k] = { pendientes: 0, completados: 0, producido: 0 };
+    return porMecanico[k];
+  };
+  ordenesTaller.forEach(o => { const e = asegurar(nombreMecanico(o)); e.completados++; e.producido += totalItems(o); });
+  // "pendientes" es una foto del estado ACTUAL, no depende del rango de fechas
+  ordenes.filter(o => origenTrabajoDe(o) === "taller" && !o.finalizada).forEach(o => { asegurar(nombreMecanico(o)).pendientes++; });
+
+  return {
+    taller, negocio, negocioOrdenes, negocioVentas, total,
+    porMecanico: Object.entries(porMecanico).map(([nombre, v]) => ({
+      nombre, ...v, promedio: v.completados ? v.producido / v.completados : 0,
+    })).sort((a, b) => b.producido - a.producido),
+  };
+}
+
+async function renderRendimiento(desde, hasta) {
+  const r = await calcularProduccion(desde, hasta);
+  document.getElementById("rendimientoResumen").innerHTML = `
+    <div class="widget-card tint-red"><span class="eyebrow">Taller</span><span class="big">${money(r.taller)}</span><span class="sub">Órdenes de taller cobradas en el rango</span></div>
+    <div class="widget-card tint-amber"><span class="eyebrow">Negocio</span><span class="big">${money(r.negocio)}</span><span class="sub">Ventas rápidas + órdenes marcadas "negocio"</span></div>
+    <div class="widget-card tint-green"><span class="eyebrow">Total</span><span class="big">${money(r.total)}</span><span class="sub">Taller + Negocio, sin duplicar</span></div>
+  `;
+  const body = document.getElementById("rendimientoBody");
+  document.getElementById("rendimientoEmpty").style.display = r.porMecanico.length ? "none" : "block";
+  body.innerHTML = r.porMecanico.map(m => `
+    <tr>
+      <td>${esc(m.nombre)}</td>
+      <td class="num">${m.pendientes}</td>
+      <td class="num">${m.completados}</td>
+      <td class="num">${money(m.producido)}</td>
+      <td class="num">${money(m.promedio)}</td>
+    </tr>`).join("");
+}
+
+document.querySelectorAll("#finPeriodoRapido [data-periodo]").forEach(btn => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll("#finPeriodoRapido [data-periodo]").forEach(b => b.classList.toggle("active", b === btn));
+    if (btn.dataset.periodo === "rango") return; // deja los campos Desde/Hasta como estén, para editarlos a mano
+    const hoy = new Date();
+    const desde = new Date(hoy);
+    if (btn.dataset.periodo === "semana") desde.setDate(hoy.getDate() - 6);
+    else if (btn.dataset.periodo === "mes") desde.setDate(1);
+    document.getElementById("finDesde").value = desde.toISOString().slice(0, 10);
+    document.getElementById("finHasta").value = hoy.toISOString().slice(0, 10);
+    renderFinanzas();
+  });
+});
+
 async function renderFinanzas() {
   const movs = await DB.getAll("caja_movimientos");
   const desdeEl = document.getElementById("finDesde");
@@ -4217,14 +4698,20 @@ async function renderFinanzas() {
   const ingresos = filtrados.filter(m => m.tipo === "ingreso").reduce((s, m) => s + m.monto, 0);
   const egresos = filtrados.filter(m => m.tipo === "egreso").reduce((s, m) => s + m.monto, 0);
 
-  // Costo estimado: costoCompra de los repuestos vendidos por TPV en el rango filtrado.
+  /* Costo de lo vendido con el COSTO HISTÓRICO sellado en cada renglón.
+     Antes se leía el costoCompra actual del inventario, así que subirle el precio
+     a un repuesto cambiaba hacia atrás la utilidad de ventas ya cerradas, y
+     borrarlo del inventario la inflaba (costo cero). Ahora manda lo que costaba
+     el día de la venta; solo los registros anteriores a la v6 caen al costo
+     actual, y se avisa de cuántos son. */
   const ventas = (await DB.getAll("ventas_rapidas")).filter(v => { const d = v.fechaISO.slice(0, 10); return d >= desde && d <= hasta; });
   let costoVentas = 0;
+  let renglonesEstimados = 0;
   const inv = await DB.getAll("inventario");
   ventas.forEach(v => v.items.forEach(it => {
     if (!it.inventarioId) return;
-    const rep = inv.find(r => r.id === it.inventarioId);
-    if (rep) costoVentas += (rep.costoCompra || 0) * it.cantidad;
+    costoVentas += costoDelItem(it, inv) * it.cantidad;
+    if (it.costoUnitario === undefined || it.costoEstimado) renglonesEstimados++;
   }));
   const costosTotal = egresos + costoVentas;
   const utilidad = ingresos - costosTotal;
@@ -4239,7 +4726,7 @@ async function renderFinanzas() {
   document.getElementById("finanzasResumen").innerHTML = `
     <div class="widget-card tint-green"><span class="eyebrow">Ingresos totales</span><span class="big">${money(ingresos)}</span><span class="sub">En el rango filtrado</span></div>
     <div class="widget-card tint-red"><span class="eyebrow">Costos</span><span class="big">${money(costosTotal)}</span><span class="sub">Egresos + costo de repuestos vendidos</span></div>
-    <div class="widget-card ${utilidad >= 0 ? "tint-green" : "tint-red"}"><span class="eyebrow">Utilidad neta</span><span class="big">${money(utilidad)}</span><span class="sub">Ingresos − costos</span></div>
+    <div class="widget-card ${utilidad >= 0 ? "tint-green" : "tint-red"}"><span class="eyebrow">Utilidad neta</span><span class="big">${money(utilidad)}</span><span class="sub">${renglonesEstimados ? `Ingresos − costos · ${renglonesEstimados} renglón${renglonesEstimados === 1 ? "" : "es"} con costo estimado` : "Ingresos − costos (costo del día de la venta)"}</span></div>
     <div class="widget-card"><span class="eyebrow" style="color:var(--text-faint);">Margen promedio</span><span class="big">${margen.toFixed(1)}%</span><span class="sub">Utilidad / ingresos</span></div>
     <button type="button" class="widget-card ${cuentasPorCobrar > 0 ? "tint-amber" : ""}" id="cardCuentasPorCobrar" style="text-align:left; font-family:inherit; cursor:pointer;">
       <span class="eyebrow">Cuentas por cobrar</span><span class="big">${money(cuentasPorCobrar)}</span><span class="sub">Saldo pendiente en créditos activos</span>
@@ -4267,12 +4754,24 @@ async function renderFinanzas() {
       <td>${esc(metodoLabel[m.metodoPago] || "—")}</td>
       <td>${esc(m.descripcion || "")}</td>
       <td class="num">${money(m.monto)}</td>
-      <td class="num"><button type="button" class="btn ghost small danger" data-eliminar-movi="${m.id}" title="Eliminar" aria-label="Eliminar movimiento">🗑</button></td>
+      <td class="num">${movimientoEsBorrable(m)
+        ? `<button type="button" class="btn ghost small danger" data-eliminar-movi="${m.id}" title="Eliminar" aria-label="Eliminar movimiento">🗑</button>`
+        : `<span class="mov-ligado" title="${esc(motivoNoBorrable(m))}">🔒</span>`}</td>
     </tr>`).join("");
   body.querySelectorAll("[data-eliminar-movi]").forEach(btn => {
     btn.addEventListener("click", () => {
       requestAdminCode(async () => {
-        await DB.delete("caja_movimientos", Number(btn.dataset.eliminarMovi));
+        const id = Number(btn.dataset.eliminarMovi);
+        const mov = await DB.get("caja_movimientos", id);
+        // se revalida contra la base: entre pintar la tabla y tocar el botón
+        // el movimiento pudo quedar ligado a algo
+        if (!mov) { toast("Ese movimiento ya no existe", "off"); renderFinanzas(); return; }
+        if (!movimientoEsBorrable(mov)) { toast(motivoNoBorrable(mov), "off"); renderFinanzas(); return; }
+
+        // la bitácora guarda lo suficiente para reconstruirlo si hiciera falta
+        await registrarAuditoria("eliminar", "caja_movimientos", id,
+          `${mov.tipo} ${money(mov.monto)} · ${mov.categoria || "sin categoría"} · ${mov.descripcion || ""}`);
+        await DB.delete("caja_movimientos", id);
         markDirty();
         toast("Movimiento eliminado");
         renderFinanzas();
@@ -4282,14 +4781,16 @@ async function renderFinanzas() {
   });
 
   await renderFinanzasCharts();
+  await renderRendimiento(desde, hasta);
 }
 
 document.getElementById("btnFiltrarFinanzas").addEventListener("click", renderFinanzas);
 alHacerClicUnaVez(document.getElementById("btnGuardarMovimiento"), async () => {
   const monto = Number(document.getElementById("moviMonto").value) || 0;
   if (monto <= 0) { toast("El monto debe ser mayor a cero", "off"); return; }
-  await DB.save("caja_movimientos", {
-    tipo: document.getElementById("moviTipo").value,
+  const tipoMovi = document.getElementById("moviTipo").value;
+  const idMovi = await DB.save("caja_movimientos", {
+    tipo: tipoMovi,
     categoria: document.getElementById("moviCategoria").value,
     monto,
     metodoPago: document.getElementById("moviMetodo").value,
@@ -4297,6 +4798,8 @@ alHacerClicUnaVez(document.getElementById("btnGuardarMovimiento"), async () => {
     fechaISO: new Date().toISOString(), creadoEn: Date.now(),
   });
   markDirty();
+  registrarAuditoria("registrar", "caja_movimientos", idMovi, `${tipoMovi} ${money(monto)} a mano`);
+  encolarSync("caja_movimientos", idMovi, "crear", null);
   document.getElementById("moviMonto").value = "";
   document.getElementById("moviDescripcion").value = "";
   toast("Movimiento registrado");
@@ -4876,6 +5379,7 @@ async function renderAjustes() {
     const activa = keys.find((k) => k.startsWith("entimotors-v"));
     document.getElementById("ajustesVersion").textContent = activa ? activa.replace("entimotors-v", "") : "sin Service Worker";
   }
+  pintarUltimoRespaldo();
 }
 
 document.getElementById("btnForzarActualizacion").addEventListener("click", async () => {
@@ -4896,49 +5400,297 @@ document.getElementById("btnForzarActualizacion").addEventListener("click", asyn
   location.href = location.pathname + "?_=" + Date.now();
 });
 
-document.getElementById("btnRespaldarDatos").addEventListener("click", async () => {
+/* ================= RESPALDO, VERIFICACIÓN Y RESTAURACIÓN =================
+   Toda la información del taller existe únicamente en este dispositivo. El
+   respaldo es lo único que separa al cliente de perderlo todo si se le rompe el
+   teléfono, así que se trata como la operación más importante del sistema:
+
+   1. se arma el archivo con TODAS las tablas respaldables;
+   2. se vuelve a leer y se compara tabla por tabla contra la base;
+   3. solo si cuadra se le entrega a la persona;
+   4. si no cuadra, se le dice — nunca se entrega una copia en la que no confiamos.
+
+   El archivo lleva su propia cabecera con versión de app, versión de esquema,
+   fecha e identificador, para que al restaurarlo se sepa exactamente de dónde
+   salió y si el esquema es compatible. */
+
+const VERSION_APP = "3.12.0";
+const VERSION_RESPALDO = 2; // formato del archivo, no de la app
+
+async function armarRespaldo() {
   const data = {};
-  for (const store of ALL_STORES) data[store] = await DB.getAll(store);
-  const respaldo = { version: 1, exportadoEn: new Date().toISOString(), data };
-  const blob = new Blob([JSON.stringify(respaldo, null, 2)], { type: "application/json" });
+  const conteos = {};
+  for (const store of ALL_STORES) {
+    const filas = await DB.getAll(store);
+    data[store] = filas;
+    conteos[store] = filas.length;
+  }
+  const total = Object.values(conteos).reduce((a, b) => a + b, 0);
+  return {
+    version: VERSION_RESPALDO,
+    versionApp: VERSION_APP,
+    esquemaDB: db?.version ?? null,
+    idRespaldo: `ENTI-${new Date().toISOString().slice(0, 10)}-${Math.random().toString(36).slice(2, 8).toUpperCase()}`,
+    exportadoEn: new Date().toISOString(),
+    exportadoPor: currentUser?.nombre || "—",
+    dispositivo: navigator.userAgent.slice(0, 120),
+    conteos, totalRegistros: total,
+    data,
+  };
+}
+
+/* Vuelve a leer la base y la compara con lo que se acaba de escribir en el
+   archivo. Es la diferencia entre "descargué un respaldo" y "tengo un respaldo
+   que sirve". */
+async function verificarRespaldo(respaldo) {
+  const problemas = [];
+  for (const store of ALL_STORES) {
+    const enBase = (await DB.getAll(store)).length;
+    const enArchivo = (respaldo.data[store] || []).length;
+    if (enBase !== enArchivo) problemas.push(`${store}: la base tiene ${enBase} y el archivo ${enArchivo}`);
+  }
+  // el archivo tiene que poder volver a leerse: si el JSON no sobrevive el
+  // viaje de ida y vuelta, no sirve de nada aunque los números cuadren
+  let texto;
+  try {
+    texto = JSON.stringify(respaldo);
+    const releido = JSON.parse(texto);
+    if (releido.totalRegistros !== respaldo.totalRegistros) problemas.push("el archivo no se relee igual");
+  } catch (e) {
+    problemas.push("no se pudo generar el archivo: " + e.message);
+  }
+  return { ok: problemas.length === 0, problemas, texto, bytes: texto ? new Blob([texto]).size : 0 };
+}
+
+function nombreArchivoRespaldo(respaldo) {
+  return `entimotors-backup-${respaldo.exportadoEn.slice(0, 10)}-${respaldo.idRespaldo.split("-").pop()}.json`;
+}
+
+function pintarEstadoRespaldo(caja, respaldo, verificacion) {
+  const el = document.getElementById(caja);
+  if (!el) return;
+  el.style.display = "block";
+  el.className = `respaldo-estado ${verificacion.ok ? "ok" : "mal"}`;
+  el.innerHTML = verificacion.ok
+    ? `<b>✅ Copia verificada — ${respaldo.totalRegistros} registros</b><br>
+       <span style="color:var(--text-faint);">${respaldo.idRespaldo} · ${Math.max(1, Math.round(verificacion.bytes / 1024))} KB</span>
+       <div class="respaldo-conteos">${ALL_STORES.filter(k => respaldo.conteos[k]).map(k => `<span>${esc(k)} <b>${respaldo.conteos[k]}</b></span>`).join("")}</div>`
+    : `<b>⚠️ La copia no se pudo verificar</b><br>${verificacion.problemas.map(esc).join("<br>")}`;
+}
+
+// deja constancia local de cuándo fue la última copia buena, para poder
+// recordárselo a la persona si lleva mucho sin hacer una
+function anotarUltimoRespaldo(respaldo) {
+  try {
+    localStorage.setItem("enti_ultimo_respaldo", JSON.stringify({
+      idRespaldo: respaldo.idRespaldo, en: respaldo.exportadoEn, registros: respaldo.totalRegistros,
+    }));
+  } catch (e) {}
+  pintarUltimoRespaldo();
+}
+
+function pintarUltimoRespaldo() {
+  const el = document.getElementById("ultimoRespaldoInfo");
+  if (!el) return;
+  let info = null;
+  try { info = JSON.parse(localStorage.getItem("enti_ultimo_respaldo") || "null"); } catch (e) {}
+  if (!info) { el.innerHTML = `<b style="color:var(--red);">Todavía no has hecho ninguna copia en este dispositivo.</b>`; return; }
+  const dias = Math.floor((Date.now() - new Date(info.en).getTime()) / 86400000);
+  const cuando = dias <= 0 ? "hoy" : dias === 1 ? "ayer" : `hace ${dias} días`;
+  el.innerHTML = dias >= 7
+    ? `<b style="color:var(--amber);">Última copia ${cuando}</b> (${info.registros} registros) — conviene hacer una nueva.`
+    : `Última copia ${cuando} · ${info.registros} registros · ${esc(info.idRespaldo)}`;
+}
+
+function descargarArchivo(nombre, texto, tipo = "application/json") {
+  const blob = new Blob([texto], { type: tipo });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
-  a.download = `entimotors_respaldo_${new Date().toISOString().slice(0, 10)}.json`;
+  a.download = nombre;
   document.body.appendChild(a);
   a.click();
   a.remove();
-  URL.revokeObjectURL(url);
-  toast("Respaldo descargado");
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+
+/* Genera, verifica y entrega. Devuelve el respaldo verificado o null si algo
+   no cuadró — quien la llama decide qué hacer, pero nunca sigue a ciegas. */
+async function generarRespaldoVerificado(cajaEstado) {
+  const respaldo = await armarRespaldo();
+  const verif = await verificarRespaldo(respaldo);
+  if (cajaEstado) pintarEstadoRespaldo(cajaEstado, respaldo, verif);
+  if (!verif.ok) {
+    toast("La copia no se pudo verificar — revisa el detalle antes de continuar", "off");
+    return null;
+  }
+  anotarUltimoRespaldo(respaldo);
+  registrarAuditoria("respaldo", "sistema", null, `${respaldo.idRespaldo} · ${respaldo.totalRegistros} registros`);
+  return { respaldo, verif };
+}
+
+document.getElementById("btnRespaldarDatos").addEventListener("click", async () => {
+  toast("Preparando y verificando la copia…");
+  const r = await generarRespaldoVerificado("respaldoEstado");
+  if (!r) return;
+  descargarArchivo(nombreArchivoRespaldo(r.respaldo), r.verif.texto);
+  toast(`Copia verificada y descargada · ${r.respaldo.totalRegistros} registros`);
 });
+
+/* Compartir usa el menú del propio teléfono, así el archivo puede irse por
+   WhatsApp, a Archivos o a otra persona. WhatsApp aquí es solo el camión de
+   mudanza: la restauración siempre se hace eligiendo el archivo a mano. */
+document.getElementById("btnCompartirRespaldo").addEventListener("click", async () => {
+  toast("Preparando y verificando la copia…");
+  const r = await generarRespaldoVerificado("respaldoEstado");
+  if (!r) return;
+  const archivo = new File([r.verif.texto], nombreArchivoRespaldo(r.respaldo), { type: "application/json" });
+
+  if (navigator.canShare?.({ files: [archivo] })) {
+    try {
+      await navigator.share({
+        files: [archivo],
+        title: "Copia de seguridad ENTIMOTORS",
+        text: `Copia de ENTIMOTORS OS del ${new Date(r.respaldo.exportadoEn).toLocaleDateString("es-HN")} · ${r.respaldo.totalRegistros} registros. Guárdala: con este archivo se recupera todo el sistema.`,
+      });
+      toast("Copia compartida");
+    } catch (err) {
+      if (err?.name !== "AbortError") toast("No se pudo abrir el menú de compartir — se descargó en su lugar", "off");
+      if (err?.name !== "AbortError") descargarArchivo(archivo.name, r.verif.texto);
+    }
+    return;
+  }
+  descargarArchivo(archivo.name, r.verif.texto);
+  toast("Este navegador no comparte archivos: se descargó la copia", "off");
+});
+
+/* ---- restauración ---- */
+let respaldoParaRestaurar = null;
+let modoRestauracion = "reemplazar";
 
 document.getElementById("inputRestaurar").addEventListener("change", async (e) => {
   const file = e.target.files[0];
   e.target.value = "";
   if (!file) return;
-  let respaldo;
-  try {
-    respaldo = JSON.parse(await file.text());
-  } catch {
-    toast("Ese archivo no es un respaldo válido", "off");
-    return;
-  }
-  if (!respaldo?.data) { toast("Ese archivo no es un respaldo válido", "off"); return; }
 
-  const ok = await showConfirm(
-    "Esto reemplaza TODOS los datos actuales de este dispositivo por los del archivo. Lo que tengas ahora que no esté en el respaldo se perderá.",
-    { titulo: "Restaurar respaldo", textoOk: "Restaurar" }
-  );
-  if (!ok) return;
+  let respaldo;
+  try { respaldo = JSON.parse(await file.text()); }
+  catch { toast("Ese archivo no es un respaldo válido", "off"); return; }
+  if (!respaldo?.data || typeof respaldo.data !== "object") { toast("Ese archivo no es un respaldo válido", "off"); return; }
+
+  respaldoParaRestaurar = respaldo;
+  modoRestauracion = "reemplazar";
+  document.querySelectorAll("#restaurarModo .seg-opt").forEach(b => b.classList.toggle("active", b.dataset.modo === "reemplazar"));
+
+  const fecha = respaldo.exportadoEn ? new Date(respaldo.exportadoEn).toLocaleString("es-HN") : "fecha desconocida";
+  document.getElementById("restaurarOrigen").innerHTML =
+    `${esc(file.name)} · hecho el ${esc(fecha)}${respaldo.versionApp ? ` con la versión ${esc(respaldo.versionApp)}` : ""}${respaldo.idRespaldo ? ` · ${esc(respaldo.idRespaldo)}` : ""}`;
+
+  // qué trae el archivo frente a lo que ya hay
+  const actuales = {};
+  for (const store of ALL_STORES) actuales[store] = (await DB.getAll(store)).length;
+  const traeTotal = ALL_STORES.reduce((a, k) => a + (respaldo.data[k]?.length || 0), 0);
+  const hayTotal = Object.values(actuales).reduce((a, b) => a + b, 0);
+
+  document.getElementById("restaurarResumen").innerHTML =
+    `<b>El archivo trae ${traeTotal} registros.</b> Ahora mismo en este dispositivo hay ${hayTotal}.
+     <div class="respaldo-conteos">${ALL_STORES
+       .filter(k => (respaldo.data[k]?.length || 0) || actuales[k])
+       .map(k => `<span>${esc(k)} <b>${actuales[k]} → ${respaldo.data[k]?.length || 0}</b></span>`).join("")}</div>`;
+
+  // un respaldo de un esquema más nuevo puede traer tablas que esta versión no entiende
+  const desconocidas = Object.keys(respaldo.data).filter(k => !ALL_STORES.includes(k));
+  const aviso = document.getElementById("restaurarAviso");
+  if (respaldo.esquemaDB && db && respaldo.esquemaDB > db.version) {
+    aviso.className = "aviso-fuerte peligro";
+    aviso.textContent = `Este respaldo se hizo con una versión más nueva del sistema (esquema ${respaldo.esquemaDB} contra ${db.version} de aquí). Puede que algunos datos no se entiendan. Actualiza la app antes de restaurar.`;
+  } else if (desconocidas.length) {
+    aviso.className = "aviso-fuerte";
+    aviso.textContent = `El archivo trae información que esta versión no conoce (${desconocidas.join(", ")}) y esa parte se dejará fuera.`;
+  } else {
+    aviso.className = "aviso-fuerte";
+    aviso.textContent = "Antes de tocar nada se guardará automáticamente una copia de lo que hay ahora, por si necesitas volver atrás.";
+  }
+
+  actualizarExplicacionRestauracion();
+  document.getElementById("modalRestaurar").classList.add("active");
+});
+
+function actualizarExplicacionRestauracion() {
+  document.getElementById("restaurarExplicacion").textContent = modoRestauracion === "reemplazar"
+    ? "Se borra todo lo que hay en este dispositivo y queda exactamente lo del archivo. Es lo correcto si cambiaste de celular o estás recuperando de un desastre."
+    : "Se conserva lo que ya hay y solo se agregan los registros del archivo que no existan aquí (se comparan por identificador). Nada se borra, pero pueden quedar duplicados si el mismo dato se creó por separado en los dos dispositivos.";
+}
+
+document.getElementById("restaurarModo").addEventListener("click", (e) => {
+  const btn = e.target.closest(".seg-opt");
+  if (!btn) return;
+  modoRestauracion = btn.dataset.modo;
+  document.querySelectorAll("#restaurarModo .seg-opt").forEach(b => b.classList.toggle("active", b === btn));
+  actualizarExplicacionRestauracion();
+});
+
+document.getElementById("btnCancelarRestaurar").addEventListener("click", () => {
+  respaldoParaRestaurar = null;
+  document.getElementById("modalRestaurar").classList.remove("active");
+});
+
+alHacerClicUnaVez(document.getElementById("btnConfirmarRestaurar"), async () => {
+  const respaldo = respaldoParaRestaurar;
+  if (!respaldo) return;
+  const modo = modoRestauracion;
 
   requestAdminCode(async () => {
-    for (const store of ALL_STORES) {
-      await DB.clear(store);
-      for (const registro of respaldo.data[store] || []) await DB.save(store, registro);
+    // red de seguridad: antes de tocar nada, una copia de lo que hay AHORA.
+    // Si la restauración sale mal, esto es lo único que permite volver.
+    toast("Guardando una copia de lo actual antes de restaurar…");
+    const previo = await armarRespaldo();
+    const verifPrevio = await verificarRespaldo(previo);
+    if (verifPrevio.ok && previo.totalRegistros > 0) {
+      descargarArchivo(`entimotors-ANTES-de-restaurar-${previo.exportadoEn.slice(0, 10)}.json`, verifPrevio.texto);
     }
+
+    let escritos = 0, omitidos = 0;
+    if (modo === "reemplazar") {
+      for (const store of ALL_STORES) {
+        if (STORES_SOLO_AGREGAR.includes(store)) {
+          // la bitácora se conserva y se le suma lo del archivo, nunca se borra
+          const yaHay = new Set((await DB.getAll(store)).map(r => r.id));
+          for (const registro of respaldo.data[store] || []) {
+            if (registro.id !== undefined && yaHay.has(registro.id)) { omitidos++; continue; }
+            const { id, ...resto } = registro;
+            await DB.save(store, resto); // id nuevo: no pisa ninguna entrada existente
+            escritos++;
+          }
+          continue;
+        }
+        await DB.clear(store);
+        for (const registro of respaldo.data[store] || []) { await DB.save(store, registro); escritos++; }
+      }
+    } else {
+      for (const store of ALL_STORES) {
+        const existentes = new Set((await DB.getAll(store)).map(r => r.id ?? r.key));
+        for (const registro of respaldo.data[store] || []) {
+          const clave = registro.id ?? registro.key;
+          // no se pisa nada que ya exista: combinar solo agrega lo que falta
+          if (clave !== undefined && existentes.has(clave)) { omitidos++; continue; }
+          await DB.save(store, registro);
+          escritos++;
+        }
+      }
+    }
+
+    // comprobar que de verdad quedó lo que se esperaba
+    const despues = {};
+    for (const store of ALL_STORES) despues[store] = (await DB.getAll(store)).length;
+    const totalDespues = Object.values(despues).reduce((a, b) => a + b, 0);
+
     markDirty();
-    localStorage.setItem("enti_modo_datos", "blanco"); // ya hay datos reales del respaldo, no debe volver a sembrar demo
-    toast("Datos restaurados");
+    localStorage.setItem("enti_modo_datos", "blanco"); // ya hay datos reales: no volver a sembrar demo
+    registrarAuditoria("restaurar", "sistema", null, `${modo} · ${escritos} escritos, ${omitidos} omitidos · ${respaldo.idRespaldo || "sin id"}`);
+    respaldoParaRestaurar = null;
+    document.getElementById("modalRestaurar").classList.remove("active");
+    toast(`Restaurado: ${escritos} registros escritos${omitidos ? `, ${omitidos} ya existían` : ""} · ahora hay ${totalDespues}`);
     await continuarArranque(null);
   });
 });
@@ -5125,7 +5877,7 @@ async function seedIfEmpty() {
   await DB.save("caja_movimientos", { tipo: "ingreso", categoria: "Servicio taller", monto: 330, metodoPago: "efectivo", descripcion: "Orden de taller #entregada", fechaISO: haceDos.toISOString(), creadoEn: haceDos.getTime() });
   await DB.save("caja_movimientos", { tipo: "egreso", categoria: "Compra de repuestos", monto: 900, metodoPago: "efectivo", descripcion: "Reposición de aceite y pastillas", fechaISO: haceDos.toISOString(), creadoEn: haceDos.getTime() });
   if (aceite) {
-    const ventaDemo = { items: [{ inventarioId: aceite.id, nombre: aceite.nombre, cantidad: 2, precio: aceite.precio }], clienteId: null, metodoPago: "efectivo", total: aceite.precio * 2, efectivoRecibido: aceite.precio * 2, cambio: 0, fechaISO: new Date().toISOString(), creadoEn: Date.now(), mecanico: "Wilkin" };
+    const ventaDemo = { items: [{ inventarioId: aceite.id, nombre: aceite.nombre, cantidad: 2, precio: aceite.precio, costoUnitario: aceite.costoCompra || 0, costoEstimado: false }], clienteId: null, metodoPago: "efectivo", total: aceite.precio * 2, efectivoRecibido: aceite.precio * 2, cambio: 0, fechaISO: new Date().toISOString(), creadoEn: Date.now(), mecanico: "Wilkin" };
     const ventaId = await DB.save("ventas_rapidas", ventaDemo);
     await DB.save("caja_movimientos", { tipo: "ingreso", categoria: "Venta mostrador", monto: ventaDemo.total, metodoPago: "efectivo", descripcion: `Venta rápida #${ventaId}`, ventaId, fechaISO: ventaDemo.fechaISO, creadoEn: Date.now() });
   }
@@ -5166,7 +5918,19 @@ document.getElementById("btnModoBlanco").addEventListener("click", () => elegirM
 
 async function continuarArranque(modo) {
   if (modo === "demo") await seedIfEmpty();
-  if (currentUser?.user === "prueba") await sembrarDatosPrueba();
+  /* La cuenta "prueba" siembra datos de ejemplo, y hasta ahora lo hacía en
+     CUALQUIER base — incluida la real del taller. Como la contraseña está en el
+     código, bastaba con que alguien entrara con esa cuenta en el celular del
+     cliente para mezclarle clientes y repuestos inventados con los de verdad,
+     sin ninguna advertencia.
+     Ahora solo siembra si el dispositivo está prácticamente vacío. Donde ya hay
+     trabajo real, la cuenta de prueba entra y no toca nada. */
+  if (currentUser?.user === "prueba") {
+    const reales = await Promise.all(["clientes", "ordenes", "ventas_rapidas", "creditos"].map(st => DB.getAll(st)));
+    const totalReal = reales.reduce((a, filas) => a + filas.length, 0);
+    if (totalReal === 0) await sembrarDatosPrueba();
+    else console.info("[ENTIMOTORS] cuenta de prueba: ya hay datos reales, no se siembra nada");
+  }
   aplicarPermisosPorRol();
   await renderOrdersList();
   await renderClientes();
@@ -5189,13 +5953,18 @@ async function continuarArranque(modo) {
 function wireServiceWorkerUpdates() {
   if (!("serviceWorker" in navigator)) return;
 
-  // sw.js llama a skipWaiting()/clients.claim() sin pedir permiso, así que en
-  // cuanto el nuevo Service Worker toma control recargamos solo — nadie tiene
-  // que darle a "Actualizar" ni refrescar la página a mano.
-  let recargando = false;
+  /* ANTES la app se recargaba sola en cuanto el Service Worker nuevo tomaba
+     control. Eso está bien mientras se está desarrollando, pero es inaceptable
+     en el taller del cliente: toda su información vive únicamente en este
+     dispositivo, y una actualización silenciosa lo mueve de versión sin que
+     tenga copia de nada y —peor— pudiendo perder lo que estuviera escribiendo.
+
+     Ahora la recarga solo ocurre cuando la persona la pide desde el aviso de
+     versión nueva, y después de haberle ofrecido la copia de seguridad. */
+  let recargaAutorizada = false;
+  window.autorizarRecargaPorActualizacion = () => { recargaAutorizada = true; };
   navigator.serviceWorker.addEventListener("controllerchange", () => {
-    if (recargando) return;
-    recargando = true;
+    if (!recargaAutorizada) return; // actualización silenciosa: bloqueada a propósito
     location.reload();
   });
 
@@ -5211,7 +5980,7 @@ function wireServiceWorkerUpdates() {
         // "installed" + ya había un controller = hay una versión nueva esperando,
         // no es la primera instalación del Service Worker.
         if (nuevo.state === "installed" && navigator.serviceWorker.controller) {
-          document.getElementById("updateBanner").style.display = "flex";
+          abrirAvisoVersionNueva();
         }
       });
     });
@@ -5227,6 +5996,64 @@ function wireServiceWorkerUpdates() {
     });
   }).catch(() => {});
 }
+
+/* ================= AVISO DE VERSIÓN NUEVA =================
+   Pasar de la versión que el cliente usa hoy a una nueva es un momento de
+   riesgo: sus datos están solo aquí. Por eso la actualización nunca es
+   automática — se avisa, se le ofrece la copia primero, y él decide.
+
+   "Ahora no" es una respuesta válida y se respeta: no se vuelve a preguntar en
+   esta sesión, y la versión vieja sigue funcionando con normalidad. */
+let avisoVersionMostrado = false;
+
+function abrirAvisoVersionNueva() {
+  if (avisoVersionMostrado) return;
+  if (document.getElementById("modalRestaurar")?.classList.contains("active")) return; // no interrumpir una restauración
+  avisoVersionMostrado = true;
+
+  document.getElementById("versionNuevaDetalle").textContent =
+    `Hay una versión nueva de ENTIMOTORS OS lista para instalarse en este dispositivo. La que tienes ahora seguirá funcionando hasta que decidas actualizar.`;
+  const estado = document.getElementById("versionNuevaEstado");
+  estado.style.display = "none";
+  estado.className = "respaldo-estado";
+  document.getElementById("modalVersionNueva").classList.add("active");
+}
+
+function cerrarAvisoVersion() {
+  document.getElementById("modalVersionNueva").classList.remove("active");
+}
+
+document.getElementById("btnActualizarDespues").addEventListener("click", () => {
+  cerrarAvisoVersion();
+  toast("De acuerdo — puedes actualizar cuando quieras desde Ajustes");
+});
+
+document.getElementById("btnSoloCopia").addEventListener("click", async () => {
+  toast("Preparando y verificando la copia…");
+  const r = await generarRespaldoVerificado("versionNuevaEstado");
+  if (!r) return;
+  descargarArchivo(nombreArchivoRespaldo(r.respaldo), r.verif.texto);
+  toast(`Copia verificada · ${r.respaldo.totalRegistros} registros`);
+});
+
+alHacerClicUnaVez(document.getElementById("btnCopiaYActualizar"), async () => {
+  toast("Preparando y verificando la copia…");
+  const r = await generarRespaldoVerificado("versionNuevaEstado");
+  // si la copia no se pudo verificar NO se actualiza: actualizar sin respaldo
+  // bueno es exactamente el escenario que hay que evitar
+  if (!r) { toast("No se actualizará hasta tener una copia verificada", "off"); return; }
+  descargarArchivo(nombreArchivoRespaldo(r.respaldo), r.verif.texto);
+  registrarAuditoria("actualizar-version", "sistema", null, `desde ${VERSION_APP} · copia ${r.respaldo.idRespaldo}`);
+
+  toast("Copia guardada. Actualizando…");
+  window.autorizarRecargaPorActualizacion?.();
+  try {
+    const reg = await navigator.serviceWorker.getRegistration();
+    if (reg?.waiting) reg.waiting.postMessage({ tipo: "activar-ya" });
+  } catch (e) {}
+  // si el Service Worker no cambia de control en unos segundos, se recarga igual
+  setTimeout(() => location.reload(), 2500);
+});
 
 /* ================= boot: gate de instalación -> gate de login -> app ================= */
 (function boot() {

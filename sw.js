@@ -2,8 +2,8 @@
 // cambiando la app todos los días, "caché primero" deja a los dispositivos ya
 // instalados atascados en una versión vieja para siempre — network-first evita
 // eso y de todos modos cae al caché cuando de verdad no hay señal.
-const CACHE_NAME = "entimotors-v3.11.0";
-const SHELL = ["./", "./index.html", "./app.js?v=3.11.0", "./manifest.json", "./icons/icon-192.png", "./icons/logo-watermark-doc.png"];
+const CACHE_NAME = "entimotors-v3.12.0";
+const SHELL = ["./", "./index.html", "./app.js?v=3.12.0", "./manifest.json", "./icons/icon-192.png", "./icons/logo-watermark-doc.png"];
 
 // Librerías que convierten la factura en imagen/PDF para poder mandarla por
 // WhatsApp. Van aparte del SHELL y con .catch(): si el CDN no responde, la app
@@ -27,7 +27,14 @@ self.addEventListener("install", (event) => {
       ])
     )
   );
-  self.skipWaiting();
+  // OJO: aquí NO va self.skipWaiting().
+  // Con skipWaiting() la versión nueva tomaba el control sola y la app se
+  // recargaba sin avisar. El cliente tiene información que solo existe en su
+  // dispositivo, así que la versión nueva se queda esperando en "waiting" hasta
+  // que la persona acepte el aviso —y haya guardado su copia—. Ese aviso manda
+  // el mensaje "activar-ya" que se atiende más abajo.
+  // En la primerísima instalación no hay ningún Service Worker anterior, así que
+  // el navegador activa esta directamente sin pasar por la espera.
 });
 
 self.addEventListener("activate", (event) => {
@@ -46,6 +53,8 @@ self.addEventListener("activate", (event) => {
 const URL_IMPRESION = new URL("impresion.html", self.location).href;
 
 self.addEventListener("message", (event) => {
+  // la app autorizó la actualización: recién ahora esta versión toma el control
+  if (event.data?.tipo === "activar-ya") { self.skipWaiting(); return; }
   if (event.data?.tipo !== "guardar-impresion") return;
   event.waitUntil(
     caches.open(CACHE_NAME)
