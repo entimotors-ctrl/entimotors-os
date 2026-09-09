@@ -3143,7 +3143,7 @@ async function refreshCitaHoraOptions() {
     sel.innerHTML = `<option value="">Elige una fecha primero</option>`;
     return;
   }
-  const libres = await slotsDisponibles(fecha, mecanico);
+  const libres = await slotsDisponibles(fecha, mecanico, citaEditandoId);
   sel.innerHTML = libres.length
     ? libres.map(h => `<option value="${h}">${h}</option>`).join("")
     : `<option value="">Sin horarios disponibles ese día — elige otra fecha</option>`;
@@ -3152,10 +3152,11 @@ async function refreshCitaHoraOptions() {
 document.getElementById("citaFecha").addEventListener("change", refreshCitaHoraOptions);
 document.getElementById("citaMecanico").addEventListener("change", refreshCitaHoraOptions);
 
-async function checkCitaConflicto(fecha, hora, mecanico) {
+async function checkCitaConflicto(fecha, hora, mecanico, excluirCitaId = null) {
   if (!mecanico) return true;
   const citas = await DB.getAll("citas");
-  const choque = citas.find(c => c.fecha === fecha && c.hora === hora && c.mecanico === mecanico);
+  // al editar una cita sin moverla de horario, ella misma no es un choque
+  const choque = citas.find(c => c.id !== excluirCitaId && c.fecha === fecha && c.hora === hora && c.mecanico === mecanico);
   if (!choque) return true;
   return showConfirm(
     `${mecanico} ya tiene otra cita agendada el ${fecha} a las ${hora}. ¿Agendar esta de todas formas?`,
@@ -3187,7 +3188,7 @@ async function abrirModalMoverCita(citaId) {
   citaAMover = cita;
 
   const cliente = cita.clienteId ? await DB.get("clientes", cita.clienteId) : null;
-  const nombre = cliente?.nombre || cita.nombreTmp || "Cliente";
+  const nombre = cita.nombreTmp || cliente?.nombre || "Cliente";
   // el teléfono de la cita manda sobre el de la ficha: si se corrigió a mano al
   // agendar, esa corrección vale para esta cita. Si no se tocó, telefonoTmp
   // queda vacío y se sigue usando el teléfono actual del cliente.
@@ -3239,7 +3240,7 @@ alHacerClicUnaVez(document.getElementById("btnConfirmarMover"), async () => {
   if (!(await checkCitaConflicto(fecha, hora, mecanico))) return;
 
   const cliente = cita.clienteId ? await DB.get("clientes", cita.clienteId) : null;
-  const nombre = cliente?.nombre || cita.nombreTmp || "Cliente";
+  const nombre = cita.nombreTmp || cliente?.nombre || "Cliente";
   // el teléfono de la cita manda sobre el de la ficha: si se corrigió a mano al
   // agendar, esa corrección vale para esta cita. Si no se tocó, telefonoTmp
   // queda vacío y se sigue usando el teléfono actual del cliente.
@@ -3335,7 +3336,7 @@ async function renderCitasList() {
   citas = [...citas].sort((a, b) => `${a.fecha}${a.hora}`.localeCompare(`${b.fecha}${b.hora}`));
   list.innerHTML = citas.map(c => {
     const cliente = clientes.find(cl => cl.id === c.clienteId);
-    const nombre = cliente?.nombre || c.nombreTmp || "Cliente";
+    const nombre = c.nombreTmp || cliente?.nombre || "Cliente";
     const telefono = c.telefonoTmp || cliente?.telefono || "";
     const { label, dt } = citaWhenInfo(c);
     const { diffDays } = citaWhenInfo(c);
@@ -3347,16 +3348,19 @@ async function renderCitasList() {
       acciones = `<button type="button" class="btn ghost small" data-action="ver-orden" data-orden="${c.ordenId}">Ver orden #${c.ordenId} →</button>`;
     } else if (c.estado === "ausente") {
       acciones = `<button type="button" class="btn ghost small" data-action="reabrir" data-id="${c.id}">Reabrir</button>
+        <button type="button" class="btn ghost small" data-action="editar" data-id="${c.id}">✏️ Editar</button>
         <button type="button" class="btn ghost small" data-action="mover" data-id="${c.id}">📅 Mover</button>
         <button type="button" class="btn ghost small danger" data-action="eliminar" data-id="${c.id}" data-tel="" data-nombre="${esc(nombre)}" title="Eliminar cita" aria-label="Eliminar cita">🗑</button>`;
     } else if (diffDays <= 0) {
       // ya llegó el día (o ya pasó): toca decidir si vino o no
       acciones = `<button class="btn primary small" data-action="llego" data-id="${c.id}">✅ Llegó</button>
         <button type="button" class="btn ghost small" data-action="ausente" data-id="${c.id}">🚫 No llegó</button>
+        <button type="button" class="btn ghost small" data-action="editar" data-id="${c.id}">✏️ Editar</button>
         <button type="button" class="btn ghost small" data-action="mover" data-id="${c.id}">📅 Mover</button>
         <button type="button" class="btn ghost small danger" data-action="eliminar" data-id="${c.id}" data-tel="${esc(telefono)}" data-nombre="${esc(nombre)}" title="Eliminar cita" aria-label="Eliminar cita">🗑</button>`;
     } else {
       acciones = `<button class="btn wa small" data-action="recordar" data-id="${c.id}" data-tel="${esc(telefono)}" data-nombre="${esc(nombre)}">${c.recordatorioEnviado ? "Recordatorio enviado ✓" : "Enviar recordatorio"}</button>
+        <button type="button" class="btn ghost small" data-action="editar" data-id="${c.id}">✏️ Editar</button>
         <button type="button" class="btn ghost small" data-action="mover" data-id="${c.id}">📅 Mover</button>
         <button type="button" class="btn ghost small danger" data-action="eliminar" data-id="${c.id}" data-tel="${esc(telefono)}" data-nombre="${esc(nombre)}" title="Eliminar cita" aria-label="Eliminar cita">🗑</button>`;
     }
@@ -3391,6 +3395,13 @@ async function renderCitasList() {
     btn.addEventListener("click", async (e) => {
       e.stopPropagation();
       await abrirOrdenDesdeCita(Number(btn.dataset.id));
+    });
+  });
+
+  list.querySelectorAll('[data-action="editar"]').forEach(btn => {
+    btn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      await abrirModalEditarCita(Number(btn.dataset.id));
     });
   });
 
@@ -3472,6 +3483,54 @@ function updateCitasBadge(n) {
 }
 
 let citaClienteSel = null; // clienteId cuando se elige un cliente existente
+let citaEditandoId = null; // id de la cita cuando el modal está editando una existente (null = cita nueva)
+
+/* El mismo modal sirve para crear y para editar; lo único que cambia son los
+   rótulos, para que quede claro cuál de las dos cosas se está haciendo.
+   "Mover" sigue existiendo aparte para el cambio rápido de fecha/hora. */
+function ponerModoCita(editando) {
+  document.getElementById("citaModalTitulo").textContent = editando ? "Editar cita" : "Nueva cita";
+  document.getElementById("citaNombreLabel").textContent = editando ? "Nombre para esta cita" : "Nombre (si es nuevo)";
+  document.getElementById("btnGuardarCita").textContent = editando ? "Guardar cambios y avisar" : "Guardar y avisar";
+}
+
+async function abrirModalEditarCita(citaId) {
+  const cita = await DB.get("citas", citaId);
+  if (!cita) return;
+  citaEditandoId = citaId; // antes de refrescar horas: libera el hueco propio
+  await refreshCitaClienteSelect();
+
+  const cliente = cita.clienteId ? await DB.get("clientes", cita.clienteId) : null;
+  citaClienteSel = cita.clienteId || null;
+  document.getElementById("citaBuscarCliente").value = cliente?.nombre || "";
+  renderCitaClienteChip();
+
+  // se muestra lo que vale para ESTA cita: su propio nombre/teléfono si los
+  // tiene, y si no los de la ficha del cliente.
+  document.getElementById("citaNombre").value = cita.nombreTmp || cliente?.nombre || "";
+  document.getElementById("citaTelefono").value = cita.telefonoTmp || cliente?.telefono || "";
+  document.getElementById("citaMotivo").value = cita.motivo || "";
+
+  // una cita vieja puede estar en el pasado; el min de "nueva cita" impediría
+  // abrirla siquiera, así que aquí el mínimo es su propia fecha.
+  const hoy = new Date().toISOString().slice(0, 10);
+  const campoFecha = document.getElementById("citaFecha");
+  campoFecha.min = cita.fecha < hoy ? cita.fecha : hoy;
+  campoFecha.value = cita.fecha;
+
+  document.getElementById("citaMecanico").value = cita.mecanico;
+  await refreshCitaHoraOptions();
+  const selHora = document.getElementById("citaHora");
+  // si la hora actual no es uno de los huecos estándar (típico de las citas que
+  // entran por la web), se agrega para no perderla al abrir el modal.
+  if (cita.hora && ![...selHora.options].some(o => o.value === cita.hora)) {
+    selHora.insertAdjacentHTML("afterbegin", `<option value="${esc(cita.hora)}">${esc(cita.hora)} (actual)</option>`);
+  }
+  selHora.value = cita.hora;
+
+  ponerModoCita(true);
+  document.getElementById("modalCita").classList.add("active");
+}
 
 function renderCitaClienteChip() {
   const wrap = document.getElementById("citaClienteChipWrap");
@@ -3499,6 +3558,8 @@ async function refreshCitaClienteSelect() {
 
 document.getElementById("btnNuevaCita").addEventListener("click", async () => {
   await refreshCitaClienteSelect();
+  citaEditandoId = null;
+  ponerModoCita(false);
   citaClienteSel = null;
   document.getElementById("citaBuscarCliente").value = "";
   renderCitaClienteChip();
@@ -3507,7 +3568,11 @@ document.getElementById("btnNuevaCita").addEventListener("click", async () => {
   await refreshCitaHoraOptions();
   document.getElementById("modalCita").classList.add("active");
 });
-document.getElementById("btnCancelarCita").addEventListener("click", () => document.getElementById("modalCita").classList.remove("active"));
+document.getElementById("btnCancelarCita").addEventListener("click", () => {
+  citaEditandoId = null;
+  ponerModoCita(false);
+  document.getElementById("modalCita").classList.remove("active");
+});
 
 alHacerClicUnaVez(document.getElementById("btnGuardarCita"), async () => {
   const fecha = document.getElementById("citaFecha").value;
@@ -3517,66 +3582,71 @@ alHacerClicUnaVez(document.getElementById("btnGuardarCita"), async () => {
   if (!fecha) { toast("Elige una fecha", "off"); return; }
   if (!hora) { toast("Elige una hora disponible", "off"); return; }
 
-  /* El teléfono que se usa es SIEMPRE el que quedó escrito en el formulario.
-
-     Antes se leía solo en la rama del cliente nuevo: si alguien elegía un
-     cliente del autocompletado y luego corregía el número a mano, esa
-     corrección se descartaba en silencio y la confirmación se abría hacia el
-     teléfono viejo guardado en la ficha. El autocompletado rellena el campo,
-     pero editarlo no deselecciona al cliente (y no debe: la cita tiene que
-     seguir ligada a él), así que el número visible es el que manda. */
+  /* El nombre y el teléfono que se usan son SIEMPRE los que quedaron escritos
+     en el formulario. El autocompletado los rellena, pero editarlos no
+     deselecciona al cliente (y no debe: la cita tiene que seguir ligada a él),
+     así que lo visible es lo que manda. */
+  const nombreEscrito = document.getElementById("citaNombre").value.trim();
   const telefonoEscrito = document.getElementById("citaTelefono").value.trim();
-  let clienteId = null, nombreTmp = "";
-  if (citaClienteSel) {
-    clienteId = citaClienteSel;
-  } else {
-    nombreTmp = document.getElementById("citaNombre").value.trim();
-    if (!nombreTmp) { toast("Falta el nombre del cliente", "off"); return; }
-  }
+  const clienteId = citaClienteSel || null;
+  if (!clienteId && !nombreEscrito) { toast("Falta el nombre del cliente", "off"); return; }
 
-  // se abre YA, antes del modal de confirmación de choque de horario — ese
-  // modal puede tardar segundos en cerrarse (espera a que la persona toque
-  // algo), y para cuando eso resuelve, el gesto original ya expiró y
-  // window.open() se bloquearía en silencio si se abriera hasta después.
-  // Se abren las DOS ventanas (mecánico y cliente) en el mismo gesto de clic;
-  // la que no se termine usando se cierra sin navegar, sin costo real.
-  const mecanicoInfo = TEAM.find(t => t.nombre === mecanico);
-  const ventanaWA = mecanicoInfo?.telefono ? abrirVentanaWA() : null;
+  /* UNA sola ventana de WhatsApp por gesto, y va al CLIENTE.
+
+     Antes se abrían dos (mecánico primero, cliente después). En iPhone el
+     navegador solo concede una ventana por gesto: la del mecánico se quedaba
+     con el único cupo y la del cliente se bloqueaba en silencio, así que el
+     taller terminaba viendo el WhatsApp del propio mecánico en lugar del
+     número de la cita. El aviso al mecánico sale del flujo de citas; se hará
+     dentro de la app cuando existan perfiles y notificaciones. */
   const ventanaWACliente = (toWaDigits(telefonoEscrito) || clienteId) ? abrirVentanaWA() : null;
 
-  if (!(await checkCitaConflicto(fecha, hora, mecanico))) { ventanaWA?.close(); ventanaWACliente?.close(); return; }
+  const editandoId = citaEditandoId;
+  if (!(await checkCitaConflicto(fecha, hora, mecanico, editandoId))) { ventanaWACliente?.close(); return; }
 
   const clienteGuardado = clienteId ? await DB.get("clientes", clienteId) : null;
-  const nombreCliente = clienteGuardado ? clienteGuardado.nombre : nombreTmp;
+  const nombreCliente = nombreEscrito || clienteGuardado?.nombre || "Cliente";
   const telefonoCliente = telefonoEscrito || (clienteGuardado?.telefono || "");
 
-  /* telefonoTmp guarda el número SOLO cuando difiere del de la ficha: así una
-     cita sin corregir sigue al teléfono actual del cliente (si mañana cambia
-     de número, el recordatorio va al nuevo), y una cita corregida a mano
-     conserva su propio número sin pisar la ficha del cliente. */
+  /* nombreTmp y telefonoTmp guardan el dato SOLO cuando difiere del de la
+     ficha. Así una cita sin corregir sigue al dato actual del cliente (si
+     mañana cambia de número, el recordatorio va al nuevo), y una cita
+     corregida a mano conserva el suyo — sin tocar la ficha del cliente, que
+     nunca se escribe desde aquí. */
   const telefonoTmp = (clienteGuardado && telefonoEscrito === (clienteGuardado.telefono || "").trim())
     ? "" : telefonoEscrito;
+  const nombreTmp = (clienteGuardado && nombreEscrito === (clienteGuardado.nombre || "").trim())
+    ? "" : nombreEscrito;
 
-  const id = await DB.save("citas", { clienteId, nombreTmp, telefonoTmp, fecha, hora, motivo, mecanico, origen: "interna", recordatorioEnviado: false, creadoEn: Date.now() });
+  let id = editandoId;
+  const citaPrevia = editandoId ? await DB.get("citas", editandoId) : null;
+  if (citaPrevia) {
+    // se conserva todo lo que este modal no edita: estado, origen, creadoEn,
+    // reprogramaciones, el vínculo con la orden, el aviso ya registrado...
+    const cambioDeHorario = citaPrevia.fecha !== fecha || citaPrevia.hora !== hora;
+    await DB.save("citas", {
+      ...citaPrevia, clienteId, nombreTmp, telefonoTmp, fecha, hora, motivo, mecanico,
+      // si se corrió la cita, el recordatorio anterior ya no sirve
+      recordatorioEnviado: cambioDeHorario ? false : citaPrevia.recordatorioEnviado,
+    });
+  } else {
+    id = await DB.save("citas", { clienteId, nombreTmp, telefonoTmp, fecha, hora, motivo, mecanico, origen: "interna", recordatorioEnviado: false, creadoEn: Date.now() });
+  }
   markDirty();
   document.getElementById("modalCita").classList.remove("active");
-  toast("Cita guardada");
+  citaEditandoId = null;
+  ponerModoCita(false);
+  toast(citaPrevia ? "Cita actualizada" : "Cita guardada");
 
-  const texto = `Nueva cita asignada: ${nombreCliente} el ${new Date(`${fecha}T${hora}`).toLocaleDateString()} a las ${hora}. Motivo: ${motivo || "sin especificar"}.`;
-  if (mecanicoInfo?.telefono) {
-    navegarWA(ventanaWA, mecanicoInfo.telefono, texto);
-  } else {
-    toast(`${mecanico} no tiene teléfono configurado en TEAM (app.js) — no se pudo abrir el aviso por WhatsApp`, "off");
-  }
-
-  /* Confirmación al cliente. El envío 100% automático (sin que nadie toque
-     "enviar" dentro de WhatsApp) requiere WhatsApp Business API con un backend
-     propio — ENTIMOTORS no lo tiene todavía (ver comentario al inicio del
-     archivo). Esto abre WhatsApp con el mensaje ya escrito, así que el estado
-     que se guarda es "abierto", nunca "enviado": no hay forma de confirmar
-     desde aquí que el mensaje de verdad salió. */
+  /* Aviso al cliente. El envío 100% automático (sin que nadie toque "enviar"
+     dentro de WhatsApp) requiere WhatsApp Business API con un backend propio —
+     ENTIMOTORS no lo tiene todavía (ver comentario al inicio del archivo).
+     Esto abre WhatsApp con el mensaje ya escrito, así que el estado que se
+     guarda es "abierto", nunca "enviado". */
   const fechaLegible = new Date(`${fecha}T${hora}`).toLocaleDateString("es-HN", { day: "numeric", month: "long" });
-  const textoCliente = `Hola ${nombreCliente}, tu cita en ENTIMOTORS quedó registrada para el ${fechaLegible} a las ${hora}. ¡Te esperamos!`;
+  const textoCliente = citaPrevia
+    ? `Hola ${nombreCliente}, actualizamos tu cita en ENTIMOTORS: queda para el ${fechaLegible} a las ${hora}. ¡Te esperamos!`
+    : `Hola ${nombreCliente}, tu cita en ENTIMOTORS quedó registrada para el ${fechaLegible} a las ${hora}. ¡Te esperamos!`;
   let avisoClienteWA;
   if (toWaDigits(telefonoCliente)) {
     navegarWA(ventanaWACliente, telefonoCliente, textoCliente);
@@ -5326,7 +5396,7 @@ async function renderWebCMS() {
     citasWeb.sort((a, b) => `${a.fecha}${a.hora}`.localeCompare(`${b.fecha}${b.hora}`));
     list.innerHTML = citasWeb.map(c => {
       const cliente = clientes.find(cl => cl.id === c.clienteId);
-      const nombre = cliente?.nombre || c.nombreTmp || "Cliente web";
+      const nombre = c.nombreTmp || cliente?.nombre || "Cliente web";
       const telefono = c.telefonoTmp || cliente?.telefono || "";
       const { label, dt } = citaWhenInfo(c);
       return `
@@ -5435,7 +5505,7 @@ document.getElementById("btnForzarActualizacion").addEventListener("click", asyn
    fecha e identificador, para que al restaurarlo se sepa exactamente de dónde
    salió y si el esquema es compatible. */
 
-const VERSION_APP = "3.12.1";
+const VERSION_APP = "3.12.2";
 const VERSION_RESPALDO = 2; // formato del archivo, no de la app
 
 async function armarRespaldo() {

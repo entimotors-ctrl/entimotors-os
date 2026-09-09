@@ -2,8 +2,8 @@
 // cambiando la app todos los días, "caché primero" deja a los dispositivos ya
 // instalados atascados en una versión vieja para siempre — network-first evita
 // eso y de todos modos cae al caché cuando de verdad no hay señal.
-const CACHE_NAME = "entimotors-v3.12.1";
-const SHELL = ["./", "./index.html", "./app.js?v=3.12.1", "./manifest.json", "./icons/icon-192.png", "./icons/logo-watermark-doc.png"];
+const CACHE_NAME = "entimotors-v3.12.2";
+const SHELL = ["./", "./index.html", "./app.js?v=3.12.2", "./manifest.json", "./icons/icon-192.png", "./icons/logo-watermark-doc.png"];
 
 // Librerías que convierten la factura en imagen/PDF para poder mandarla por
 // WhatsApp. Van aparte del SHELL y con .catch(): si el CDN no responde, la app

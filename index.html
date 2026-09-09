@@ -1160,7 +1160,7 @@
     <!-- CITAS -->
     <section class="view" id="view-citas">
       <div class="view-head">
-        <div><h2>Citas</h2><p>Al guardar una cita se prepara un aviso por WhatsApp al mecánico asignado.</p></div>
+        <div><h2>Citas</h2><p>Al guardar una cita se prepara la confirmación por WhatsApp para el cliente.</p></div>
         <button class="btn primary" id="btnNuevaCita">+ Nueva cita</button>
       </div>
       <div class="widget-row" id="citasWidgetRow"></div>
@@ -2011,7 +2011,7 @@
 <!-- Modal: nueva cita -->
 <div class="modal-bg" id="modalCita">
   <div class="modal">
-    <h3>Nueva cita</h3>
+    <h3 id="citaModalTitulo">Nueva cita</h3>
     <label>Buscar cliente por nombre o placa</label>
     <div class="autocomplete-wrap">
       <input type="text" id="citaBuscarCliente" placeholder="Ej. Carlos Reyes o HAX-4471" autocomplete="off">
@@ -2019,7 +2019,7 @@
     </div>
     <div id="citaClienteChipWrap"></div>
     <div class="field-row" style="grid-template-columns:1fr 1fr;">
-      <div><label>Nombre (si es nuevo)</label><input type="text" id="citaNombre"></div>
+      <div><label id="citaNombreLabel">Nombre (si es nuevo)</label><input type="text" id="citaNombre"></div>
       <div><label>Teléfono</label><input type="tel" id="citaTelefono" placeholder="9704-9635"></div>
     </div>
     <div class="field-row" style="grid-template-columns:1fr 1fr;">
@@ -2312,11 +2312,11 @@
 <!-- config-local.js es opcional (ignorado por Git): sin él, el login local de
      TEAM y el código de administrador quedan deshabilitados, pero el resto de
      la app sigue funcionando igual. Ver config-local.example.js. -->
-<script src="config-local.js?v=3.12.1"></script>
+<script src="config-local.js?v=3.12.2"></script>
 <!-- el ?v= debe cambiar cada vez que se toque app.js (junto con CACHE_NAME en
      sw.js) — es la forma más universal de forzar que CUALQUIER navegador
      pida el archivo de nuevo aunque ya tenga guardada una copia vieja en su
      propio caché HTTP, sin depender de que respete el Service Worker. -->
-<script src="app.js?v=3.12.1"></script>
+<script src="app.js?v=3.12.2"></script>
 </body>
 </html>
