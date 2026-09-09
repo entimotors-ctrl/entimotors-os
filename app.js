@@ -3188,7 +3188,10 @@ async function abrirModalMoverCita(citaId) {
 
   const cliente = cita.clienteId ? await DB.get("clientes", cita.clienteId) : null;
   const nombre = cliente?.nombre || cita.nombreTmp || "Cliente";
-  const telefono = cliente?.telefono || cita.telefonoTmp || "";
+  // el teléfono de la cita manda sobre el de la ficha: si se corrigió a mano al
+  // agendar, esa corrección vale para esta cita. Si no se tocó, telefonoTmp
+  // queda vacío y se sigue usando el teléfono actual del cliente.
+  const telefono = cita.telefonoTmp || cliente?.telefono || "";
   const { dt } = citaWhenInfo(cita);
 
   document.getElementById("moverCitaActualTexto").textContent =
@@ -3237,7 +3240,10 @@ alHacerClicUnaVez(document.getElementById("btnConfirmarMover"), async () => {
 
   const cliente = cita.clienteId ? await DB.get("clientes", cita.clienteId) : null;
   const nombre = cliente?.nombre || cita.nombreTmp || "Cliente";
-  const telefono = cliente?.telefono || cita.telefonoTmp || "";
+  // el teléfono de la cita manda sobre el de la ficha: si se corrigió a mano al
+  // agendar, esa corrección vale para esta cita. Si no se tocó, telefonoTmp
+  // queda vacío y se sigue usando el teléfono actual del cliente.
+  const telefono = cita.telefonoTmp || cliente?.telefono || "";
 
   // la ventana de WhatsApp se abre desde el propio clic, antes de guardar: si
   // se abriera después del await, el celular la bloquearía por "gesto vencido".
@@ -3330,7 +3336,7 @@ async function renderCitasList() {
   list.innerHTML = citas.map(c => {
     const cliente = clientes.find(cl => cl.id === c.clienteId);
     const nombre = cliente?.nombre || c.nombreTmp || "Cliente";
-    const telefono = cliente?.telefono || c.telefonoTmp || "";
+    const telefono = c.telefonoTmp || cliente?.telefono || "";
     const { label, dt } = citaWhenInfo(c);
     const { diffDays } = citaWhenInfo(c);
     // los botones cambian según en qué momento está la cita: no tiene sentido
@@ -3511,12 +3517,20 @@ alHacerClicUnaVez(document.getElementById("btnGuardarCita"), async () => {
   if (!fecha) { toast("Elige una fecha", "off"); return; }
   if (!hora) { toast("Elige una hora disponible", "off"); return; }
 
-  let clienteId = null, nombreTmp = "", telefonoTmp = "";
+  /* El teléfono que se usa es SIEMPRE el que quedó escrito en el formulario.
+
+     Antes se leía solo en la rama del cliente nuevo: si alguien elegía un
+     cliente del autocompletado y luego corregía el número a mano, esa
+     corrección se descartaba en silencio y la confirmación se abría hacia el
+     teléfono viejo guardado en la ficha. El autocompletado rellena el campo,
+     pero editarlo no deselecciona al cliente (y no debe: la cita tiene que
+     seguir ligada a él), así que el número visible es el que manda. */
+  const telefonoEscrito = document.getElementById("citaTelefono").value.trim();
+  let clienteId = null, nombreTmp = "";
   if (citaClienteSel) {
     clienteId = citaClienteSel;
   } else {
     nombreTmp = document.getElementById("citaNombre").value.trim();
-    telefonoTmp = document.getElementById("citaTelefono").value.trim();
     if (!nombreTmp) { toast("Falta el nombre del cliente", "off"); return; }
   }
 
@@ -3528,18 +3542,25 @@ alHacerClicUnaVez(document.getElementById("btnGuardarCita"), async () => {
   // la que no se termine usando se cierra sin navegar, sin costo real.
   const mecanicoInfo = TEAM.find(t => t.nombre === mecanico);
   const ventanaWA = mecanicoInfo?.telefono ? abrirVentanaWA() : null;
-  const ventanaWACliente = (clienteId || toWaDigits(telefonoTmp)) ? abrirVentanaWA() : null;
+  const ventanaWACliente = (toWaDigits(telefonoEscrito) || clienteId) ? abrirVentanaWA() : null;
 
   if (!(await checkCitaConflicto(fecha, hora, mecanico))) { ventanaWA?.close(); ventanaWACliente?.close(); return; }
+
+  const clienteGuardado = clienteId ? await DB.get("clientes", clienteId) : null;
+  const nombreCliente = clienteGuardado ? clienteGuardado.nombre : nombreTmp;
+  const telefonoCliente = telefonoEscrito || (clienteGuardado?.telefono || "");
+
+  /* telefonoTmp guarda el número SOLO cuando difiere del de la ficha: así una
+     cita sin corregir sigue al teléfono actual del cliente (si mañana cambia
+     de número, el recordatorio va al nuevo), y una cita corregida a mano
+     conserva su propio número sin pisar la ficha del cliente. */
+  const telefonoTmp = (clienteGuardado && telefonoEscrito === (clienteGuardado.telefono || "").trim())
+    ? "" : telefonoEscrito;
 
   const id = await DB.save("citas", { clienteId, nombreTmp, telefonoTmp, fecha, hora, motivo, mecanico, origen: "interna", recordatorioEnviado: false, creadoEn: Date.now() });
   markDirty();
   document.getElementById("modalCita").classList.remove("active");
   toast("Cita guardada");
-
-  const clienteGuardado = clienteId ? await DB.get("clientes", clienteId) : null;
-  const nombreCliente = clienteGuardado ? clienteGuardado.nombre : nombreTmp;
-  const telefonoCliente = clienteGuardado ? (clienteGuardado.telefono || "") : telefonoTmp;
 
   const texto = `Nueva cita asignada: ${nombreCliente} el ${new Date(`${fecha}T${hora}`).toLocaleDateString()} a las ${hora}. Motivo: ${motivo || "sin especificar"}.`;
   if (mecanicoInfo?.telefono) {
@@ -5306,7 +5327,7 @@ async function renderWebCMS() {
     list.innerHTML = citasWeb.map(c => {
       const cliente = clientes.find(cl => cl.id === c.clienteId);
       const nombre = cliente?.nombre || c.nombreTmp || "Cliente web";
-      const telefono = cliente?.telefono || c.telefonoTmp || "";
+      const telefono = c.telefonoTmp || cliente?.telefono || "";
       const { label, dt } = citaWhenInfo(c);
       return `
         <div class="cms-row">
@@ -5414,7 +5435,7 @@ document.getElementById("btnForzarActualizacion").addEventListener("click", asyn
    fecha e identificador, para que al restaurarlo se sepa exactamente de dónde
    salió y si el esquema es compatible. */
 
-const VERSION_APP = "3.12.0";
+const VERSION_APP = "3.12.1";
 const VERSION_RESPALDO = 2; // formato del archivo, no de la app
 
 async function armarRespaldo() {
