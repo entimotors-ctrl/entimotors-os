@@ -47,7 +47,15 @@ const TEAM = [
 // desarrollo, nunca se publica). Si el archivo no existe, devuelve undefined
 // y el login local de TEAM queda simplemente no disponible — no es un error.
 function claveLocal(user) {
-  return window.ENTIMOTORS_LOCAL?.teamPasswords?.[user];
+  return configLocal()?.teamPasswords?.[user];
+}
+/* config-local.js es SOLO de desarrollo, y los valores que tuvo en su día están
+   en el historial público del repositorio: no pueden servir de nada en un
+   servidor real. Por eso, aunque el archivo llegara por error a producción,
+   fuera de localhost se ignora entero y no habilita ningún acceso. */
+const ES_ORIGEN_LOCAL = ["localhost", "127.0.0.1"].includes(location.hostname);
+function configLocal() {
+  return ES_ORIGEN_LOCAL ? window.ENTIMOTORS_LOCAL : undefined;
 }
 // Secciones que solo el rol "admin" (dueño) puede ver — un mecánico no necesita
 // entrar a la caja, la web o los respaldos para hacer su trabajo diario.
@@ -62,9 +70,10 @@ const HORARIO_TALLER = { horaInicio: "08:00", horaFin: "17:00", intervaloMin: 30
 // "Borrar todo"). Es una protección local contra accidentes, NO seguridad
 // real — vive en el cliente y cualquiera con DevTools puede leerlo si
 // config-local.js está presente. El valor real vive en config-local.js
-// (ignorado por Git); sin ese archivo estas acciones no se pueden confirmar.
+// (ignorado por Git) y solo se usa en localhost; en cualquier otro sitio se
+// confirma con correo y contraseña de administrador (ver requestAdminCode).
 function codigoAdminLocal() {
-  return window.ENTIMOTORS_LOCAL?.adminCode;
+  return configLocal()?.adminCode;
 }
 
 let db;
@@ -732,23 +741,54 @@ function toast(msg, kind = "on") {
 
 /* ---- confirmación con código de administrador para acciones que no se pueden deshacer ---- */
 let adminCodeCallback = null;
+/* Dos modos. En desarrollo (config-local.js en localhost) sigue el código local
+   de siempre. En cualquier otro sitio NO hay código: quien confirma escribe su
+   correo y contraseña de administrador, y Supabase los comprueba en el servidor.
+   Así no existe ningún secreto en el navegador que se pueda leer con DevTools. */
+function adminConCodigoLocal() { return typeof codigoAdminLocal() === "string"; }
 function requestAdminCode(onConfirm) {
   adminCodeCallback = onConfirm;
+  const local = adminConCodigoLocal();
+  document.getElementById("adminCodeCorreoFila").style.display = local ? "none" : "";
+  document.getElementById("adminCodeEtiqueta").textContent = local ? "Código" : "Contraseña";
+  document.getElementById("adminCodeHint").textContent = local
+    ? "Esta acción no se puede deshacer. Pide el código al administrador del taller."
+    : "Esta acción no se puede deshacer. Confirma con el correo y la contraseña del administrador.";
+  document.getElementById("adminCodeInput").setAttribute("inputmode", local ? "numeric" : "text");
+  document.getElementById("adminCodeCorreo").value = "";
   document.getElementById("adminCodeInput").value = "";
   document.getElementById("adminCodeError").textContent = "";
   document.getElementById("modalAdminCode").classList.add("active");
-  document.getElementById("adminCodeInput").focus();
+  document.getElementById(local ? "adminCodeInput" : "adminCodeCorreo").focus();
 }
 document.getElementById("btnCancelarAdminCode").addEventListener("click", () => {
   document.getElementById("modalAdminCode").classList.remove("active");
   adminCodeCallback = null;
 });
 document.getElementById("btnConfirmarAdminCode").addEventListener("click", async () => {
-  const code = document.getElementById("adminCodeInput").value.trim();
-  if (code !== codigoAdminLocal()) {
-    document.getElementById("adminCodeError").textContent = "Código incorrecto.";
-    return;
+  const btn = document.getElementById("btnConfirmarAdminCode");
+  const errEl = document.getElementById("adminCodeError");
+  if (btn.disabled) return;
+  if (adminConCodigoLocal()) {
+    const code = document.getElementById("adminCodeInput").value.trim();
+    if (code !== codigoAdminLocal()) { errEl.textContent = "Código incorrecto."; return; }
+  } else {
+    if (!window.AccesoSeguro) { errEl.textContent = "La verificación en línea no está disponible."; return; }
+    btn.disabled = true;
+    errEl.textContent = "Verificando…";
+    let r;
+    try {
+      r = await AccesoSeguro.verificar(
+        document.getElementById("adminCodeCorreo").value,
+        document.getElementById("adminCodeInput").value);
+    } finally {
+      btn.disabled = false;
+      document.getElementById("adminCodeInput").value = "";
+    }
+    if (!r.ok) { errEl.textContent = r.mensaje; return; }
+    if (!AccesoSeguro.esAdmin(r.perfil)) { errEl.textContent = "Esa cuenta no es de administrador."; return; }
   }
+  errEl.textContent = "";
   document.getElementById("modalAdminCode").classList.remove("active");
   const cb = adminCodeCallback;
   adminCodeCallback = null;
@@ -1258,27 +1298,103 @@ function wireInstallGate() {
 function readSession() {
   try { return JSON.parse(localStorage.getItem("enti_session") || "null"); } catch { return null; }
 }
+function entrarConSesion(session) {
+  document.getElementById("loginError").textContent = "";
+  document.getElementById("loginPass").value = "";
+  localStorage.setItem("enti_session", JSON.stringify(session));
+  document.getElementById("gateLogin").classList.remove("active");
+  startApp(session);
+}
 function wireLoginGate() {
-  document.getElementById("loginForm").addEventListener("submit", (e) => {
+  let verificando = false;
+  document.getElementById("loginForm").addEventListener("submit", async (e) => {
     e.preventDefault();
+    if (verificando) return;
     const u = document.getElementById("loginUser").value.trim().toLowerCase();
     const p = document.getElementById("loginPass").value;
+    const errEl = document.getElementById("loginError");
+
+    /* Con correo: cuenta de ENTIMOTORS. La contraseña la compara Supabase en el
+       servidor; aquí solo se recibe "es quien dice, con este rol". */
+    if (u.includes("@")) {
+      if (!window.AccesoSeguro) { errEl.textContent = "La verificación en línea no está disponible."; return; }
+      verificando = true;
+      const btn = document.querySelector("#loginForm button[type=submit]");
+      if (btn) btn.disabled = true;
+      errEl.textContent = "Verificando…";
+      let r;
+      try { r = await AccesoSeguro.verificar(u, p); }
+      finally { verificando = false; if (btn) btn.disabled = false; }
+      if (!r.ok) { errEl.textContent = r.mensaje; document.getElementById("loginPass").value = ""; return; }
+      const permiso = AccesoSeguro.permiteTaller(r.perfil);
+      if (!permiso.ok) { errEl.textContent = permiso.mensaje; document.getElementById("loginPass").value = ""; return; }
+      entrarConSesion(AccesoSeguro.sesionDesdePerfil(r.correo, r.perfil));
+      return;
+    }
+
+    // Usuario del equipo: login local, que solo existe en desarrollo (localhost + config-local.js)
     const miembro = TEAM.find(t => t.user === u);
     const clave = miembro && claveLocal(miembro.user);
     const found = miembro && typeof clave === "string" && clave === p ? miembro : null;
-    const errEl = document.getElementById("loginError");
     if (!found) { errEl.textContent = "Usuario o contraseña incorrectos."; return; }
-    errEl.textContent = "";
-    document.getElementById("loginPass").value = "";
-    const session = { user: found.user, nombre: found.nombre, telefono: found.telefono, rol: found.rol };
-    localStorage.setItem("enti_session", JSON.stringify(session));
-    document.getElementById("gateLogin").classList.remove("active");
-    startApp(session);
+    entrarConSesion({ user: found.user, nombre: found.nombre, telefono: found.telefono, rol: found.rol });
   });
 }
-document.getElementById("btnLogout").addEventListener("click", () => {
+
+/* ---------------- cerrar sesión SIN poder quedarse fuera ----------------
+   Hasta la 3.12.2, cerrar sesión borraba la sesión y dejaba la pantalla de
+   login. En producción ese login no tenía con qué comprobar ninguna contraseña,
+   así que quien cerraba sesión se quedaba fuera de su propia información.
+
+   Regla ahora: la sesión solo se borra DESPUÉS de demostrar que se puede volver
+   a entrar. La persona confirma su correo y contraseña; si el servidor los
+   acepta y la cuenta puede usar el taller, se cierra. Si no hay red, si no hay
+   verificación disponible o si la contraseña no es la correcta, NO se toca nada
+   y la sesión sigue abierta. No hay puerta trasera: sin verificación, no se sale. */
+function hayReingresoLocal() {
+  const s = readSession();
+  return !!(s && !s.origen && typeof claveLocal(s.user) === "string");
+}
+function cerrarSesionYa() {
   localStorage.removeItem("enti_session");
   location.reload();
+}
+document.getElementById("btnLogout").addEventListener("click", () => {
+  // desarrollo: el login local funciona, así que salir no deja a nadie fuera
+  if (hayReingresoLocal()) { cerrarSesionYa(); return; }
+  const s = readSession();
+  document.getElementById("salidaCorreo").value = s && s.origen === "supabase" ? s.user : "";
+  document.getElementById("salidaClave").value = "";
+  document.getElementById("salidaError").textContent = "";
+  document.getElementById("modalSalida").classList.add("active");
+  document.getElementById(s && s.origen === "supabase" ? "salidaClave" : "salidaCorreo").focus();
+});
+document.getElementById("btnCancelarSalida").addEventListener("click", () => {
+  document.getElementById("modalSalida").classList.remove("active");
+  document.getElementById("salidaClave").value = "";
+});
+document.getElementById("btnConfirmarSalida").addEventListener("click", async () => {
+  const btn = document.getElementById("btnConfirmarSalida");
+  const errEl = document.getElementById("salidaError");
+  if (btn.disabled) return;
+  const aviso = " Tu sesión sigue abierta.";
+  if (!window.AccesoSeguro) { errEl.textContent = "No se puede comprobar que podrás volver a entrar." + aviso; return; }
+  const d = AccesoSeguro.disponible();
+  if (!d.ok) { errEl.textContent = d.mensaje + aviso; return; }
+  btn.disabled = true;
+  errEl.textContent = "Verificando…";
+  let r;
+  try {
+    r = await AccesoSeguro.verificar(document.getElementById("salidaCorreo").value,
+                                     document.getElementById("salidaClave").value);
+  } finally {
+    btn.disabled = false;
+    document.getElementById("salidaClave").value = "";
+  }
+  if (!r.ok) { errEl.textContent = r.mensaje + aviso; return; }
+  const permiso = AccesoSeguro.permiteTaller(r.perfil);
+  if (!permiso.ok) { errEl.textContent = permiso.mensaje + " Con esa cuenta no podrías volver a entrar." + aviso; return; }
+  cerrarSesionYa();
 });
 
 /* ================= modo claro / oscuro ================= */
@@ -5505,7 +5621,7 @@ document.getElementById("btnForzarActualizacion").addEventListener("click", asyn
    fecha e identificador, para que al restaurarlo se sepa exactamente de dónde
    salió y si el esquema es compatible. */
 
-const VERSION_APP = "3.12.2";
+const VERSION_APP = "3.12.3";
 const VERSION_RESPALDO = 2; // formato del archivo, no de la app
 
 async function armarRespaldo() {
@@ -5655,6 +5771,36 @@ document.getElementById("btnCompartirRespaldo").addEventListener("click", async 
   toast("Este navegador no comparte archivos: se descargó la copia", "off");
 });
 
+/* ---- operaciones destructivas: cerradas salvo desarrollo habilitado a propósito ----
+   Restaurar (Reemplazar y también Combinar) y "Borrar todo" escriben o vacían
+   tablas enteras. Hasta tener una copia verificada fuera del dispositivo y una
+   restauración que no pueda quedarse a medias ni mezclar registros de otro
+   equipo, quedan cerradas aunque quien confirme sea administrador.
+   Solo se abren con las dos cosas a la vez: origen localhost/127.0.0.1 Y
+   allowDestructiveDev: true en config-local.js. Servir una copia en localhost
+   no basta, y fuera de localhost config-local.js se ignora entero (configLocal).
+   El ajuste no es un secreto: solo evita que cualquier copia borre por descuido.
+   Crear y descargar respaldos NO pasa por aquí: eso sigue disponible siempre. */
+const OPERACIONES_DESTRUCTIVAS_PERMITIDAS = ES_ORIGEN_LOCAL && configLocal()?.allowDestructiveDev === true;
+const MENSAJE_FUNCION_DESHABILITADA = "Esta función está temporalmente deshabilitada hasta completar el respaldo de seguridad.";
+function operacionDestructivaBloqueada() {
+  if (OPERACIONES_DESTRUCTIVAS_PERMITIDAS) return false;
+  toast(MENSAJE_FUNCION_DESHABILITADA, "off");
+  return true;
+}
+if (!OPERACIONES_DESTRUCTIVAS_PERMITIDAS) {
+  document.getElementById("inputRestaurar").closest(".card").querySelector(".hint").textContent =
+    "Restauración temporalmente deshabilitada hasta completar el respaldo de seguridad. Puedes elegir un archivo para ver qué contiene.";
+  document.querySelectorAll("#restaurarModo .seg-opt").forEach(b => {
+    b.disabled = true;
+    b.querySelector("small").textContent = "No disponible por ahora";
+  });
+  document.getElementById("btnConfirmarRestaurar").disabled = true;
+  const btnDeCero = document.getElementById("btnEmpezarDeCero");
+  btnDeCero.disabled = true;
+  btnDeCero.closest(".card").querySelector(".hint").textContent = MENSAJE_FUNCION_DESHABILITADA;
+}
+
 /* ---- restauración ---- */
 let respaldoParaRestaurar = null;
 let modoRestauracion = "reemplazar";
@@ -5672,6 +5818,8 @@ document.getElementById("inputRestaurar").addEventListener("change", async (e) =
   respaldoParaRestaurar = respaldo;
   modoRestauracion = "reemplazar";
   document.querySelectorAll("#restaurarModo .seg-opt").forEach(b => b.classList.toggle("active", b.dataset.modo === "reemplazar"));
+  // ver qué trae el archivo sigue permitido; confirmar no (alHacerClicUnaVez lo rehabilita tras cada toque)
+  document.getElementById("btnConfirmarRestaurar").disabled = !OPERACIONES_DESTRUCTIVAS_PERMITIDAS;
 
   const fecha = respaldo.exportadoEn ? new Date(respaldo.exportadoEn).toLocaleString("es-HN") : "fecha desconocida";
   document.getElementById("restaurarOrigen").innerHTML =
@@ -5700,7 +5848,9 @@ document.getElementById("inputRestaurar").addEventListener("change", async (e) =
     aviso.textContent = `El archivo trae información que esta versión no conoce (${desconocidas.join(", ")}) y esa parte se dejará fuera.`;
   } else {
     aviso.className = "aviso-fuerte";
-    aviso.textContent = "Antes de tocar nada se guardará automáticamente una copia de lo que hay ahora, por si necesitas volver atrás.";
+    aviso.textContent = OPERACIONES_DESTRUCTIVAS_PERMITIDAS
+      ? "Antes de tocar nada se guardará automáticamente una copia de lo que hay ahora, por si necesitas volver atrás."
+      : "Solo se muestra lo que contiene el archivo: no se escribirá nada en este dispositivo.";
   }
 
   actualizarExplicacionRestauracion();
@@ -5708,7 +5858,9 @@ document.getElementById("inputRestaurar").addEventListener("change", async (e) =
 });
 
 function actualizarExplicacionRestauracion() {
-  document.getElementById("restaurarExplicacion").textContent = modoRestauracion === "reemplazar"
+  document.getElementById("restaurarExplicacion").textContent = !OPERACIONES_DESTRUCTIVAS_PERMITIDAS
+    ? MENSAJE_FUNCION_DESHABILITADA
+    : modoRestauracion === "reemplazar"
     ? "Se borra todo lo que hay en este dispositivo y queda exactamente lo del archivo. Es lo correcto si cambiaste de celular o estás recuperando de un desastre."
     : "Se conserva lo que ya hay y solo se agregan los registros del archivo que no existan aquí (se comparan por identificador). Nada se borra, pero pueden quedar duplicados si el mismo dato se creó por separado en los dos dispositivos.";
 }
@@ -5716,6 +5868,7 @@ function actualizarExplicacionRestauracion() {
 document.getElementById("restaurarModo").addEventListener("click", (e) => {
   const btn = e.target.closest(".seg-opt");
   if (!btn) return;
+  if (operacionDestructivaBloqueada()) return;
   modoRestauracion = btn.dataset.modo;
   document.querySelectorAll("#restaurarModo .seg-opt").forEach(b => b.classList.toggle("active", b === btn));
   actualizarExplicacionRestauracion();
@@ -5730,6 +5883,8 @@ alHacerClicUnaVez(document.getElementById("btnConfirmarRestaurar"), async () => 
   const respaldo = respaldoParaRestaurar;
   if (!respaldo) return;
   const modo = modoRestauracion;
+  // cerrada antes siquiera de pedir credenciales (Reemplazar y Combinar por igual)
+  if (operacionDestructivaBloqueada()) return;
 
   requestAdminCode(async () => {
     // red de seguridad: antes de tocar nada, una copia de lo que hay AHORA.
@@ -5741,6 +5896,8 @@ alHacerClicUnaVez(document.getElementById("btnConfirmarRestaurar"), async () => 
       descargarArchivo(`entimotors-ANTES-de-restaurar-${previo.exportadoEn.slice(0, 10)}.json`, verifPrevio.texto);
     }
 
+    // última guarda, pegada a la primera escritura: se comprueba aunque se llegue por otro camino
+    if (operacionDestructivaBloqueada()) return;
     let escritos = 0, omitidos = 0;
     if (modo === "reemplazar") {
       for (const store of ALL_STORES) {
@@ -5787,6 +5944,8 @@ alHacerClicUnaVez(document.getElementById("btnConfirmarRestaurar"), async () => 
 });
 
 document.getElementById("btnEmpezarDeCero").addEventListener("click", async () => {
+  // cerrada antes de la confirmación y de pedir credenciales
+  if (operacionDestructivaBloqueada()) return;
   const ok = await showConfirm(
     "Esto borra TODA la información guardada en este dispositivo: clientes, órdenes, ventas, caja, inventario, todo. No se puede deshacer.",
     { titulo: "Borrar todo y empezar de cero", textoOk: "Borrar todo" }
@@ -5794,6 +5953,8 @@ document.getElementById("btnEmpezarDeCero").addEventListener("click", async () =
   if (!ok) return;
 
   requestAdminCode(async () => {
+    // última guarda, pegada al primer clear()
+    if (operacionDestructivaBloqueada()) return;
     for (const store of ALL_STORES) await DB.clear(store);
     localStorage.removeItem("enti_modo_datos");
     markDirty();

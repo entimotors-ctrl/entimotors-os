@@ -129,7 +129,7 @@
   button.btn.primary:hover { background: var(--red-hover); }
   button.btn.ghost { background: transparent; }
   button.btn.small { padding: 0.35rem 0.7rem; font-size: 0.78rem; }
-  button.btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  button.btn:disabled, .seg-opt:disabled { opacity: 0.4; cursor: not-allowed; }
   button.btn.wa { background: #1f8f5a; border-color: #1f8f5a; color: #fff; }
   button.btn.wa:hover { background: #1a7a4d; }
   button.btn.danger { color: var(--red); }
@@ -954,10 +954,10 @@
   <div class="gate-card">
     <img src="icons/icon-192.png" alt="ENTIMOTORS">
     <h1>Iniciar sesión</h1>
-    <p class="desc">Acceso solo para el equipo de ENTIMOTORS.</p>
+    <p class="desc">Acceso solo para el equipo de ENTIMOTORS. Entra con tu correo y tu contraseña.</p>
     <form id="loginForm">
-      <label>Usuario</label>
-      <input type="text" id="loginUser" autocomplete="username" placeholder="ej. wilkin">
+      <label>Correo</label>
+      <input type="text" id="loginUser" autocomplete="username" inputmode="email" autocapitalize="off" spellcheck="false" placeholder="tu@correo.com">
       <label>Contraseña</label>
       <input type="password" id="loginPass" autocomplete="current-password">
       <p class="gate-error" id="loginError"></p>
@@ -1960,13 +1960,34 @@
 <div class="modal-bg" id="modalAdminCode">
   <div class="modal">
     <h3>Confirmación de administrador</h3>
-    <p class="hint" style="margin-top:0;">Esta acción no se puede deshacer. Pide el código al administrador del taller.</p>
-    <label>Código</label>
-    <input type="password" id="adminCodeInput" inputmode="numeric" autocomplete="off">
+    <p class="hint" style="margin-top:0;" id="adminCodeHint">Esta acción no se puede deshacer. Confirma con el correo y la contraseña del administrador.</p>
+    <div id="adminCodeCorreoFila">
+      <label>Correo del administrador</label>
+      <input type="text" id="adminCodeCorreo" inputmode="email" autocomplete="off" autocapitalize="off" spellcheck="false">
+    </div>
+    <label id="adminCodeEtiqueta">Contraseña</label>
+    <input type="password" id="adminCodeInput" autocomplete="off">
     <p class="gate-error" id="adminCodeError"></p>
     <div class="modal-actions">
       <button class="btn ghost" id="btnCancelarAdminCode">Cancelar</button>
       <button class="btn primary" id="btnConfirmarAdminCode">Confirmar</button>
+    </div>
+  </div>
+</div>
+
+<!-- Cerrar sesión: solo se cierra si antes se demuestra que se puede volver a entrar -->
+<div class="modal-bg" id="modalSalida">
+  <div class="modal">
+    <h3>Cerrar sesión</h3>
+    <p class="hint" style="margin-top:0;">Para no quedarte fuera, confirma primero que puedes volver a entrar. Si algo falla, tu sesión sigue abierta.</p>
+    <label>Correo</label>
+    <input type="text" id="salidaCorreo" inputmode="email" autocomplete="username" autocapitalize="off" spellcheck="false">
+    <label>Contraseña</label>
+    <input type="password" id="salidaClave" autocomplete="current-password">
+    <p class="gate-error" id="salidaError"></p>
+    <div class="modal-actions">
+      <button class="btn ghost" id="btnCancelarSalida">Cancelar</button>
+      <button class="btn primary" id="btnConfirmarSalida">Cerrar sesión</button>
     </div>
   </div>
 </div>
@@ -2312,11 +2333,18 @@
 <!-- config-local.js es opcional (ignorado por Git): sin él, el login local de
      TEAM y el código de administrador quedan deshabilitados, pero el resto de
      la app sigue funcionando igual. Ver config-local.example.js. -->
-<script src="config-local.js?v=3.12.2"></script>
+<script src="config-local.js?v=3.12.3"></script>
+<!-- Verificación de identidad contra Supabase Auth. supabase-config.js solo lleva
+     la URL del proyecto y la clave PÚBLICA (anon): no es un secreto, y
+     supabase-client.js se niega a arrancar si alguien pusiera ahí una de servidor.
+     Ninguna contraseña ni código vive en estos archivos. -->
+<script src="supabase-config.js?v=3.12.3"></script>
+<script src="supabase-client.js?v=3.12.3"></script>
+<script src="acceso-seguro.js?v=3.12.3"></script>
 <!-- el ?v= debe cambiar cada vez que se toque app.js (junto con CACHE_NAME en
      sw.js) — es la forma más universal de forzar que CUALQUIER navegador
      pida el archivo de nuevo aunque ya tenga guardada una copia vieja en su
      propio caché HTTP, sin depender de que respete el Service Worker. -->
-<script src="app.js?v=3.12.2"></script>
+<script src="app.js?v=3.12.3"></script>
 </body>
 </html>

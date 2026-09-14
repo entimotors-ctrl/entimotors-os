@@ -2,8 +2,10 @@
 // cambiando la app todos los días, "caché primero" deja a los dispositivos ya
 // instalados atascados en una versión vieja para siempre — network-first evita
 // eso y de todos modos cae al caché cuando de verdad no hay señal.
-const CACHE_NAME = "entimotors-v3.12.2";
-const SHELL = ["./", "./index.html", "./app.js?v=3.12.2", "./manifest.json", "./icons/icon-192.png", "./icons/logo-watermark-doc.png"];
+const CACHE_NAME = "entimotors-v3.12.3";
+// La capa de verificación va en el SHELL: el SW se registra después de entrar,
+// así que sin precargarla una recarga sin señal se quedaría sin estos archivos.
+const SHELL = ["./", "./index.html", "./supabase-config.js?v=3.12.3", "./supabase-client.js?v=3.12.3", "./acceso-seguro.js?v=3.12.3", "./app.js?v=3.12.3", "./manifest.json", "./icons/icon-192.png", "./icons/logo-watermark-doc.png"];
 
 // Librerías que convierten la factura en imagen/PDF para poder mandarla por
 // WhatsApp. Van aparte del SHELL y con .catch(): si el CDN no responde, la app
