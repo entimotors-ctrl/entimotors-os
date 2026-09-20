@@ -20,9 +20,12 @@ window.ENTIMOTORS_SUPABASE = {
 
   habilitado: true,
 
-  // Dirección del api-server (el backend que ya existe). Solo se usa para
-  // la pantalla «Usuarios y equipo»: crear cuentas exige la clave de
-  // servidor, y esa clave no puede pisar el navegador.
-  // Sin este valor, esa pantalla avisa y el resto de la app va igual.
-  apiUrl: ""   // ej. "https://<tu-servicio>.onrender.com"
+  // Dirección del api-server (el backend de producción, en Render). Es una URL
+  // pública, no un secreto. Solo se usa para la pantalla «Usuarios y equipo»:
+  // crear cuentas exige la clave de servidor, y esa clave no puede pisar el
+  // navegador. Sin barra final ni ruta: la app añade «/api/admin/usuarios…».
+  // Si se deja vacía, esa pantalla avisa y el resto de la app va igual; por eso
+  // pruebas/multiusuario/25-config-produccion-apiurl.test.mjs falla si este
+  // archivo se publica sin ella.
+  apiUrl: "https://entimotors-1.onrender.com"
 };
