@@ -103,6 +103,16 @@
     return { ok: false, motivo: motivoErr, detalle: detalle || "", http: http || 0 };
   }
 
+  /* Primera CADENA no vacía de la lista. Un objeto (p. ej. {"error":{"mensaje":"x"}})
+     no se convierte a texto —saldría «[object Object]»—: se salta al siguiente. */
+  function primeraCadena(candidatos) {
+    for (var i = 0; i < candidatos.length; i++) {
+      var c = candidatos[i];
+      if (typeof c === "string" && c.trim() !== "") return c;
+    }
+    return "";
+  }
+
   function pedir(ruta, opciones) {
     opciones = opciones || {};
     if (!activo) return Promise.resolve(mal("desactivado", motivo));
@@ -144,7 +154,8 @@
         var cuerpo = null;
         if (txt) { try { cuerpo = JSON.parse(txt); } catch (e) { cuerpo = txt; } }
         if (!res.ok) {
-          var msg = (cuerpo && (cuerpo.message || cuerpo.error_description || cuerpo.error)) || res.statusText;
+          var msg = (cuerpo && typeof cuerpo === "object" ? primeraCadena([cuerpo.message, cuerpo.msg, cuerpo.error_description, cuerpo.error]) : "") ||
+                    (typeof res.statusText === "string" ? res.statusText : "");
           return mal(res.status === 401 || res.status === 403 ? "sin-permiso" : "error-servidor", msg, res.status);
         }
         return bien(cuerpo, rango ? { rango: rango } : null);

@@ -115,9 +115,13 @@
   @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.45} }
   .chip .n { font-variant-numeric: tabular-nums; font-weight: 600; }
 
-  .user-chip { display: flex; align-items: center; gap: 0.55rem; }
-  .user-chip .who { font-weight: 600; font-size: 0.85rem; }
-  .user-chip .who small { display: block; font-weight: 400; color: var(--text-faint); font-size: 0.72rem; }
+  /* Nombre + rol en dos líneas: la píldora de una sola línea (.chip, radio 999px, line-height 1.5 heredado) los dejaba pegados al borde curvo
+     y con un nombre largo (el api-server admite 60 letras) rompía el topbar. Aquí: compacto, y elipsis en escritorio. En móvil manda el
+     bloque de abajo (.account-panel …): nombre completo, en varias líneas si hace falta. */
+  .user-chip { display: flex; align-items: center; gap: 0.55rem; padding: 0.3rem 0.9rem; border-radius: 0.9rem; line-height: 1.25; max-width: 14rem; }
+  .user-chip .who { font-weight: 600; font-size: 0.85rem; min-width: 0; }
+  .user-chip .who > span, .user-chip .who small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .user-chip .who small { font-weight: 400; color: var(--text-faint); font-size: 0.72rem; }
 
   button.btn {
     border: 1px solid var(--border); background: var(--panel); color: var(--text); border-radius: 0.55rem;
@@ -129,7 +133,7 @@
   button.btn.primary:hover { background: var(--red-hover); }
   button.btn.ghost { background: transparent; }
   button.btn.small { padding: 0.35rem 0.7rem; font-size: 0.78rem; }
-  button.btn:disabled, .seg-opt:disabled { opacity: 0.4; cursor: not-allowed; }
+  button.btn:disabled { opacity: 0.4; cursor: not-allowed; }
   button.btn.wa { background: #1f8f5a; border-color: #1f8f5a; color: #fff; }
   button.btn.wa:hover { background: #1a7a4d; }
   button.btn.danger { color: var(--red); }
@@ -765,7 +769,8 @@
     }
     .account-panel.open { display: flex; }
     .account-panel .chip { white-space: normal; width: 100%; }
-    .account-panel .user-chip { background: var(--panel); padding: 0.6rem 0.7rem; border-radius: 0.6rem; }
+    .account-panel .user-chip { background: var(--panel); padding: 0.6rem 0.7rem; border-radius: 0.6rem; max-width: none; }
+    .account-panel .user-chip .who > span, .account-panel .user-chip .who small { overflow: visible; text-overflow: clip; white-space: normal; overflow-wrap: anywhere; }
     .account-panel button.btn { width: 100%; }
 
     #sidebar {
@@ -954,15 +959,28 @@
   <div class="gate-card">
     <img src="icons/icon-192.png" alt="ENTIMOTORS">
     <h1>Iniciar sesión</h1>
-    <p class="desc">Acceso solo para el equipo de ENTIMOTORS. Entra con tu correo y tu contraseña.</p>
+    <p class="desc">Acceso solo para el equipo de ENTIMOTORS.</p>
+    <p class="desc" id="loginModo" style="font-size:.8rem;opacity:.75;margin-top:-.4rem;"></p>
     <form id="loginForm">
-      <label>Correo</label>
-      <input type="text" id="loginUser" autocomplete="username" inputmode="email" autocapitalize="off" spellcheck="false" placeholder="tu@correo.com">
+      <label>Correo o usuario</label>
+      <input type="text" id="loginUser" autocomplete="username" placeholder="correo@entimotors.hn">
       <label>Contraseña</label>
       <input type="password" id="loginPass" autocomplete="current-password">
       <p class="gate-error" id="loginError"></p>
       <button class="btn primary" type="submit" style="width:100%;">Entrar</button>
     </form>
+    <!-- OBS-9 (plan B): no hay formulario de correo ni promesa de correo; la recuperación la hace el administrador desde «Usuarios y equipo» -->
+    <p class="desc" id="loginAyuda" style="font-size:.8rem;opacity:.8;margin:1rem 0 0;">¿Olvidaste tu contraseña? Pide al administrador que te genere un enlace de recuperación.</p>
+  </div>
+</div>
+
+<!-- GATE R: establecer contraseña (solo al llegar por un enlace de Supabase) -->
+<div class="gate" id="gateRecovery">
+  <div class="gate-card">
+    <img src="icons/icon-192.png" alt="ENTIMOTORS">
+    <h1>Establecer contraseña</h1>
+    <p class="desc" id="rcvIntro">Elige tu contraseña para entrar a ENTIMOTORS OS.</p>
+    <div id="rcvCuerpo"></div>
   </div>
 </div>
 
@@ -1007,7 +1025,7 @@
       <div class="account-wrap" id="accountWrap">
         <button type="button" class="icon-btn" id="btnCuenta" aria-label="Cuenta y estado de conexión" title="Cuenta">👤</button>
         <div class="account-panel" id="accountPanel">
-          <span class="chip" id="syncChip"><span class="dot on" id="syncDot"></span><span id="syncLabel">En línea · sincronizado</span></span>
+          <span class="chip" id="syncChip"><span class="dot on" id="syncDot"></span><span id="syncLabel">En línea · datos locales</span></span>
           <button class="btn small ghost" id="offlineToggle" title="Simular pérdida de señal para probar el modo sin internet">Simular sin conexión</button>
           <button class="btn small ghost" id="btnTema" title="Cambiar entre modo claro y oscuro">🌙 Modo oscuro</button>
           <span class="chip user-chip"><span class="who"><span id="loggedUserName">—</span><small id="loggedUserRole"></small></span></span>
@@ -1020,6 +1038,7 @@
   <div id="sidebarBackdrop"></div>
   <div id="sidebar">
     <div class="nav-grp">Taller</div>
+    <button class="nav-item" data-view="mi-trabajo"><span class="sw"></span>Mi trabajo</button>
     <button class="nav-item active" data-view="dashboard"><span class="sw"></span>Página principal</button>
     <button class="nav-item" data-view="pos"><span class="sw"></span>Venta rápida (TPV)</button>
     <button class="nav-item" data-view="ordenes"><span class="sw"></span>Órdenes de servicio</button>
@@ -1035,12 +1054,27 @@
     <button class="nav-item disabled" title="Se administra hoy desde admin.html — se integra en una siguiente etapa"><span class="sw"></span>Trabajos</button>
     <button class="nav-item disabled" title="Se administra hoy desde admin.html — se integra en una siguiente etapa"><span class="sw"></span>Videos</button>
     <div class="nav-grp">Sistema</div>
+    <button class="nav-item" data-view="usuarios"><span class="sw"></span>Usuarios y equipo</button>
     <button class="nav-item" data-view="ajustes"><span class="sw"></span>Ajustes</button>
   </div>
 
   <div id="main">
 
     <!-- DASHBOARD -->
+    <section class="view" id="view-mi-trabajo">
+      <h2 class="font-display" style="margin-bottom:0.2rem;">Mi trabajo</h2>
+      <p style="color:var(--text-muted); margin:0 0 1rem;" id="miTrabajoSub">Acceso para mecánicos.</p>
+      <div class="card" id="miTrabajoAlcance" style="margin-bottom:1rem;">
+        <p style="margin:0; color:var(--text-muted);">La asignación y sincronización de trabajos entre dispositivos estará disponible en una versión posterior.</p>
+      </div>
+      <h3 class="font-display" style="font-size:0.95rem; margin:0 0 0.5rem;">Mis citas</h3>
+      <div id="miTrabajoCitas"></div>
+      <h3 class="font-display" style="font-size:0.95rem; margin:1.2rem 0 0.5rem;">Mis órdenes abiertas</h3>
+      <div id="miTrabajoOrdenes"></div>
+      <h3 class="font-display" style="font-size:0.95rem; margin:1.2rem 0 0.5rem;">Entregadas</h3>
+      <div id="miTrabajoHistorial"></div>
+    </section>
+
     <section class="view active" id="view-dashboard">
       <div class="view-head">
         <div>
@@ -1427,6 +1461,14 @@
       <div id="citasWebList"></div>
     </section>
 
+    <!-- USUARIOS Y EQUIPO — solo administrador; el servidor lo comprueba aparte -->
+    <section class="view" id="view-usuarios">
+      <div class="view-head">
+        <div><h2>Usuarios y equipo</h2><p>Quién entra al sistema y con qué rol. Las cuentas las protege el servidor; los datos de este dispositivo los controla la aplicación.</p></div>
+      </div>
+      <div id="usuariosCuerpo"></div>
+    </section>
+
     <!-- AJUSTES -->
     <section class="view" id="view-ajustes">
       <div class="view-head">
@@ -1463,7 +1505,7 @@
         <p class="hint" style="margin:0 0 0.6rem;" id="ajustesInfo"></p>
         <p class="hint" style="margin:0 0 0.8rem;">Versión instalada: <b id="ajustesVersion">—</b></p>
         <button type="button" class="btn small" id="btnForzarActualizacion">Buscar actualización ahora</button>
-        <p class="hint" style="margin:0.5rem 0 0;">Si hiciste un cambio y no se refleja en este dispositivo, usa este botón — borra la copia guardada y vuelve a bajar todo de cero.</p>
+        <p class="hint" style="margin:0.5rem 0 0;">Comprueba si hay una versión nueva. Si la hay, te ofrece guardar una copia de seguridad antes de actualizar; nunca se instala sola.</p>
       </div>
     </section>
 
@@ -1960,34 +2002,13 @@
 <div class="modal-bg" id="modalAdminCode">
   <div class="modal">
     <h3>Confirmación de administrador</h3>
-    <p class="hint" style="margin-top:0;" id="adminCodeHint">Esta acción no se puede deshacer. Confirma con el correo y la contraseña del administrador.</p>
-    <div id="adminCodeCorreoFila">
-      <label>Correo del administrador</label>
-      <input type="text" id="adminCodeCorreo" inputmode="email" autocomplete="off" autocapitalize="off" spellcheck="false">
-    </div>
-    <label id="adminCodeEtiqueta">Contraseña</label>
-    <input type="password" id="adminCodeInput" autocomplete="off">
+    <p class="hint" style="margin-top:0;">Esta acción no se puede deshacer. Pide el código al administrador del taller.</p>
+    <label>Código</label>
+    <input type="password" id="adminCodeInput" inputmode="numeric" autocomplete="off">
     <p class="gate-error" id="adminCodeError"></p>
     <div class="modal-actions">
       <button class="btn ghost" id="btnCancelarAdminCode">Cancelar</button>
       <button class="btn primary" id="btnConfirmarAdminCode">Confirmar</button>
-    </div>
-  </div>
-</div>
-
-<!-- Cerrar sesión: solo se cierra si antes se demuestra que se puede volver a entrar -->
-<div class="modal-bg" id="modalSalida">
-  <div class="modal">
-    <h3>Cerrar sesión</h3>
-    <p class="hint" style="margin-top:0;">Para no quedarte fuera, confirma primero que puedes volver a entrar. Si algo falla, tu sesión sigue abierta.</p>
-    <label>Correo</label>
-    <input type="text" id="salidaCorreo" inputmode="email" autocomplete="username" autocapitalize="off" spellcheck="false">
-    <label>Contraseña</label>
-    <input type="password" id="salidaClave" autocomplete="current-password">
-    <p class="gate-error" id="salidaError"></p>
-    <div class="modal-actions">
-      <button class="btn ghost" id="btnCancelarSalida">Cancelar</button>
-      <button class="btn primary" id="btnConfirmarSalida">Cerrar sesión</button>
     </div>
   </div>
 </div>
@@ -2333,18 +2354,24 @@
 <!-- config-local.js es opcional (ignorado por Git): sin él, el login local de
      TEAM y el código de administrador quedan deshabilitados, pero el resto de
      la app sigue funcionando igual. Ver config-local.example.js. -->
-<script src="config-local.js?v=3.12.3"></script>
-<!-- Verificación de identidad contra Supabase Auth. supabase-config.js solo lleva
-     la URL del proyecto y la clave PÚBLICA (anon): no es un secreto, y
-     supabase-client.js se niega a arrancar si alguien pusiera ahí una de servidor.
-     Ninguna contraseña ni código vive en estos archivos. -->
-<script src="supabase-config.js?v=3.12.3"></script>
-<script src="supabase-client.js?v=3.12.3"></script>
-<script src="acceso-seguro.js?v=3.12.3"></script>
+<!-- Declara si esta copia es el taller o «Mi Trabajo». Va primero: app.js lo
+     lee al arrancar. Ver build-target.js. -->
+<script src="build-target.js?v=3.13.0"></script>
+<!-- Capa de Supabase. Si supabase-config.js no existe o está sin rellenar, los
+     cuatro se cargan igual y no hacen nada: la app sigue funcionando entera con
+     IndexedDB, como hasta ahora. -->
+<script src="supabase-config.js?v=3.13.0"></script>
+<script src="supabase-client.js?v=3.13.0"></script>
+<script src="auth.js?v=3.13.0"></script>
+<script src="recovery.js?v=3.13.0"></script>
+<script src="config-local.js?v=3.13.0"></script>
 <!-- el ?v= debe cambiar cada vez que se toque app.js (junto con CACHE_NAME en
      sw.js) — es la forma más universal de forzar que CUALQUIER navegador
      pida el archivo de nuevo aunque ya tenga guardada una copia vieja en su
      propio caché HTTP, sin depender de que respete el Service Worker. -->
-<script src="app.js?v=3.12.3"></script>
+<script src="app.js?v=3.13.0"></script>
+<!-- Pantalla «Usuarios y equipo»: habla con el api-server, no con IndexedDB.
+     Va después de app.js porque solo se invoca al abrir esa vista. -->
+<script src="usuarios.js?v=3.13.0"></script>
 </body>
 </html>

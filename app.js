@@ -28,12 +28,82 @@ const ORIGENES_TRABAJO = [
 ];
 function origenTrabajoDe(o) { return o?.origenTrabajo === "negocio" ? "negocio" : "taller"; }
 
+/* ================= QUÉ PRODUCTO ES ESTA COPIA =================
+   ENTIMOTORS se publica dos veces, en dos ORIGINS distintos: el taller de
+   siempre y «Mi Trabajo» para mecánicos. build-target.js lo declara; si falta,
+   se asume el taller, que es la operación histórica.
+
+   Esto NO protege nada: quien abra la consola puede reescribirlo. Lo que de
+   verdad separa a las dos apps es que viven en hostnames distintos —y la
+   política de mismo origen sí la impone el navegador— más las RLS del
+   servidor. Aquí solo se decide qué producto se arma. */
+const PRODUCTO = window.ENTIMOTORS_BUILD?.producto === "mecanico" ? "mecanico" : "admin";
+const ES_APP_MECANICOS = PRODUCTO === "mecanico";
+// El login de la lista TEAM solo existe en el taller. En «Mi Trabajo» no se
+// esconde el formulario: se rechaza en el handler, aunque alguien inyecte
+// window.ENTIMOTORS_LOCAL a mano.
+const PERMITE_LOGIN_LOCAL = !ES_APP_MECANICOS;
+
+// Los únicos roles que abren el taller (ver sesionAdmitida). «mecanico» solo con sesión LOCAL de la lista TEAM.
+const ROLES_DEL_TALLER = ["admin", "cajero", "mecanico"];
+
+/* El portero. Se ejecuta ANTES de abrir ninguna base: una sesión que no
+   corresponde a este producto no debe llegar a tocar IndexedDB, ni siquiera
+   para leerla un instante. Devuelve el motivo en el idioma del taller, porque
+   se le enseña tal cual a quien intenta entrar. */
+function sesionAdmitida(session) {
+  if (!session || !session.rol) return { ok: false, motivo: "No se pudo leer tu sesión. Vuelve a entrar." };
+
+  if (ES_APP_MECANICOS) {
+    // Aquí solo entra un mecánico con cuenta real, activa y con identidad.
+    if (session.origen !== "supabase")
+      return { ok: false, motivo: "Aquí se entra solo con tu correo y contraseña de ENTIMOTORS." };
+    if (session.rol !== "mecanico")
+      return { ok: false, motivo: "Esta cuenta se usa desde ENTIMOTORS Taller, no desde Mi Trabajo." };
+    if (session.activo === false)
+      return { ok: false, motivo: "Esta cuenta está dada de baja. Habla con el administrador." };
+    if (typeof session.perfilId !== "string" || !session.perfilId)
+      return { ok: false, motivo: "No se pudo validar tu identidad de trabajador. Habla con el administrador." };
+    return { ok: true };
+  }
+
+  // Taller: el mecánico con cuenta de Supabase tiene su propia app. Las cuentas
+  // locales de la lista TEAM siguen entrando como siempre — ver TEAM más abajo.
+  if (session.rol === "mecanico" && session.origen === "supabase")
+    return { ok: false, motivo: "Esta cuenta debe ingresar desde ENTIMOTORS Mi Trabajo." };
+  /* Lista BLANCA. Antes se admitía cualquier rol que no estuviera en una lista
+     de vistas restringidas, y un rol inventado (p. ej. una sesión guardada
+     manipulada) entraba con el nivel operativo de un mecánico local. El
+     desarrollador tiene su propio panel y ya se rechaza al iniciar sesión: aquí
+     se repite, porque este portero también corre con sesiones ya guardadas. */
+  if (session.rol === "desarrollador")
+    return { ok: false, motivo: "Cuenta técnica: no abre el taller. Usa el panel técnico." };
+  if (typeof session.rol !== "string" || !ROLES_DEL_TALLER.includes(session.rol))
+    return { ok: false, motivo: "Tu rol no tiene acceso a ENTIMOTORS Taller." };
+  return { ok: true };
+}
+
+// Deja la app cerrada y devuelve a quien sea al login, sin haber abierto base
+// alguna. No borra nada del dispositivo: solo se va la sesión.
+async function denegarSesion(motivo) {
+  currentUser = null;
+  document.getElementById("shell").classList.remove("active");
+  /* Sin esto el login se enseña muerto: arrancarConSesion() solo cablea el
+     formulario cuando NO hay sesión guardada, así que a quien rechazamos aquí
+     no le respondería el botón de entrar. */
+  wireLoginGate();
+  document.getElementById("gateLogin").classList.add("active");
+  document.getElementById("loginError").textContent = motivo;
+  localStorage.removeItem("enti_session");
+  if (window.Auth) { try { await Auth.cerrarSesion(); } catch { /* la sesión local ya quedó fuera */ } }
+}
+
 // Equipo del taller para el login local (sin red). Solo datos no secretos:
 // las contraseñas NO viven aquí porque este archivo se descarga completo con
 // cualquier PWA publicada. Viven en taller-demo/config-local.js (ignorado por
 // Git) — ver claveLocal() más abajo. Sin ese archivo, el login local de estos
-// usuarios queda deshabilitado y solo sirve una sesión ya guardada en este
-// dispositivo.
+// usuarios queda deshabilitado y solo sirve el login por correo (Supabase) o
+// una sesión ya guardada en este dispositivo.
 const TEAM = [
   { user: "wilkin", nombre: "Wilkin", telefono: "97049635", rol: "admin" },
   { user: "mecanico1", nombre: "Mecánico 1", telefono: "", rol: "mecanico" },
@@ -47,19 +117,83 @@ const TEAM = [
 // desarrollo, nunca se publica). Si el archivo no existe, devuelve undefined
 // y el login local de TEAM queda simplemente no disponible — no es un error.
 function claveLocal(user) {
-  return configLocal()?.teamPasswords?.[user];
-}
-/* config-local.js es SOLO de desarrollo, y los valores que tuvo en su día están
-   en el historial público del repositorio: no pueden servir de nada en un
-   servidor real. Por eso, aunque el archivo llegara por error a producción,
-   fuera de localhost se ignora entero y no habilita ningún acceso. */
-const ES_ORIGEN_LOCAL = ["localhost", "127.0.0.1"].includes(location.hostname);
-function configLocal() {
-  return ES_ORIGEN_LOCAL ? window.ENTIMOTORS_LOCAL : undefined;
+  return window.ENTIMOTORS_LOCAL?.teamPasswords?.[user];
 }
 // Secciones que solo el rol "admin" (dueño) puede ver — un mecánico no necesita
 // entrar a la caja, la web o los respaldos para hacer su trabajo diario.
-const VISTAS_SOLO_ADMIN = ["finanzas", "web-cms", "ajustes"];
+const VISTAS_SOLO_ADMIN = ["finanzas", "web-cms", "ajustes", "usuarios"];
+// Qué secciones NO ve cada rol. El admin lo ve todo. El cajero necesita la caja
+// (finanzas) pero no el gestor de la web ni los respaldos.
+// OJO: esto solo esconde botones. Lo que de verdad protege los datos son las
+// políticas RLS del servidor — y todavía no aplican a IndexedDB, que es local.
+// Todo lo que NO es Mi Trabajo. Un mecánico con cuenta no entra a ninguna:
+// ni al POS ni a créditos, que hasta 4E-1 tenía abiertos de par en par.
+const VISTAS_FUERA_DEL_MECANICO = [
+  "dashboard", "citas", "ordenes", "clientes", "cotizaciones",
+  "inventario", "pos", "creditos", "finanzas", "web-cms", "ajustes", "usuarios",
+];
+const VISTAS_OCULTAS_POR_ROL = {
+  admin: ["mi-trabajo"],
+  cajero: ["web-cms", "ajustes", "usuarios", "mi-trabajo"],
+  // Las cuentas locales de la lista TEAM siguen con lo de siempre; a quien
+  // entra con cuenta real se le aplica VISTAS_FUERA_DEL_MECANICO (ver
+  // vistasOcultasParaSesion). Este valor es el del modo local histórico.
+  mecanico: VISTAS_SOLO_ADMIN.concat("mi-trabajo"),
+  desarrollador: null,   // null = no entra al taller; ver panel-tecnico.html
+};
+
+function vistasOcultasParaSesion() {
+  if (esMecanicoCuenta()) return VISTAS_FUERA_DEL_MECANICO;
+  return VISTAS_OCULTAS_POR_ROL[currentUser?.rol] ?? VISTAS_SOLO_ADMIN.concat("mi-trabajo");
+}
+function vistaInicial() { return esMecanicoCuenta() ? "mi-trabajo" : "dashboard"; }
+/* ── Quién es quién, y qué es suyo ─────────────────────────────────────────
+   Un solo sitio donde se decide, para que no haya quince criterios distintos
+   repartidos por el archivo.
+
+   OJO con esMecanicoCuenta(): es "mecánico CON cuenta de verdad", no "rol
+   mecánico". La diferencia importa. Las cuentas de la lista TEAM local no
+   tienen perfilId, nunca lo tuvieron y siguen funcionando como siempre: son el
+   modo local de un solo dispositivo, anterior a todo esto. Las restricciones
+   de Mi Trabajo se aplican a quien entra con cuenta real, que es de quien
+   habla la frontera de seguridad del servidor. */
+function esAdmin()    { return currentUser?.rol === "admin"; }
+function esCajero()   { return currentUser?.rol === "cajero"; }
+function tieneIdentidadMecanico() {
+  return currentUser?.rol === "mecanico" && !!currentUser?.perfilId;
+}
+function esMecanicoCuenta() {
+  return currentUser?.rol === "mecanico" && currentUser?.origen === "supabase" && !!currentUser?.perfilId;
+}
+function puedeGestionarTaller() { return esAdmin() || esCajero(); }
+// Solo el administrador asigna y reasigna trabajo. Decisión de producto de 4E.
+function puedeAsignarMecanico() { return esAdmin(); }
+
+/* Propiedad SIEMPRE por uuid, jamás por nombre: dos personas pueden llamarse
+   igual y un nombre se cambia. mecanicoId nulo = sin asignar = de nadie, que
+   es exactamente lo que responde RLS en el servidor. */
+/* Rechaza y avisa. Se usa en los handlers, no solo al pintar: esconder un
+   botón no impide invocar su función desde la consola, y la mitad de estos
+   handlers se alcanzan por delegación de eventos. */
+function bloquear(motivo = "No tienes permiso para esa acción") {
+  toast(motivo, "off");
+  return false;
+}
+function exigeGestion(motivo) {
+  if (puedeGestionarTaller()) return true;
+  return bloquear(motivo || "Esa acción es del administrador");
+}
+
+function esTrabajoPropio(registro) {
+  const mio = currentUser?.perfilId;
+  return !!mio && !!registro?.mecanicoId && registro.mecanicoId === mio;
+}
+function puedeEditarTecnico(orden) {
+  if (!esMecanicoCuenta()) return puedeGestionarTaller();
+  return esTrabajoPropio(orden) && orden?.estado !== "entregado";
+}
+
+const NOMBRE_ROL = { admin: "administrador", cajero: "cajero", mecanico: "mecánico", desarrollador: "desarrollador" };
 
 // Horario del taller para el selector de citas: ajusta estos 3 valores si el
 // taller abre/cierra en otro horario o quieres citas cada X minutos.
@@ -70,10 +204,9 @@ const HORARIO_TALLER = { horaInicio: "08:00", horaFin: "17:00", intervaloMin: 30
 // "Borrar todo"). Es una protección local contra accidentes, NO seguridad
 // real — vive en el cliente y cualquiera con DevTools puede leerlo si
 // config-local.js está presente. El valor real vive en config-local.js
-// (ignorado por Git) y solo se usa en localhost; en cualquier otro sitio se
-// confirma con correo y contraseña de administrador (ver requestAdminCode).
+// (ignorado por Git); sin ese archivo estas acciones no se pueden confirmar.
 function codigoAdminLocal() {
-  return configLocal()?.adminCode;
+  return window.ENTIMOTORS_LOCAL?.adminCode;
 }
 
 let db;
@@ -125,9 +258,34 @@ function navegarWA(ventana, phoneRaw, text) {
 }
 
 /* ---------------- IndexedDB helper mínimo ---------------- */
-function openDb() {
+// La base del taller de siempre. NO se renombra, NO se migra, NO se borra:
+// puede contener trabajo real todavía sin sincronizar.
+const BASE_TALLER = "entimotors_os_demo";
+
+/* Qué base le toca a esta sesión.
+   El taller (admin, cajero y cualquier sesión local de la lista TEAM) sigue
+   usando la de siempre, byte por byte. Un mecánico con cuenta real usa una
+   base propia, derivada de su perfilId.
+   La razón es que IndexedDB no tiene RLS: lo que llegue al dispositivo se lee
+   con las herramientas del navegador, filtre lo que filtre la pantalla. Si el
+   dueño entra a revisar algo en el teléfono de un mecánico y luego entra el
+   mecánico, sin esto le quedarían delante los datos del taller entero.
+   Aislar por perfil no borra nada de nadie: son bases distintas que conviven. */
+function nombreBaseParaSesion(session) {
+  if (session?.rol === "mecanico" && session?.origen === "supabase" && session?.perfilId) {
+    return `${BASE_TALLER}_mec_${session.perfilId}`;
+  }
+  /* En «Mi Trabajo» no hay base del taller. El portero ya rechazó todo lo que
+     no sea un mecánico con identidad, así que llegar aquí es un error de
+     programación: devolvemos null para que reviente a la vista en vez de
+     abrir entimotors_os_demo en el dispositivo de un mecánico. */
+  if (ES_APP_MECANICOS) return null;
+  return BASE_TALLER;
+}
+
+function openDb(nombre = BASE_TALLER) {
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open("entimotors_os_demo", 6);
+    const req = indexedDB.open(nombre, 6);
     req.onupgradeneeded = (e) => {
       const d = req.result;
       const t = req.transaction;
@@ -341,6 +499,26 @@ const STORES_NO_RESPALDABLES = ["sync_cola"];
 // restaurando un respaldo viejo — y entonces la bitácora no probaría nada.
 const STORES_SOLO_AGREGAR = ["auditoria"];
 async function updateOrder(id, mutator) {
+  if (esMecanicoCuenta()) {
+    const actual = await DB.get("ordenes", id);
+    if (!esTrabajoPropio(actual)) { bloquear("Ese trabajo no está asignado a ti"); return actual; }
+    if (actual?.estado === "entregado") { bloquear("Este trabajo ya fue entregado"); return actual; }
+    /* Misma regla que el trigger de 4D, aquí arriba: un peldaño, hacia
+       adelante, y nunca hasta "entregado". Se comprueba sobre el resultado del
+       mutator y no sobre el botón, porque a updateOrder se llega por varios
+       caminos y el botón es solo uno de ellos. */
+    const tentativa = { ...actual };
+    mutator(tentativa);
+    if (tentativa.estado !== actual.estado) {
+      const paso = AVANCE_MECANICO[actual.estado];
+      if (!paso?.siguiente || tentativa.estado !== paso.siguiente) {
+        bloquear(tentativa.estado === "entregado"
+          ? "Entregar y cobrar es del administrador"
+          : "Solo puedes avanzar una etapa a la vez");
+        return actual;
+      }
+    }
+  }
   const o = await DB.get("ordenes", id);
   mutator(o);
   await DB.save("ordenes", o);
@@ -442,7 +620,7 @@ function registrarVentaRapida({ items, clienteId, clienteNombre, metodoPago, efe
       items, clienteId: clienteId || null, clienteNombre: clienteNombre || null, metodoPago, total,
       efectivoRecibido: metodoPago === "efectivo" ? Number(efectivoRecibido) || 0 : null,
       cambio: metodoPago === "efectivo" ? Math.max(0, (Number(efectivoRecibido) || 0) - total) : 0,
-      fechaISO, creadoEn: Date.now(), mecanico: currentUser?.nombre || "",
+      fechaISO, creadoEn: Date.now(), ...asignacionDelUsuarioActual(),
     };
 
     const ventaReq = ventasStore.add(venta);
@@ -504,7 +682,7 @@ function registrarCredito({ clienteId, clienteNombre, clienteTelefono, items, ve
       clienteId: clienteId || null, clienteNombre, clienteTelefono: clienteTelefono || "",
       items, total, abonado: 0, saldo: total, estado: "pendiente",
       vencimiento: vencimiento || null, nota: nota || "",
-      historialAbonos: [], fechaISO, creadoEn: Date.now(), mecanico: currentUser?.nombre || "",
+      historialAbonos: [], fechaISO, creadoEn: Date.now(), ...asignacionDelUsuarioActual(),
     };
     const credReq = credStore.add(credito);
     credReq.onsuccess = () => { credId = credReq.result; };
@@ -741,54 +919,23 @@ function toast(msg, kind = "on") {
 
 /* ---- confirmación con código de administrador para acciones que no se pueden deshacer ---- */
 let adminCodeCallback = null;
-/* Dos modos. En desarrollo (config-local.js en localhost) sigue el código local
-   de siempre. En cualquier otro sitio NO hay código: quien confirma escribe su
-   correo y contraseña de administrador, y Supabase los comprueba en el servidor.
-   Así no existe ningún secreto en el navegador que se pueda leer con DevTools. */
-function adminConCodigoLocal() { return typeof codigoAdminLocal() === "string"; }
 function requestAdminCode(onConfirm) {
   adminCodeCallback = onConfirm;
-  const local = adminConCodigoLocal();
-  document.getElementById("adminCodeCorreoFila").style.display = local ? "none" : "";
-  document.getElementById("adminCodeEtiqueta").textContent = local ? "Código" : "Contraseña";
-  document.getElementById("adminCodeHint").textContent = local
-    ? "Esta acción no se puede deshacer. Pide el código al administrador del taller."
-    : "Esta acción no se puede deshacer. Confirma con el correo y la contraseña del administrador.";
-  document.getElementById("adminCodeInput").setAttribute("inputmode", local ? "numeric" : "text");
-  document.getElementById("adminCodeCorreo").value = "";
   document.getElementById("adminCodeInput").value = "";
   document.getElementById("adminCodeError").textContent = "";
   document.getElementById("modalAdminCode").classList.add("active");
-  document.getElementById(local ? "adminCodeInput" : "adminCodeCorreo").focus();
+  document.getElementById("adminCodeInput").focus();
 }
 document.getElementById("btnCancelarAdminCode").addEventListener("click", () => {
   document.getElementById("modalAdminCode").classList.remove("active");
   adminCodeCallback = null;
 });
 document.getElementById("btnConfirmarAdminCode").addEventListener("click", async () => {
-  const btn = document.getElementById("btnConfirmarAdminCode");
-  const errEl = document.getElementById("adminCodeError");
-  if (btn.disabled) return;
-  if (adminConCodigoLocal()) {
-    const code = document.getElementById("adminCodeInput").value.trim();
-    if (code !== codigoAdminLocal()) { errEl.textContent = "Código incorrecto."; return; }
-  } else {
-    if (!window.AccesoSeguro) { errEl.textContent = "La verificación en línea no está disponible."; return; }
-    btn.disabled = true;
-    errEl.textContent = "Verificando…";
-    let r;
-    try {
-      r = await AccesoSeguro.verificar(
-        document.getElementById("adminCodeCorreo").value,
-        document.getElementById("adminCodeInput").value);
-    } finally {
-      btn.disabled = false;
-      document.getElementById("adminCodeInput").value = "";
-    }
-    if (!r.ok) { errEl.textContent = r.mensaje; return; }
-    if (!AccesoSeguro.esAdmin(r.perfil)) { errEl.textContent = "Esa cuenta no es de administrador."; return; }
+  const code = document.getElementById("adminCodeInput").value.trim();
+  if (code !== codigoAdminLocal()) {
+    document.getElementById("adminCodeError").textContent = "Código incorrecto.";
+    return;
   }
-  errEl.textContent = "";
   document.getElementById("modalAdminCode").classList.remove("active");
   const cb = adminCodeCallback;
   adminCodeCallback = null;
@@ -1298,103 +1445,120 @@ function wireInstallGate() {
 function readSession() {
   try { return JSON.parse(localStorage.getItem("enti_session") || "null"); } catch { return null; }
 }
+/* Un correo entra por Supabase; un usuario suelto, por la lista local de
+   siempre. Los dos caminos conviven a propósito: mientras la información viva
+   en el teléfono, el taller tiene que poder entrar sin señal. */
+function pareceCorreo(v) { return /.+@.+\..+/.test(v); }
+
+function sesionDesdePerfil(perfil, correo) {
+  // perfilId es el identificador ESTABLE de la persona (perfiles.id en
+  // Supabase). Es lo que se guarda en las citas y órdenes que crea, para que
+  // el trabajo siga siendo suyo aunque cambie de nombre. En una sesión local
+  // (lista TEAM, sin cuenta) vale null, y eso es válido: ver identidadMecanico().
+  return { user: correo, uid: perfil.uid, perfilId: perfil.uid || perfil.id || null,
+           nombre: perfil.nombre, telefono: "", rol: perfil.rol, origen: "supabase",
+           // lo comprueba el portero: una cuenta dada de baja no abre ninguna base
+           activo: perfil.activo !== false };
+}
+
+function pintarModoLogin() {
+  const el = document.getElementById("loginModo");
+  if (!el) return;
+  const hay = window.Auth && Auth.disponible();
+  el.textContent = hay
+    ? (navigator.onLine ? "Conectado al servidor — entra con tu correo." : "Sin señal — solo acceso local.")
+    : "";
+}
+
+let loginGateCableado = false;
+function wireLoginGate() {
+  // Idempotente: el portero puede mostrar el login en un arranque donde
+  // arrancarConSesion() ya lo había cableado, y duplicar el listener haría que
+  // cada intento de entrar se procesara dos veces.
+  if (loginGateCableado) return;
+  loginGateCableado = true;
+  pintarModoLogin();
+  window.addEventListener("online", pintarModoLogin);
+  window.addEventListener("offline", pintarModoLogin);
+
+  document.getElementById("loginForm").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const entrada = document.getElementById("loginUser").value.trim();
+    const p = document.getElementById("loginPass").value;
+    const errEl = document.getElementById("loginError");
+    const btn = e.target.querySelector('button[type=submit]');
+    errEl.textContent = "";
+
+    // ── camino Supabase ──
+    if (pareceCorreo(entrada) && window.Auth && Auth.disponible()) {
+      btn.disabled = true; btn.textContent = "Entrando…";
+      const r = await Auth.iniciarSesion(entrada.toLowerCase(), p);
+      btn.disabled = false; btn.textContent = "Entrar";
+      document.getElementById("loginPass").value = "";   // la contraseña no se queda en el DOM
+      if (!r.ok) {
+        errEl.textContent =
+          r.motivo === "credenciales-invalidas" ? "Correo o contraseña incorrectos." :
+          r.motivo === "cuenta-desactivada"     ? "Esta cuenta está dada de baja. Habla con el administrador." :
+          r.motivo === "sin-perfil"             ? "La cuenta existe pero no tiene perfil asignado." :
+          r.motivo === "sin-conexion"           ? "Sin conexión con el servidor. Entra con tu usuario local." :
+                                                  "No se pudo entrar. Inténtalo de nuevo.";
+        return;
+      }
+      entrarConSesion(sesionDesdePerfil(r.datos, entrada.toLowerCase()));
+      return;
+    }
+
+    // ── camino local (sin red, o usuario del equipo sin correo) ──
+    /* En «Mi Trabajo» este camino no existe, y se corta ANTES de mirar la lista
+       TEAM o de llamar a claveLocal(). No depende de que config-local.js dé
+       404: aunque alguien inyecte window.ENTIMOTORS_LOCAL en la consola, por
+       aquí no se pasa. */
+    if (!PERMITE_LOGIN_LOCAL) {
+      errEl.textContent = "Aquí se entra solo con tu correo y contraseña de ENTIMOTORS.";
+      return;
+    }
+    const u = entrada.toLowerCase();
+    const miembro = TEAM.find(t => t.user === u);
+    const clave = miembro && claveLocal(miembro.user);
+    const found = miembro && typeof clave === "string" && clave === p ? miembro : null;
+    if (!found) {
+      errEl.textContent = pareceCorreo(entrada) && !navigator.onLine
+        ? "Sin conexión: para entrar con correo hace falta señal."
+        : "Usuario o contraseña incorrectos.";
+      return;
+    }
+    document.getElementById("loginPass").value = "";
+    entrarConSesion({ user: found.user, nombre: found.nombre, telefono: found.telefono,
+                      rol: found.rol, origen: "local" });
+  });
+}
+
+/* El desarrollador no entra al taller: mientras los datos vivan en IndexedDB,
+   RLS no puede protegerlos, y su rol existe precisamente para no verlos. */
 function entrarConSesion(session) {
-  document.getElementById("loginError").textContent = "";
-  document.getElementById("loginPass").value = "";
+  // El panel técnico solo existe en el taller; en «Mi Trabajo» al desarrollador
+  // lo rechaza el portero como a cualquier otro rol que no sea mecánico.
+  if (!ES_APP_MECANICOS && session.rol === "desarrollador") {
+    const errEl = document.getElementById("loginError");
+    errEl.innerHTML = 'Cuenta técnica: no abre el taller. Usa el ' +
+                      '<a href="panel-tecnico.html" style="text-decoration:underline;">panel técnico</a>.';
+    if (window.Auth) Auth.cerrarSesion();
+    return;
+  }
+  /* Se comprueba ANTES de guardar la sesión: una cuenta que no es de este
+     producto no deja rastro en el dispositivo. */
+  const admitida = sesionAdmitida(session);
+  if (!admitida.ok) { denegarSesion(admitida.motivo); return; }
   localStorage.setItem("enti_session", JSON.stringify(session));
   document.getElementById("gateLogin").classList.remove("active");
   startApp(session);
 }
-function wireLoginGate() {
-  let verificando = false;
-  document.getElementById("loginForm").addEventListener("submit", async (e) => {
-    e.preventDefault();
-    if (verificando) return;
-    const u = document.getElementById("loginUser").value.trim().toLowerCase();
-    const p = document.getElementById("loginPass").value;
-    const errEl = document.getElementById("loginError");
-
-    /* Con correo: cuenta de ENTIMOTORS. La contraseña la compara Supabase en el
-       servidor; aquí solo se recibe "es quien dice, con este rol". */
-    if (u.includes("@")) {
-      if (!window.AccesoSeguro) { errEl.textContent = "La verificación en línea no está disponible."; return; }
-      verificando = true;
-      const btn = document.querySelector("#loginForm button[type=submit]");
-      if (btn) btn.disabled = true;
-      errEl.textContent = "Verificando…";
-      let r;
-      try { r = await AccesoSeguro.verificar(u, p); }
-      finally { verificando = false; if (btn) btn.disabled = false; }
-      if (!r.ok) { errEl.textContent = r.mensaje; document.getElementById("loginPass").value = ""; return; }
-      const permiso = AccesoSeguro.permiteTaller(r.perfil);
-      if (!permiso.ok) { errEl.textContent = permiso.mensaje; document.getElementById("loginPass").value = ""; return; }
-      entrarConSesion(AccesoSeguro.sesionDesdePerfil(r.correo, r.perfil));
-      return;
-    }
-
-    // Usuario del equipo: login local, que solo existe en desarrollo (localhost + config-local.js)
-    const miembro = TEAM.find(t => t.user === u);
-    const clave = miembro && claveLocal(miembro.user);
-    const found = miembro && typeof clave === "string" && clave === p ? miembro : null;
-    if (!found) { errEl.textContent = "Usuario o contraseña incorrectos."; return; }
-    entrarConSesion({ user: found.user, nombre: found.nombre, telefono: found.telefono, rol: found.rol });
-  });
-}
-
-/* ---------------- cerrar sesión SIN poder quedarse fuera ----------------
-   Hasta la 3.12.2, cerrar sesión borraba la sesión y dejaba la pantalla de
-   login. En producción ese login no tenía con qué comprobar ninguna contraseña,
-   así que quien cerraba sesión se quedaba fuera de su propia información.
-
-   Regla ahora: la sesión solo se borra DESPUÉS de demostrar que se puede volver
-   a entrar. La persona confirma su correo y contraseña; si el servidor los
-   acepta y la cuenta puede usar el taller, se cierra. Si no hay red, si no hay
-   verificación disponible o si la contraseña no es la correcta, NO se toca nada
-   y la sesión sigue abierta. No hay puerta trasera: sin verificación, no se sale. */
-function hayReingresoLocal() {
-  const s = readSession();
-  return !!(s && !s.origen && typeof claveLocal(s.user) === "string");
-}
-function cerrarSesionYa() {
+document.getElementById("btnLogout").addEventListener("click", async () => {
+  // Cerrar sesión NO borra nada del taller: ni clientes, ni inventario, ni
+  // órdenes, ni la configuración. Solo se va la sesión.
+  if (window.Auth && Auth.estado().conSesion) { try { await Auth.cerrarSesion(); } catch (e) {} }
   localStorage.removeItem("enti_session");
   location.reload();
-}
-document.getElementById("btnLogout").addEventListener("click", () => {
-  // desarrollo: el login local funciona, así que salir no deja a nadie fuera
-  if (hayReingresoLocal()) { cerrarSesionYa(); return; }
-  const s = readSession();
-  document.getElementById("salidaCorreo").value = s && s.origen === "supabase" ? s.user : "";
-  document.getElementById("salidaClave").value = "";
-  document.getElementById("salidaError").textContent = "";
-  document.getElementById("modalSalida").classList.add("active");
-  document.getElementById(s && s.origen === "supabase" ? "salidaClave" : "salidaCorreo").focus();
-});
-document.getElementById("btnCancelarSalida").addEventListener("click", () => {
-  document.getElementById("modalSalida").classList.remove("active");
-  document.getElementById("salidaClave").value = "";
-});
-document.getElementById("btnConfirmarSalida").addEventListener("click", async () => {
-  const btn = document.getElementById("btnConfirmarSalida");
-  const errEl = document.getElementById("salidaError");
-  if (btn.disabled) return;
-  const aviso = " Tu sesión sigue abierta.";
-  if (!window.AccesoSeguro) { errEl.textContent = "No se puede comprobar que podrás volver a entrar." + aviso; return; }
-  const d = AccesoSeguro.disponible();
-  if (!d.ok) { errEl.textContent = d.mensaje + aviso; return; }
-  btn.disabled = true;
-  errEl.textContent = "Verificando…";
-  let r;
-  try {
-    r = await AccesoSeguro.verificar(document.getElementById("salidaCorreo").value,
-                                     document.getElementById("salidaClave").value);
-  } finally {
-    btn.disabled = false;
-    document.getElementById("salidaClave").value = "";
-  }
-  if (!r.ok) { errEl.textContent = r.mensaje + aviso; return; }
-  const permiso = AccesoSeguro.permiteTaller(r.perfil);
-  if (!permiso.ok) { errEl.textContent = permiso.mensaje + " Con esa cuenta no podrías volver a entrar." + aviso; return; }
-  cerrarSesionYa();
 });
 
 /* ================= modo claro / oscuro ================= */
@@ -1419,12 +1583,33 @@ document.getElementById("btnTema").addEventListener("click", () => {
 actualizarBotonTema();
 
 /* ================= navegación entre vistas ================= */
+/* Qué vistas puede abrir un rol. Hasta ahora los permisos solo escondían el
+   botón del menú, así que showView("finanzas") desde la consola —o cualquier
+   código que se equivocara de destino— abría la sección igual. Esto lo cierra.
+
+   OJO, y es importante: esto es una defensa de la interfaz, NO seguridad de
+   los datos. Todo lo que se ve vive en IndexedDB, en el propio teléfono, y ahí
+   no hay nada que impida leerlo por otros medios. La barrera de verdad son las
+   políticas RLS del servidor, que todavía no distinguen entre miembros del
+   equipo (ver informe de Fase 4A). Esto evita el acceso accidental y el
+   "me equivoqué de botón"; no evita a alguien decidido con su propio dispositivo. */
+function puedeVerVista(name) {
+  if (!currentUser) return true;              // durante el arranque no hay rol todavía
+  if (VISTAS_OCULTAS_POR_ROL[currentUser.rol] === null) return false;  // desarrollador
+  return !vistasOcultasParaSesion().includes(name);
+}
+
 function showView(name) {
+  if (!puedeVerVista(name)) {
+    toast("No tienes acceso a esa sección", "off");
+    return false;   // quien despacha no debe renderizar la vista tampoco
+  }
   document.querySelectorAll(".view").forEach(v => v.classList.remove("active"));
   document.getElementById(`view-${name}`).classList.add("active");
   document.querySelectorAll(".nav-item[data-view]").forEach(b => b.classList.toggle("active", b.dataset.view === name));
   document.getElementById("fabHome").classList.toggle("fab-hidden", name === "dashboard");
   closeMobileSidebar();
+  return true;
 }
 
 document.getElementById("fabHome").addEventListener("click", () => {
@@ -1590,6 +1775,7 @@ document.addEventListener("click", (e) => {
   if (wrap && !wrap.contains(e.target)) document.getElementById("accountPanel").classList.remove("open");
 });
 const renderByView = {
+  "mi-trabajo": () => renderMiTrabajo(),
   dashboard: () => renderDashboard(),
   ordenes: () => renderOrdersList(),
   cotizaciones: () => renderCotizaciones(),
@@ -1601,11 +1787,12 @@ const renderByView = {
   creditos: () => renderCreditos(),
   "web-cms": () => renderWebCMS(),
   ajustes: () => renderAjustes(),
+  // vive en usuarios.js: habla con el api-server, no con IndexedDB
+  usuarios: () => window.PantallaUsuarios?.render(),
 };
 document.querySelectorAll(".nav-item[data-view]").forEach(btn => {
   btn.addEventListener("click", () => {
-    showView(btn.dataset.view);
-    renderByView[btn.dataset.view]?.();
+    if (showView(btn.dataset.view)) renderByView[btn.dataset.view]?.();
   });
 });
 
@@ -1613,8 +1800,7 @@ document.querySelectorAll(".nav-item[data-view]").forEach(btn => {
 // menú hamburguesa, mismo despacho de render.
 document.querySelectorAll(".qa-btn[data-view]").forEach(btn => {
   btn.addEventListener("click", () => {
-    showView(btn.dataset.view);
-    renderByView[btn.dataset.view]?.();
+    if (showView(btn.dataset.view)) renderByView[btn.dataset.view]?.();
   });
 });
 
@@ -1633,7 +1819,7 @@ function renderWidgetRow(containerId, items) {
     const item = items[i];
     if (item.goto) {
       btn.addEventListener("click", () => {
-        showView(item.goto);
+        if (!showView(item.goto)) return;
         document.querySelectorAll(".nav-item[data-view]").forEach(b => b.classList.toggle("active", b.dataset.view === item.goto));
         renderByView[item.goto]?.();
       });
@@ -1644,6 +1830,81 @@ function renderWidgetRow(containerId, items) {
 }
 
 /* ================= DASHBOARD ================= */
+/* ── MI TRABAJO ───────────────────────────────────────────────────────────
+   La pantalla del mecánico. No es el panel del taller recortado: es su lista
+   de trabajo y nada más.
+
+   Filtra por esTrabajoPropio(), es decir, por uuid. Sobre la base aislada del
+   mecánico ese filtro debería ser redundante —ahí solo debería haber lo suyo—
+   pero se hace igual: si algún día un error de sincronización mete de más, la
+   pantalla no lo enseña. */
+async function renderMiTrabajo() {
+  const [citas, ordenes, clientes, motos] = await Promise.all([
+    DB.getAll("citas"), DB.getAll("ordenes"), DB.getAll("clientes"), DB.getAll("motos"),
+  ]);
+  const nombreCliente = (id) => clientes.find(c => c.id === id)?.nombre || "Cliente";
+  const telCliente = (id) => clientes.find(c => c.id === id)?.telefono || "";
+  const motoDe = (id) => motos.find(m => m.id === id);
+
+  document.getElementById("miTrabajoSub").textContent =
+    `${currentUser?.nombre || ""} · acceso para mecánicos.`;
+
+  const mias = citas.filter(esTrabajoPropio).filter(c => !citaCerrada(c))
+    .sort((a, b) => `${a.fecha}${a.hora}`.localeCompare(`${b.fecha}${b.hora}`));
+  document.getElementById("miTrabajoCitas").innerHTML = mias.length ? mias.map(c => `
+    <div class="card" style="margin-bottom:0.6rem;">
+      <div style="display:flex; justify-content:space-between; gap:0.6rem; align-items:baseline;">
+        <b>${esc(nombreCliente(c.clienteId) || c.nombreTmp || "Cliente")}</b>
+        <span class="pill">${esc(citaWhenInfo(c).label)} ${esc(c.hora || "")}</span>
+      </div>
+      <div class="meta">${esc(c.motivo || "Sin motivo especificado")}</div>
+      <div class="meta">${esc(telCliente(c.clienteId) || c.telefonoTmp || "sin teléfono")}</div>
+    </div>`).join("")
+    : `<div class="card"><p style="color:var(--text-muted); margin:0;">No hay citas en este dispositivo.</p></div>`;
+
+  const abiertas = ordenes.filter(esTrabajoPropio).filter(o => o.estado !== "entregado");
+  const entregadas = ordenes.filter(esTrabajoPropio).filter(o => o.estado === "entregado");
+  const tarjeta = (o, historial) => {
+    const m = motoDe(o.motoId);
+    return `<div class="card orden-mia" data-id="${o.id}" style="margin-bottom:0.6rem; cursor:pointer;">
+      <div style="display:flex; justify-content:space-between; gap:0.6rem; align-items:baseline;">
+        <b>#${o.id} — ${esc(m ? `${m.marca} ${m.modelo}` : "Moto")}</b>
+        <span class="pill ${esc(o.estado)}">${esc(etiquetaEtapa(o.estado))}</span>
+      </div>
+      <div class="meta">${esc(nombreCliente(o.clienteId))}${m?.placa ? " · placa " + esc(m.placa) : ""}</div>
+      <div class="meta">${esc(o.falla || "Sin descripción de la falla")}</div>
+      ${historial ? `<div class="meta">Solo lectura — trabajo entregado.</div>` : ""}
+    </div>`;
+  };
+  document.getElementById("miTrabajoOrdenes").innerHTML = abiertas.length
+    ? abiertas.map(o => tarjeta(o, false)).join("")
+    : `<div class="card"><p style="color:var(--text-muted); margin:0;">No hay órdenes abiertas en este dispositivo.</p></div>`;
+  document.getElementById("miTrabajoHistorial").innerHTML = entregadas.length
+    ? entregadas.map(o => tarjeta(o, true)).join("")
+    : `<div class="card"><p style="color:var(--text-muted); margin:0;">Todavía no hay trabajos entregados en este dispositivo.</p></div>`;
+
+  document.querySelectorAll(".orden-mia").forEach(el => {
+    el.addEventListener("click", () => openOrder(Number(el.dataset.id)));
+  });
+}
+
+function etiquetaEtapa(key) {
+  return STAGES.find(s => s.key === key)?.label || key || "—";
+}
+
+/* El único avance que le corresponde al mecánico en cada etapa, con el texto
+   que de verdad describe lo que va a pasar. "Presupuesto" en la base es un
+   estado; para el mecánico es "ya terminé de diagnosticar", que es lo que
+   entiende. Nunca hay más de un botón, y en calidad no hay ninguno: entregar
+   y cobrar no es suyo. */
+const AVANCE_MECANICO = {
+  recibido:    { siguiente: "diagnostico", texto: "Empezar diagnóstico" },
+  diagnostico: { siguiente: "presupuesto", texto: "Diagnóstico listo para presupuesto" },
+  presupuesto: { siguiente: "reparacion",  texto: "Empezar reparación" },
+  reparacion:  { siguiente: "calidad",     texto: "Pasar a control de calidad" },
+  calidad:     { siguiente: null,          texto: "Trabajo técnico terminado — pendiente de entrega" },
+};
+
 async function renderDashboard() {
   const [ordenes, motos, clientes, inventario, citas, cotizaciones] = await Promise.all([
     DB.getAll("ordenes"), DB.getAll("motos"), DB.getAll("clientes"), DB.getAll("inventario"), DB.getAll("citas"),
@@ -1879,8 +2140,16 @@ async function renderOrdersList() {
 }
 
 async function openOrder(id) {
-  currentOrderId = id;
   const o = await DB.get("ordenes", id);
+  if (!o) return;
+  // La orden se carga por id venga de donde venga (lista, buscador, enlace).
+  // Aquí es donde se comprueba de quién es, no en el botón que la abrió.
+  if (esMecanicoCuenta() && !esTrabajoPropio(o)) {
+    bloquear("Ese trabajo no está asignado a ti");
+    showView("mi-trabajo"); renderMiTrabajo();
+    return;
+  }
+  currentOrderId = id;
   const moto = await DB.get("motos", o.motoId);
   const cliente = await DB.get("clientes", o.clienteId);
   currentOrderCache = { o, moto, cliente };
@@ -1893,7 +2162,9 @@ async function openOrder(id) {
     `${esc(cliente.nombre)} · ${esc(cliente.telefono || "sin teléfono")} · placa ${esc(moto.placa || "s/p")}${desdeCita}`;
   renderDetalleMecanico(o);
   document.getElementById("detalleFalla").textContent = o.falla || "(sin descripción)";
-  document.getElementById("inputKm").value = moto.km ?? "";
+  // lo legacy se sigue viendo: si la orden no trae km propio, se muestra el de
+  // la moto, igual que antes
+  document.getElementById("inputKm").value = o.kmSalida ?? moto.km ?? "";
   document.getElementById("inputKm").previousElementSibling.textContent = o.estado === "entregado" ? "Kilometraje de salida" : "Kilometraje actual";
 
   document.getElementById("detalleFotos").innerHTML = (o.fotos || []).map(src => `<img src="${src}">`).join("");
@@ -1901,6 +2172,7 @@ async function openOrder(id) {
   renderStageTracker(o.estado, o.finalizada);
   await renderStageContent(o);
   updateActionBar(o);
+  bloquearCamposSiEntregada(o);
 
   showView("detalle");
 }
@@ -1914,15 +2186,25 @@ function renderDetalleMecanico(o) {
     wrap.innerHTML = `Asignada a <b>${esc(o.mecanico || "Sin asignar")}</b> · <span class="pill ${origenTrabajoDe(o) === "negocio" ? "presupuesto" : "entregado"}">${origenTrabajoDe(o) === "negocio" ? "Negocio" : "Taller"}</span>`;
     return;
   }
+  // Solo el administrador asigna y reasigna. Al cajero y al mecánico se les
+  // enseña el nombre en texto: la información sigue ahí, la palanca no.
+  if (!puedeAsignarMecanico()) {
+    wrap.innerHTML = `Asignada a <b>${esc(o.mecanico || "Sin asignar")}</b> · <span class="pill ${origenTrabajoDe(o) === "negocio" ? "presupuesto" : "entregado"}">${origenTrabajoDe(o) === "negocio" ? "Negocio" : "Taller"}</span>`;
+    return;
+  }
   wrap.innerHTML = `Asignada a
     <select id="detalleMecanicoSel" style="display:inline-block; width:auto; padding:0.1rem 0.4rem; margin:0;"></select>
     · <select id="detalleOrigenSel" style="display:inline-block; width:auto; padding:0.1rem 0.4rem; margin:0;">
         <option value="taller">Taller</option><option value="negocio">Negocio</option>
       </select>`;
-  poblarSelectMecanico("detalleMecanicoSel", o.mecanico);
+  poblarSelectMecanico("detalleMecanicoSel", o.mecanico, o.mecanicoId);
   document.getElementById("detalleOrigenSel").value = origenTrabajoDe(o);
   document.getElementById("detalleMecanicoSel").addEventListener("change", async (e) => {
-    await updateOrder(o.id, ord => { ord.mecanico = e.target.value || ""; });
+    if (!puedeAsignarMecanico()) { bloquear("Solo el administrador asigna trabajo"); return; }
+    await updateOrder(o.id, ord => {
+      const a = asignacionDesdeSelect("detalleMecanicoSel");
+      ord.mecanico = a.mecanico; ord.mecanicoId = a.mecanicoId;
+    });
     toast("Mecánico actualizado");
     renderOrdersList();
   });
@@ -1932,12 +2214,53 @@ function renderDetalleMecanico(o) {
   });
 }
 
+/* Una orden entregada es historial para el mecánico. La base ya lo impide
+   desde 4D, pero no queremos que se entere escribiendo y recibiendo un error:
+   los campos no deben poder tocarse siquiera. */
+function bloquearCamposSiEntregada(o) {
+  if (!esMecanicoCuenta()) return;
+  const cerrada = o?.estado === "entregado" || !esTrabajoPropio(o);
+  ["inputKm", "inputFotos"].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.disabled = cerrada;
+  });
+  document.querySelectorAll("#stageContent textarea, #stageContent input").forEach(el => {
+    el.disabled = cerrada;
+  });
+}
+
 function updateActionBar(o) {
   const isLast = o.estado === STAGES[STAGES.length - 1].key;
   const btnAvanzar = document.getElementById("btnAvanzar");
   const btnRetroceder = document.getElementById("btnRetroceder");
   const btnFactura = document.getElementById("btnImprimirFactura");
   const badge = document.getElementById("finalizadoBadge");
+
+  /* El mecánico no retrocede, no factura y no entrega. Solo tiene el paso
+     siguiente, con el nombre de lo que va a hacer — y en "calidad" ni eso:
+     ahí su parte terminó y le toca a administración. */
+  if (esMecanicoCuenta()) {
+    btnFactura.style.display = "none";
+    document.getElementById("btnEnviarFacturaWA").style.display = "none";
+    btnRetroceder.style.display = "none";
+    const paso = AVANCE_MECANICO[o.estado];
+    badge.style.display = "none";
+    if (o.estado === "entregado") {
+      btnAvanzar.style.display = "none";
+      badge.style.display = "inline-flex";
+      badge.textContent = "Trabajo entregado — solo lectura";
+      return;
+    }
+    if (!paso || !paso.siguiente) {
+      btnAvanzar.style.display = "none";
+      badge.style.display = "inline-flex";
+      badge.textContent = paso?.texto || "Sin acciones pendientes";
+      return;
+    }
+    btnAvanzar.style.display = "inline-flex";
+    btnAvanzar.textContent = paso.texto;
+    return;
+  }
 
   btnFactura.style.display = isLast ? "inline-flex" : "none";
   document.getElementById("btnEnviarFacturaWA").style.display = isLast ? "inline-flex" : "none";
@@ -1962,6 +2285,7 @@ function renderStageTracker(estado, finalizada) {
     return `<button class="stage ${cls}" data-i="${i}"><div class="idx">${String(i + 1).padStart(2, "0")}</div><h4>${s.label}</h4></button>`;
   }).join("");
   document.querySelectorAll(".stage").forEach(btn => {
+    if (esMecanicoCuenta()) { btn.disabled = true; btn.style.cursor = "default"; return; }
     btn.addEventListener("click", async () => {
       if (finalizada) { toast("Este trabajo ya está finalizado", "off"); return; }
       const i = Number(btn.dataset.i);
@@ -1991,7 +2315,15 @@ async function renderStageContent(o) {
     document.getElementById("diagHoras").addEventListener("change", (e) => updateOrder(o.id, ord => { ord.diagnostico = { ...(ord.diagnostico || {}), horas: Number(e.target.value) || 0 }; }));
 
   } else if (o.estado === "presupuesto") {
-    await renderPresupuestoStage(o);
+    /* Aquí viven los importes. El mecánico no los ve — ni siquiera se cargan
+       para esconderlos después: simplemente no se pide el bloque. */
+    if (esMecanicoCuenta()) {
+      el.innerHTML = `<div class="card"><p style="color:var(--text-muted); margin:0;">
+        Diagnóstico entregado. La cotización la prepara administración; cuando esté lista podrás empezar la reparación.
+      </p></div>`;
+    } else {
+      await renderPresupuestoStage(o);
+    }
 
   } else if (o.estado === "reparacion") {
     el.innerHTML = `
@@ -2024,6 +2356,13 @@ async function renderStageContent(o) {
         ord.calidadChecklist = { ...(ord.calidadChecklist || {}), [e.target.dataset.key]: e.target.checked };
       }));
     });
+
+  } else if (o.estado === "entregado" && esMecanicoCuenta()) {
+    // ni importes ni tipo de cobro ni garantía: para él es un registro cerrado
+    el.innerHTML = `<div class="card">
+      <h4 class="font-display" style="font-size:0.95rem; margin-bottom:0.4rem;">Entregada</h4>
+      <p style="color:var(--text-muted); margin:0;">Este trabajo ya se entregó. Queda como historial: puedes consultarlo, no modificarlo.</p>
+    </div>`;
 
   } else if (o.estado === "entregado") {
     const total = (o.items || []).reduce((s, it) => s + it.cantidad * it.precio, 0);
@@ -2282,9 +2621,61 @@ let citaPendienteDeConvertir = null;
 
 // "" = sin asignar. Los registros viejos con mecánico:"—" se tratan igual que
 // "" en cualquier cálculo/agrupación (ver origenTrabajoDe y calcularProduccion).
-function poblarSelectMecanico(selectId, seleccionado) {
+/* ── identidad del mecánico ────────────────────────────────────────────────
+   Un registro puede identificar a quien lo atiende de dos maneras:
+
+     mecanicoId  uuid del perfil — estable, sobrevive a un cambio de nombre
+     mecanico    el nombre visible — lo único que hay en los registros viejos,
+                 en los creados sin conexión y en los trabajadores sin cuenta
+
+   Las dos conviven a propósito y ninguna sustituye a la otra: el id sirve para
+   agrupar y para que mañana RLS pueda decir «esto es tuyo»; el nombre es lo
+   que se enseña, y es lo que queda cuando no hay id. Todo el resto del código
+   pasa por estas tres funciones para no repetir la regla en quince sitios. */
+
+/** Clave con la que se agrupa a una persona. Prefiere el id; si no hay, el nombre. */
+function identidadMecanico(registro) {
+  const id = registro?.mecanicoId || null;
+  const nombre = (registro?.mecanico && registro.mecanico !== "—") ? registro.mecanico : "";
+  return { id, nombre, clave: id || nombre || "(sin asignar)" };
+}
+
+/** Lo que hay que guardar cuando alguien elige un mecánico en un <select>. */
+function asignacionDesdeSelect(selectId) {
+  // Quien no asigna, crea sin asignar. No se rellena un nombre por defecto:
+  // un trabajo sin dueño debe verse como lo que es, para que el administrador
+  // lo asigne. Inventar un nombre aquí sería atribuir trabajo a alguien.
+  if (!puedeAsignarMecanico()) return { mecanico: "", mecanicoId: null };
   const sel = document.getElementById(selectId);
-  sel.innerHTML = '<option value="">Sin asignar</option>' + TEAM.map(t => `<option value="${esc(t.nombre)}">${esc(t.nombre)}</option>`).join("");
+  const op = sel?.selectedOptions?.[0];
+  return { mecanico: sel?.value || "", mecanicoId: op?.dataset?.perfilId || null };
+}
+
+/** La asignación del usuario que está trabajando ahora mismo. */
+function asignacionDelUsuarioActual() {
+  return { mecanico: currentUser?.nombre || "", mecanicoId: currentUser?.perfilId || null };
+}
+
+/* El <option> sigue valiendo el NOMBRE: los huecos de horario, el aviso de
+   choque y "Mover" comparan por nombre y seguirían funcionando igual. El uuid
+   viaja aparte en data-perfil-id, así que cuando la lista pase a venir de
+   `perfiles` (4C-2) solo cambia de dónde salen las opciones, no quién las lee. */
+function poblarSelectMecanico(selectId, seleccionado, seleccionadoId) {
+  const sel = document.getElementById(selectId);
+  if (sel && !puedeAsignarMecanico()) {
+    // el <label> que lo acompaña se va con él; si no, queda un rótulo huérfano
+    sel.style.display = "none";
+    if (sel.previousElementSibling?.tagName === "LABEL") sel.previousElementSibling.style.display = "none";
+    sel.innerHTML = '<option value="">Sin asignar</option>';
+    sel.value = "";
+    return;
+  }
+  sel.innerHTML = '<option value="">Sin asignar</option>' + TEAM.map(t =>
+    `<option value="${esc(t.nombre)}"${t.perfilId ? ` data-perfil-id="${esc(t.perfilId)}"` : ""}>${esc(t.nombre)}</option>`).join("");
+  if (seleccionadoId) {
+    const porId = [...sel.options].find(o => o.dataset.perfilId === seleccionadoId);
+    if (porId) { sel.value = porId.value; return; }
+  }
   sel.value = seleccionado && TEAM.some(t => t.nombre === seleccionado) ? seleccionado : "";
 }
 
@@ -2319,7 +2710,7 @@ async function abrirOrdenDesdeCita(citaId) {
   }
   document.getElementById("ordenFalla").value = cita.motivo || "";
   renderOrdenClienteChip();
-  poblarSelectMecanico("ordenMecanico", cita.mecanico);
+  poblarSelectMecanico("ordenMecanico", cita.mecanico, cita.mecanicoId);
   document.getElementById("ordenOrigenTrabajo").value = "taller";
 
   document.getElementById("ordenDesdeCitaAviso").style.display = "block";
@@ -2336,7 +2727,7 @@ document.getElementById("btnNuevaOrden").addEventListener("click", async () => {
   renderOrdenClienteChip();
   ["ordenNombre", "ordenTelefono", "ordenPlaca", "ordenMarca", "ordenModelo", "ordenKm", "ordenFalla"].forEach(id => document.getElementById(id).value = "");
   document.getElementById("ordenFoto").value = "";
-  poblarSelectMecanico("ordenMecanico", currentUser?.nombre);
+  poblarSelectMecanico("ordenMecanico", currentUser?.nombre, currentUser?.perfilId);
   document.getElementById("ordenOrigenTrabajo").value = "taller";
   document.getElementById("modalOrden").classList.add("active");
 });
@@ -2346,6 +2737,7 @@ document.getElementById("btnCancelarOrden").addEventListener("click", () => {
 });
 
 alHacerClicUnaVez(document.getElementById("btnCrearOrden"), async () => {
+  if (!exigeGestion("Las órdenes las abre el administrador o el cajero")) return;
   let clienteId, motoId;
 
   if (ordenClienteSel?.clienteId) {
@@ -2394,7 +2786,7 @@ alHacerClicUnaVez(document.getElementById("btnCrearOrden"), async () => {
     diagnostico: null, reparacionNotas: "", calidadChecklist: null,
     // "" = sin asignar. El select ya viene precargado con el mecánico de la
     // cita (si aplica) o el usuario actual — esto solo lee lo que haya quedado.
-    mecanico: document.getElementById("ordenMecanico").value || "",
+    ...asignacionDesdeSelect("ordenMecanico"),
     origenTrabajo: document.getElementById("ordenOrigenTrabajo").value === "negocio" ? "negocio" : "taller",
     citaId: cita?.id || null,
     citaFechaISO: cita ? `${cita.fecha}T${cita.hora}` : null,
@@ -2438,6 +2830,16 @@ document.getElementById("btnVolverOrdenes").addEventListener("click", async () =
 alHacerClicUnaVez(document.getElementById("btnAvanzar"), async () => {
   const o = await DB.get("ordenes", currentOrderId);
   const idx = STAGES.findIndex(s => s.key === o.estado);
+  /* El mecánico va por su propio carril: un paso, el que le toca, y jamás
+     hasta "entregado". Sale antes de llegar al bloque de cobro. */
+  if (esMecanicoCuenta()) {
+    const paso = AVANCE_MECANICO[o.estado];
+    if (!paso?.siguiente) { bloquear("Entregar y cobrar es del administrador"); return; }
+    await updateOrder(o.id, ord => { ord.estado = paso.siguiente; });
+    toast(`Etapa: ${etiquetaEtapa(paso.siguiente)}`);
+    openOrder(o.id);
+    return;
+  }
   if (idx >= STAGES.length - 1) {
     if (o.finalizada) {
       toast("Esta orden ya estaba finalizada — no se vuelve a cobrar", "off");
@@ -2509,6 +2911,7 @@ alHacerClicUnaVez(document.getElementById("btnAvanzar"), async () => {
   openOrder(o.id);
 });
 document.getElementById("btnRetroceder").addEventListener("click", async () => {
+  if (esMecanicoCuenta()) { bloquear("Un mecánico no retrocede etapas"); return; }
   const o = await DB.get("ordenes", currentOrderId);
   const idx = STAGES.findIndex(s => s.key === o.estado);
   if (idx <= 0) return;
@@ -2519,8 +2922,20 @@ document.getElementById("btnRetroceder").addEventListener("click", async () => {
 /* ---- km ---- */
 document.getElementById("inputKm").addEventListener("change", async (e) => {
   const o = await DB.get("ordenes", currentOrderId);
+  const valor = Number(e.target.value);
+  if (!valor) return;
+  /* El mecánico anota el kilometraje EN SU ORDEN (km_salida), no en la ficha
+     de la moto. La ficha del cliente es administrativa y desde 4D el servidor
+     ya le niega escribir en motos; si siguiéramos guardando ahí, el campo se
+     rompería en cuanto sincronice. Administración conserva su comportamiento
+     de siempre sobre motos.km. */
+  if (esMecanicoCuenta()) {
+    await updateOrder(o.id, ord => { ord.kmSalida = valor; });
+    toast("Kilometraje anotado en la orden");
+    return;
+  }
   const moto = await DB.get("motos", o.motoId);
-  moto.km = Number(e.target.value) || moto.km;
+  moto.km = valor || moto.km;
   await DB.save("motos", moto);
   markDirty();
   toast("Kilometraje actualizado");
@@ -2530,6 +2945,11 @@ document.getElementById("inputKm").addEventListener("change", async (e) => {
 document.getElementById("inputFotos").addEventListener("change", async (e) => {
   const files = Array.from(e.target.files || []);
   if (!files.length) return;
+  if (esMecanicoCuenta()) {
+    const o = await DB.get("ordenes", currentOrderId);
+    if (!esTrabajoPropio(o)) { e.target.value = ""; bloquear("Ese trabajo no está asignado a ti"); return; }
+    if (o?.estado === "entregado") { e.target.value = ""; bloquear("Este trabajo ya fue entregado"); return; }
+  }
   const urls = await Promise.all(files.map(fileToDataUrl));
   const o = await updateOrder(currentOrderId, ord => { ord.fotos = (ord.fotos || []).concat(urls); });
   e.target.value = "";
@@ -3315,8 +3735,7 @@ async function abrirModalMoverCita(citaId) {
     `${nombre} — ahora está para el ${dt.toLocaleDateString("es-HN")} a las ${cita.hora} con ${cita.mecanico}.`;
   document.getElementById("moverAvisoSinTel").style.display = telefono ? "none" : "block";
 
-  document.getElementById("moverMecanico").innerHTML = TEAM.map(t => `<option value="${esc(t.nombre)}">${esc(t.nombre)}</option>`).join("");
-  document.getElementById("moverMecanico").value = cita.mecanico;
+  poblarSelectMecanico("moverMecanico", cita.mecanico, cita.mecanicoId);
   document.getElementById("moverMotivo").value = "cliente";
   document.getElementById("moverFecha").value = cita.fecha;
   await refreshMoverHoraOptions();
@@ -3344,7 +3763,7 @@ alHacerClicUnaVez(document.getElementById("btnConfirmarMover"), async () => {
 
   const fecha = document.getElementById("moverFecha").value;
   const hora = document.getElementById("moverHora").value;
-  const mecanico = document.getElementById("moverMecanico").value;
+  const { mecanico, mecanicoId } = asignacionDesdeSelect("moverMecanico");
   const motivo = document.getElementById("moverMotivo").value;
 
   if (!fecha) { toast("Elige la nueva fecha", "off"); return; }
@@ -3369,6 +3788,8 @@ alHacerClicUnaVez(document.getElementById("btnConfirmarMover"), async () => {
   const antes = { fecha: cita.fecha, hora: cita.hora, mecanico: cita.mecanico };
   await DB.save("citas", {
     ...cita, fecha, hora, mecanico,
+    // igual que al editar: sin cambio de mecánico, el id que ya tenía manda
+    mecanicoId: mecanico === cita.mecanico ? (cita.mecanicoId ?? null) : mecanicoId,
     // si estaba marcada como no asistida, moverla la vuelve a poner en juego
     estado: cita.estado === "ausente" ? undefined : cita.estado,
     cerradaEn: cita.estado === "ausente" ? undefined : cita.cerradaEn,
@@ -3509,6 +3930,7 @@ async function renderCitasList() {
   // "Llegó": abre la orden de servicio ya llena con los datos de la cita
   list.querySelectorAll('[data-action="llego"]').forEach(btn => {
     btn.addEventListener("click", async (e) => {
+      if (!exigeGestion("Solo el administrador o el cajero registran la llegada")) return;
       e.stopPropagation();
       await abrirOrdenDesdeCita(Number(btn.dataset.id));
     });
@@ -3516,6 +3938,7 @@ async function renderCitasList() {
 
   list.querySelectorAll('[data-action="editar"]').forEach(btn => {
     btn.addEventListener("click", async (e) => {
+      if (!exigeGestion("Solo el administrador o el cajero editan una cita")) return;
       e.stopPropagation();
       await abrirModalEditarCita(Number(btn.dataset.id));
     });
@@ -3523,6 +3946,7 @@ async function renderCitasList() {
 
   list.querySelectorAll('[data-action="mover"]').forEach(btn => {
     btn.addEventListener("click", async (e) => {
+      if (!exigeGestion("Solo el administrador o el cajero mueven una cita")) return;
       e.stopPropagation();
       await abrirModalMoverCita(Number(btn.dataset.id));
     });
@@ -3530,6 +3954,7 @@ async function renderCitasList() {
 
   list.querySelectorAll('[data-action="ausente"]').forEach(btn => {
     btn.addEventListener("click", async (e) => {
+      if (!exigeGestion("Solo el administrador o el cajero marcan una ausencia")) return;
       e.stopPropagation();
       const c = await DB.get("citas", Number(btn.dataset.id));
       await DB.save("citas", { ...c, estado: "ausente", cerradaEn: Date.now() });
@@ -3542,6 +3967,7 @@ async function renderCitasList() {
 
   list.querySelectorAll('[data-action="reabrir"]').forEach(btn => {
     btn.addEventListener("click", async (e) => {
+      if (!exigeGestion("Solo el administrador o el cajero reabren una cita")) return;
       e.stopPropagation();
       const c = await DB.get("citas", Number(btn.dataset.id));
       delete c.estado; delete c.cerradaEn;
@@ -3559,6 +3985,7 @@ async function renderCitasList() {
 
   list.querySelectorAll('[data-action="recordar"]').forEach(btn => {
     btn.addEventListener("click", async (e) => {
+      if (!exigeGestion("Los recordatorios los envía el administrador o el cajero")) return;
       e.stopPropagation();
       const ventanaWA = abrirVentanaWA();
       const id = Number(btn.dataset.id);
@@ -3575,6 +4002,8 @@ async function renderCitasList() {
 
   list.querySelectorAll('[data-action="eliminar"]').forEach(btn => {
     btn.addEventListener("click", async (e) => {
+      // solo el administrador borra: lo dice el aviso y la politica citas_admin_borra; exigeGestion() dejaba pasar tambien al cajero
+      if (!esAdmin()) { bloquear("Solo el administrador elimina una cita"); return; }
       e.stopPropagation();
       const ventanaWA = btn.dataset.tel ? abrirVentanaWA() : null;
       const id = Number(btn.dataset.id);
@@ -3634,7 +4063,7 @@ async function abrirModalEditarCita(citaId) {
   campoFecha.min = cita.fecha < hoy ? cita.fecha : hoy;
   campoFecha.value = cita.fecha;
 
-  document.getElementById("citaMecanico").value = cita.mecanico;
+  poblarSelectMecanico("citaMecanico", cita.mecanico, cita.mecanicoId);
   await refreshCitaHoraOptions();
   const selHora = document.getElementById("citaHora");
   // si la hora actual no es uno de los huecos estándar (típico de las citas que
@@ -3669,7 +4098,7 @@ wireAutocompleteCliente(document.getElementById("citaBuscarCliente"), document.g
 document.getElementById("citaBuscarCliente").addEventListener("input", () => { citaClienteSel = null; renderCitaClienteChip(); });
 
 async function refreshCitaClienteSelect() {
-  document.getElementById("citaMecanico").innerHTML = TEAM.map(t => `<option value="${esc(t.nombre)}">${esc(t.nombre)}</option>`).join("");
+  poblarSelectMecanico("citaMecanico");
 }
 
 document.getElementById("btnNuevaCita").addEventListener("click", async () => {
@@ -3694,7 +4123,7 @@ alHacerClicUnaVez(document.getElementById("btnGuardarCita"), async () => {
   const fecha = document.getElementById("citaFecha").value;
   const hora = document.getElementById("citaHora").value;
   const motivo = document.getElementById("citaMotivo").value.trim();
-  const mecanico = document.getElementById("citaMecanico").value;
+  const { mecanico, mecanicoId } = asignacionDesdeSelect("citaMecanico");
   if (!fecha) { toast("Elige una fecha", "off"); return; }
   if (!hora) { toast("Elige una hora disponible", "off"); return; }
 
@@ -3742,11 +4171,14 @@ alHacerClicUnaVez(document.getElementById("btnGuardarCita"), async () => {
     const cambioDeHorario = citaPrevia.fecha !== fecha || citaPrevia.hora !== hora;
     await DB.save("citas", {
       ...citaPrevia, clienteId, nombreTmp, telefonoTmp, fecha, hora, motivo, mecanico,
+      /* Si el mecánico no cambió, se respeta el id que ya tuviera: editar el
+         motivo de una cita no puede desasignarla ni inventarle un uuid. */
+      mecanicoId: mecanico === citaPrevia.mecanico ? (citaPrevia.mecanicoId ?? null) : mecanicoId,
       // si se corrió la cita, el recordatorio anterior ya no sirve
       recordatorioEnviado: cambioDeHorario ? false : citaPrevia.recordatorioEnviado,
     });
   } else {
-    id = await DB.save("citas", { clienteId, nombreTmp, telefonoTmp, fecha, hora, motivo, mecanico, origen: "interna", recordatorioEnviado: false, creadoEn: Date.now() });
+    id = await DB.save("citas", { clienteId, nombreTmp, telefonoTmp, fecha, hora, motivo, mecanico, mecanicoId, origen: "interna", recordatorioEnviado: false, creadoEn: Date.now() });
   }
   markDirty();
   document.getElementById("modalCita").classList.remove("active");
@@ -3920,6 +4352,7 @@ async function renderClientes() {
 let clienteDetalleId = null; // cliente cuya ficha está abierta, para saber a quién editar
 
 async function openClienteDetalle(id) {
+  if (esMecanicoCuenta()) { bloquear("La ficha del cliente es del administrador"); return; }
   const cliente = await DB.get("clientes", id);
   if (!cliente) return;
   clienteDetalleId = id;
@@ -4814,7 +5247,9 @@ async function calcularProduccion(desde, hasta) {
   const [ordenes, ventas, creditos] = await Promise.all([DB.getAll("ordenes"), DB.getAll("ventas_rapidas"), DB.getAll("creditos")]);
   const enRango = (iso) => { const d = (iso || "").slice(0, 10); return !!d && d >= desde && d <= hasta; };
   const totalItems = (x) => (x.items || []).reduce((s, it) => s + it.cantidad * it.precio, 0);
-  const nombreMecanico = (o) => (o.mecanico && o.mecanico !== "—") ? o.mecanico : "";
+  // se agrupa por identidadMecanico(): por uuid cuando lo hay, y si no por
+  // nombre. Así dos tocayos con cuenta propia dejan de sumar en la misma fila,
+  // y los registros viejos (sin uuid) siguen contando como siempre.
 
   const finalizadasEnRango = ordenes.filter(o => o.finalizada && enRango(o.finalizadoEn ? new Date(o.finalizadoEn).toISOString() : null));
   const ordenesTaller = finalizadasEnRango.filter(o => origenTrabajoDe(o) === "taller");
@@ -4834,19 +5269,22 @@ async function calcularProduccion(desde, hasta) {
   // mecánico, aunque ventas_rapidas tenga su propio campo "mecanico" (quien
   // hizo la venta en el TPV, no producción de taller — así lo pidió el cliente).
   const porMecanico = {};
-  const asegurar = (nombre) => {
-    const k = nombre || "(sin asignar)";
-    if (!porMecanico[k]) porMecanico[k] = { pendientes: 0, completados: 0, producido: 0 };
-    return porMecanico[k];
+  const asegurar = (o) => {
+    const { id, nombre, clave } = identidadMecanico(o);
+    if (!porMecanico[clave]) porMecanico[clave] = { mecanicoId: id, nombre: nombre || "(sin asignar)", pendientes: 0, completados: 0, producido: 0 };
+    // si una orden del mismo uuid trae un nombre más reciente, se prefiere ese:
+    // la etiqueta que se enseña es siempre humana, nunca el uuid
+    else if (id && nombre) porMecanico[clave].nombre = nombre;
+    return porMecanico[clave];
   };
-  ordenesTaller.forEach(o => { const e = asegurar(nombreMecanico(o)); e.completados++; e.producido += totalItems(o); });
+  ordenesTaller.forEach(o => { const e = asegurar(o); e.completados++; e.producido += totalItems(o); });
   // "pendientes" es una foto del estado ACTUAL, no depende del rango de fechas
-  ordenes.filter(o => origenTrabajoDe(o) === "taller" && !o.finalizada).forEach(o => { asegurar(nombreMecanico(o)).pendientes++; });
+  ordenes.filter(o => origenTrabajoDe(o) === "taller" && !o.finalizada).forEach(o => { asegurar(o).pendientes++; });
 
   return {
     taller, negocio, negocioOrdenes, negocioVentas, total,
-    porMecanico: Object.entries(porMecanico).map(([nombre, v]) => ({
-      nombre, ...v, promedio: v.completados ? v.producido / v.completados : 0,
+    porMecanico: Object.values(porMecanico).map(v => ({
+      ...v, promedio: v.completados ? v.producido / v.completados : 0,
     })).sort((a, b) => b.producido - a.producido),
   };
 }
@@ -5556,15 +5994,16 @@ document.getElementById("btnGuardarCMS").addEventListener("click", async () => {
 
 /* ================= AJUSTES: respaldo, restauración, reset, permisos ================= */
 function aplicarPermisosPorRol() {
-  const esAdmin = currentUser?.rol === "admin";
+  const ocultas = vistasOcultasParaSesion();
   document.querySelectorAll(".nav-item[data-view]").forEach(btn => {
-    if (VISTAS_SOLO_ADMIN.includes(btn.dataset.view)) btn.style.display = esAdmin ? "" : "none";
+    btn.style.display = ocultas.includes(btn.dataset.view) ? "none" : "";
   });
   // si un mecánico quedó parado en una vista restringida (por ejemplo, sesión
   // anterior era de admin en este mismo dispositivo), lo regresamos al dashboard
-  if (!esAdmin && VISTAS_SOLO_ADMIN.some(v => document.getElementById(`view-${v}`)?.classList.contains("active"))) {
-    showView("dashboard");
-    renderDashboard();
+  if (ocultas.some(v => document.getElementById(`view-${v}`)?.classList.contains("active"))) {
+    const destino = vistaInicial();
+    showView(destino);
+    if (destino === "mi-trabajo") renderMiTrabajo(); else renderDashboard();
   }
 }
 
@@ -5573,7 +6012,7 @@ async function renderAjustes() {
   const conteos = await Promise.all(ALL_STORES.map(s => DB.getAll(s).then(r => r.length)));
   const totalRegistros = conteos.reduce((a, b) => a + b, 0);
   document.getElementById("ajustesInfo").innerHTML = `
-    Usuario: <b>${esc(currentUser?.nombre || "—")}</b> (${currentUser?.rol === "admin" ? "administrador" : "mecánico"})<br>
+    Usuario: <b>${esc(currentUser?.nombre || "—")}</b> (${esc(NOMBRE_ROL[currentUser?.rol] || currentUser?.rol || "—")})<br>
     Este dispositivo arrancó ${modo} · ${totalRegistros} registros guardados en total.
   `;
 
@@ -5589,23 +6028,92 @@ async function renderAjustes() {
   pintarUltimoRespaldo();
 }
 
-document.getElementById("btnForzarActualizacion").addEventListener("click", async () => {
+/* ---- Buscar actualización ahora ----
+   ANTES este botón desregistraba todos los Service Workers, borraba todas las
+   cachés y recargaba: instalaba la versión publicada sin ofrecer la copia de
+   seguridad, pasaba por encima del «Ahora no» y, sin señal, dejaba el equipo sin
+   su caché (el navegador mostraba su página de error hasta que volviera Internet).
+
+   Ahora SOLO COMPRUEBA. Nunca desregistra, nunca borra cachés y nunca recarga por
+   su cuenta. Si hay una versión nueva abre el MISMO aviso de siempre (copia y
+   actualizar / solo copia / ahora no); quien activa el worker nuevo sigue siendo
+   únicamente «Crear copia y actualizar», con el mensaje «activar-ya». */
+const ESPERA_ACTUALIZACION_MS = 20000;   // tope para comprobar y para que un worker nuevo termine de instalarse
+
+/* Resuelve con lo que devuelva `promesa`, o con "timeout" si tarda más de `ms`.
+   Si `promesa` rechaza, rechaza. La promesa perdedora no se cancela (no se puede) pero
+   tampoco queda un rechazo sin atender. */
+function conPlazo(promesa, ms) {
+  const p = Promise.resolve(promesa);
+  p.catch(() => {});
+  let reloj;
+  const plazo = new Promise((resolve) => { reloj = setTimeout(() => resolve("timeout"), ms); });
+  return Promise.race([p, plazo]).finally(() => clearTimeout(reloj));
+}
+
+/* Espera a que `worker` termine de instalarse. "instalado": quedó listo (esperando, o ya
+   activo si no había ningún cliente al que esperar). "fallo": la instalación se abortó
+   (worker "redundant"). "timeout": no terminó a tiempo. */
+function esperarInstalacionSW(worker, ms) {
+  return new Promise((resolve) => {
+    const veredicto = () => ["installed", "activating", "activated"].includes(worker.state) ? "instalado"
+      : worker.state === "redundant" ? "fallo" : null;
+    const ya = veredicto();
+    if (ya) { resolve(ya); return; }
+    let reloj = null;
+    const salir = (r) => { clearTimeout(reloj); worker.removeEventListener("statechange", alCambiar); resolve(r); };
+    const alCambiar = () => { const r = veredicto(); if (r) salir(r); };
+    reloj = setTimeout(() => salir("timeout"), ms);
+    worker.addEventListener("statechange", alCambiar);
+  });
+}
+
+async function buscarActualizacion() {
+  if (navigator.onLine === false) {
+    toast("Sin conexión: ahora no se puede buscar actualizaciones. La app sigue funcionando igual.", "off");
+    return "sin-conexion";
+  }
+  if (!("serviceWorker" in navigator)) {
+    toast("Este navegador no permite buscar actualizaciones automáticas.", "off");
+    return "sin-soporte";
+  }
   toast("Buscando la última versión…");
-  try {
-    if ("serviceWorker" in navigator) {
-      const regs = await navigator.serviceWorker.getRegistrations();
-      await Promise.all(regs.map((r) => r.unregister()));
-    }
-    if ("caches" in window) {
-      const keys = await caches.keys();
-      await Promise.all(keys.map((k) => caches.delete(k)));
-    }
-  } catch (e) {}
-  // ?_= con la hora actual evita que el propio navegador (no el Service
-  // Worker, que ya se acaba de borrar) conteste esto con algo guardado en su
-  // caché HTTP normal.
-  location.href = location.pathname + "?_=" + Date.now();
-});
+
+  let reg;
+  try { reg = await navigator.serviceWorker.getRegistration(); }
+  catch (e) { toast("No se pudo comprobar en este dispositivo.", "off"); return "error"; }
+
+  if (!reg) {
+    // Sin Service Worker no hay nada que actualizar ni que proteger: se prepara la
+    // instalación con la misma llamada del arranque, sin forzar nada ni recargar.
+    try { await navigator.serviceWorker.register("./sw.js", { updateViaCache: "none" }); }
+    catch (e) { toast("No se pudo preparar la instalación en este dispositivo.", "off"); return "sin-sw"; }
+    toast("Instalación preparada en este dispositivo.");
+    return "sin-sw-registrado";
+  }
+
+  // Una versión que ya estaba esperando (p. ej. tras un «Ahora no» y una recarga) no
+  // vuelve a avisar sola: se le muestra a quien lo pide.
+  if (reg.waiting) { abrirAvisoVersionNueva({ forzar: true }); return "nueva"; }
+
+  if (!reg.installing) {
+    let r;
+    try { r = await conPlazo(reg.update(), ESPERA_ACTUALIZACION_MS); }
+    catch (e) { toast("No se pudo comprobar ahora. Revisa tu conexión e inténtalo de nuevo.", "off"); return "error"; }
+    if (r === "timeout") { toast("La comprobación está tardando más de lo normal. Inténtalo de nuevo en un momento.", "off"); return "timeout"; }
+  }
+
+  // update() resuelve cuando el worker nuevo EMPIEZA a instalarse, no cuando termina.
+  const nuevo = reg.waiting || reg.installing;
+  if (!nuevo) { toast("Ya tienes la última versión"); return "al-dia"; }
+  const estado = await esperarInstalacionSW(nuevo, ESPERA_ACTUALIZACION_MS);
+  if (estado === "instalado") { abrirAvisoVersionNueva({ forzar: true }); return "nueva"; }
+  if (estado === "fallo") { toast("No se pudo preparar la versión nueva. Inténtalo otra vez con conexión.", "off"); return "fallo"; }
+  toast("La comprobación está tardando más de lo normal. Inténtalo de nuevo en un momento.", "off");
+  return "timeout";
+}
+
+alHacerClicUnaVez(document.getElementById("btnForzarActualizacion"), buscarActualizacion);
 
 /* ================= RESPALDO, VERIFICACIÓN Y RESTAURACIÓN =================
    Toda la información del taller existe únicamente en este dispositivo. El
@@ -5621,7 +6129,7 @@ document.getElementById("btnForzarActualizacion").addEventListener("click", asyn
    fecha e identificador, para que al restaurarlo se sepa exactamente de dónde
    salió y si el esquema es compatible. */
 
-const VERSION_APP = "3.12.3";
+const VERSION_APP = "3.13.0";
 const VERSION_RESPALDO = 2; // formato del archivo, no de la app
 
 async function armarRespaldo() {
@@ -5771,36 +6279,6 @@ document.getElementById("btnCompartirRespaldo").addEventListener("click", async 
   toast("Este navegador no comparte archivos: se descargó la copia", "off");
 });
 
-/* ---- operaciones destructivas: cerradas salvo desarrollo habilitado a propósito ----
-   Restaurar (Reemplazar y también Combinar) y "Borrar todo" escriben o vacían
-   tablas enteras. Hasta tener una copia verificada fuera del dispositivo y una
-   restauración que no pueda quedarse a medias ni mezclar registros de otro
-   equipo, quedan cerradas aunque quien confirme sea administrador.
-   Solo se abren con las dos cosas a la vez: origen localhost/127.0.0.1 Y
-   allowDestructiveDev: true en config-local.js. Servir una copia en localhost
-   no basta, y fuera de localhost config-local.js se ignora entero (configLocal).
-   El ajuste no es un secreto: solo evita que cualquier copia borre por descuido.
-   Crear y descargar respaldos NO pasa por aquí: eso sigue disponible siempre. */
-const OPERACIONES_DESTRUCTIVAS_PERMITIDAS = ES_ORIGEN_LOCAL && configLocal()?.allowDestructiveDev === true;
-const MENSAJE_FUNCION_DESHABILITADA = "Esta función está temporalmente deshabilitada hasta completar el respaldo de seguridad.";
-function operacionDestructivaBloqueada() {
-  if (OPERACIONES_DESTRUCTIVAS_PERMITIDAS) return false;
-  toast(MENSAJE_FUNCION_DESHABILITADA, "off");
-  return true;
-}
-if (!OPERACIONES_DESTRUCTIVAS_PERMITIDAS) {
-  document.getElementById("inputRestaurar").closest(".card").querySelector(".hint").textContent =
-    "Restauración temporalmente deshabilitada hasta completar el respaldo de seguridad. Puedes elegir un archivo para ver qué contiene.";
-  document.querySelectorAll("#restaurarModo .seg-opt").forEach(b => {
-    b.disabled = true;
-    b.querySelector("small").textContent = "No disponible por ahora";
-  });
-  document.getElementById("btnConfirmarRestaurar").disabled = true;
-  const btnDeCero = document.getElementById("btnEmpezarDeCero");
-  btnDeCero.disabled = true;
-  btnDeCero.closest(".card").querySelector(".hint").textContent = MENSAJE_FUNCION_DESHABILITADA;
-}
-
 /* ---- restauración ---- */
 let respaldoParaRestaurar = null;
 let modoRestauracion = "reemplazar";
@@ -5818,8 +6296,6 @@ document.getElementById("inputRestaurar").addEventListener("change", async (e) =
   respaldoParaRestaurar = respaldo;
   modoRestauracion = "reemplazar";
   document.querySelectorAll("#restaurarModo .seg-opt").forEach(b => b.classList.toggle("active", b.dataset.modo === "reemplazar"));
-  // ver qué trae el archivo sigue permitido; confirmar no (alHacerClicUnaVez lo rehabilita tras cada toque)
-  document.getElementById("btnConfirmarRestaurar").disabled = !OPERACIONES_DESTRUCTIVAS_PERMITIDAS;
 
   const fecha = respaldo.exportadoEn ? new Date(respaldo.exportadoEn).toLocaleString("es-HN") : "fecha desconocida";
   document.getElementById("restaurarOrigen").innerHTML =
@@ -5848,9 +6324,7 @@ document.getElementById("inputRestaurar").addEventListener("change", async (e) =
     aviso.textContent = `El archivo trae información que esta versión no conoce (${desconocidas.join(", ")}) y esa parte se dejará fuera.`;
   } else {
     aviso.className = "aviso-fuerte";
-    aviso.textContent = OPERACIONES_DESTRUCTIVAS_PERMITIDAS
-      ? "Antes de tocar nada se guardará automáticamente una copia de lo que hay ahora, por si necesitas volver atrás."
-      : "Solo se muestra lo que contiene el archivo: no se escribirá nada en este dispositivo.";
+    aviso.textContent = "Antes de tocar nada se guardará automáticamente una copia de lo que hay ahora, por si necesitas volver atrás.";
   }
 
   actualizarExplicacionRestauracion();
@@ -5858,9 +6332,7 @@ document.getElementById("inputRestaurar").addEventListener("change", async (e) =
 });
 
 function actualizarExplicacionRestauracion() {
-  document.getElementById("restaurarExplicacion").textContent = !OPERACIONES_DESTRUCTIVAS_PERMITIDAS
-    ? MENSAJE_FUNCION_DESHABILITADA
-    : modoRestauracion === "reemplazar"
+  document.getElementById("restaurarExplicacion").textContent = modoRestauracion === "reemplazar"
     ? "Se borra todo lo que hay en este dispositivo y queda exactamente lo del archivo. Es lo correcto si cambiaste de celular o estás recuperando de un desastre."
     : "Se conserva lo que ya hay y solo se agregan los registros del archivo que no existan aquí (se comparan por identificador). Nada se borra, pero pueden quedar duplicados si el mismo dato se creó por separado en los dos dispositivos.";
 }
@@ -5868,7 +6340,6 @@ function actualizarExplicacionRestauracion() {
 document.getElementById("restaurarModo").addEventListener("click", (e) => {
   const btn = e.target.closest(".seg-opt");
   if (!btn) return;
-  if (operacionDestructivaBloqueada()) return;
   modoRestauracion = btn.dataset.modo;
   document.querySelectorAll("#restaurarModo .seg-opt").forEach(b => b.classList.toggle("active", b === btn));
   actualizarExplicacionRestauracion();
@@ -5883,8 +6354,6 @@ alHacerClicUnaVez(document.getElementById("btnConfirmarRestaurar"), async () => 
   const respaldo = respaldoParaRestaurar;
   if (!respaldo) return;
   const modo = modoRestauracion;
-  // cerrada antes siquiera de pedir credenciales (Reemplazar y Combinar por igual)
-  if (operacionDestructivaBloqueada()) return;
 
   requestAdminCode(async () => {
     // red de seguridad: antes de tocar nada, una copia de lo que hay AHORA.
@@ -5896,8 +6365,6 @@ alHacerClicUnaVez(document.getElementById("btnConfirmarRestaurar"), async () => 
       descargarArchivo(`entimotors-ANTES-de-restaurar-${previo.exportadoEn.slice(0, 10)}.json`, verifPrevio.texto);
     }
 
-    // última guarda, pegada a la primera escritura: se comprueba aunque se llegue por otro camino
-    if (operacionDestructivaBloqueada()) return;
     let escritos = 0, omitidos = 0;
     if (modo === "reemplazar") {
       for (const store of ALL_STORES) {
@@ -5944,8 +6411,6 @@ alHacerClicUnaVez(document.getElementById("btnConfirmarRestaurar"), async () => 
 });
 
 document.getElementById("btnEmpezarDeCero").addEventListener("click", async () => {
-  // cerrada antes de la confirmación y de pedir credenciales
-  if (operacionDestructivaBloqueada()) return;
   const ok = await showConfirm(
     "Esto borra TODA la información guardada en este dispositivo: clientes, órdenes, ventas, caja, inventario, todo. No se puede deshacer.",
     { titulo: "Borrar todo y empezar de cero", textoOk: "Borrar todo" }
@@ -5953,8 +6418,6 @@ document.getElementById("btnEmpezarDeCero").addEventListener("click", async () =
   if (!ok) return;
 
   requestAdminCode(async () => {
-    // última guarda, pegada al primer clear()
-    if (operacionDestructivaBloqueada()) return;
     for (const store of ALL_STORES) await DB.clear(store);
     localStorage.removeItem("enti_modo_datos");
     markDirty();
@@ -6055,8 +6518,8 @@ document.getElementById("offlineToggle").addEventListener("click", () => {
   forcedOffline = !forcedOffline;
   document.getElementById("offlineToggle").textContent = forcedOffline ? "Volver a estar en línea" : "Simular sin conexión";
   renderSyncChip();
-  toast(forcedOffline ? "Modo sin conexión activado" : "Conexión restaurada — sincronizando cambios pendientes");
-  if (!forcedOffline && pending > 0) setTimeout(() => { pending = 0; renderSyncChip(); toast("Todo sincronizado"); }, 1200);
+  toast(forcedOffline ? "Modo sin conexión activado" : "Conexión restaurada — procesando cambios locales…");
+  if (!forcedOffline && pending > 0) setTimeout(() => { pending = 0; renderSyncChip(); toast("Cambios guardados localmente"); }, 1200);
 });
 window.addEventListener("online", renderSyncChip);
 window.addEventListener("offline", renderSyncChip);
@@ -6141,11 +6604,26 @@ async function seedIfEmpty() {
 
 /* ================= arranque de la app (tras pasar los dos gates) ================= */
 async function startApp(session) {
+  /* Fail closed antes de abrir NADA. Aquí llegan también las sesiones que ya
+     estaban guardadas en el dispositivo, así que el portero se repite: no basta
+     con haberlo comprobado al iniciar sesión.
+     Un mecánico que llega sin perfilId es una identidad que no se pudo
+     resolver, y sin identidad no hay forma de saber qué trabajo es suyo. No hay
+     respaldo por nombre a propósito: adivinar por nombre es justo lo que esta
+     fase vino a quitar. */
+  const admitida = sesionAdmitida(session);
+  if (!admitida.ok) { await denegarSesion(admitida.motivo); return; }
+
   currentUser = session;
   document.getElementById("loggedUserName").textContent = session.nombre;
-  document.getElementById("loggedUserRole").textContent = session.user;
+  document.getElementById("loggedUserRole").textContent =
+    (NOMBRE_ROL[session.rol] || session.rol || "") + (session.origen === "supabase" ? "" : " · local");
 
-  db = await openDb();
+  // Cada identidad, su base. Se decide ANTES de la primera lectura: abrir la
+  // del taller "un momento" y cambiar después ya habría expuesto los datos.
+  const baseDeEstaSesion = nombreBaseParaSesion(session);
+  if (!baseDeEstaSesion) { await denegarSesion("No se pudo preparar tu espacio de trabajo."); return; }
+  db = await openDb(baseDeEstaSesion);
 
   const clientesExistentes = await DB.getAll("clientes");
   const modo = localStorage.getItem("enti_modo_datos");
@@ -6184,6 +6662,17 @@ async function continuarArranque(modo) {
     else console.info("[ENTIMOTORS] cuenta de prueba: ya hay datos reales, no se siembra nada");
   }
   aplicarPermisosPorRol();
+  /* Un mecánico solo necesita su pantalla. Pintar de paso el POS, las finanzas
+     y el CMS no solo sobra: cada uno de esos render hace DB.getAll de tablas
+     enteras, y aquí lo que queremos es justo lo contrario. */
+  if (esMecanicoCuenta()) {
+    showView("mi-trabajo");
+    await renderMiTrabajo();
+    renderSyncChip();
+    document.getElementById("fabHome").classList.add("fab-hidden");
+    wireServiceWorkerUpdates();
+    return;
+  }
   await renderOrdersList();
   await renderClientes();
   await renderInventario();
@@ -6255,11 +6744,13 @@ function wireServiceWorkerUpdates() {
    automática — se avisa, se le ofrece la copia primero, y él decide.
 
    "Ahora no" es una respuesta válida y se respeta: no se vuelve a preguntar en
-   esta sesión, y la versión vieja sigue funcionando con normalidad. */
+   esta sesión, y la versión vieja sigue funcionando con normalidad. Solo lo
+   reabre la propia persona, con «Buscar actualización ahora» (`forzar`). */
 let avisoVersionMostrado = false;
 
-function abrirAvisoVersionNueva() {
-  if (avisoVersionMostrado) return;
+function abrirAvisoVersionNueva({ forzar = false } = {}) {
+  if (document.getElementById("modalVersionNueva")?.classList.contains("active")) return; // ya está abierto: no se duplica
+  if (avisoVersionMostrado && !forzar) return;
   if (document.getElementById("modalRestaurar")?.classList.contains("active")) return; // no interrumpir una restauración
   avisoVersionMostrado = true;
 
@@ -6308,18 +6799,83 @@ alHacerClicUnaVez(document.getElementById("btnCopiaYActualizar"), async () => {
 });
 
 /* ================= boot: gate de instalación -> gate de login -> app ================= */
+function global_RecuperarClave() { return typeof RecuperarClave !== "undefined" && !!RecuperarClave; }
+
 (function boot() {
+  /* Primero de todo: ¿venimos de un enlace de Supabase? Quien lo abre es
+     alguien recién dado de alta, que todavía NO tiene la app instalada — si
+     esto fuera después, chocaría contra la pantalla de instalar y no habría
+     forma de poner la contraseña. Ver recovery.js. */
+  if (global_RecuperarClave() && RecuperarClave.hayEnlace()) {
+    if (RecuperarClave.iniciar()) return;
+  }
+
   if (!isStandalone() && !devBypassed()) {
     wireInstallGate();
     return; // se queda mostrando #gateInstall (ya viene "active" en el HTML)
   }
   document.getElementById("gateInstall").classList.remove("active");
 
-  const session = readSession();
-  if (!session) {
+  arrancarConSesion();
+})();
+
+/* Al abrir la app: si había sesión de Supabase se confirma contra el servidor,
+   porque el rol puede haber cambiado desde el último inicio. Si no hay red, se
+   sigue con lo que había guardado — el taller no se queda fuera por falta de
+   señal. */
+async function arrancarConSesion() {
+  const guardada = readSession();
+
+  if (window.Auth && Auth.disponible()) {
+    const r = await Auth.restaurarSesion();
+    if (r.ok) {
+      // el perfil manda sobre lo que hubiera guardado: nombre y rol al día
+      const correo = (Auth.usuarioActual() || {}).correo || (guardada && guardada.user) || "";
+      const sesion = sesionDesdePerfil(r.datos, correo);
+      if (sesion.rol === "desarrollador") {
+        wireLoginGate();
+        document.getElementById("gateLogin").classList.add("active");
+        document.getElementById("loginError").innerHTML =
+          'Cuenta técnica: no abre el taller. Usa el <a href="panel-tecnico.html" style="text-decoration:underline;">panel técnico</a>.';
+        await Auth.cerrarSesion();
+        localStorage.removeItem("enti_session");
+        return;
+      }
+      localStorage.setItem("enti_session", JSON.stringify(sesion));
+      startApp(sesion);
+      return;
+    }
+    // la sesión del servidor ya no vale: si la guardada venía de ahí, se descarta
+    if (guardada && guardada.origen === "supabase" &&
+        ["cuenta-desactivada", "sin-perfil", "sin-permiso"].includes(r.motivo)) {
+      localStorage.removeItem("enti_session");
+      wireLoginGate();
+      document.getElementById("gateLogin").classList.add("active");
+      document.getElementById("loginError").textContent =
+        r.motivo === "cuenta-desactivada" ? "Esta cuenta está dada de baja."
+                                          : "Esta cuenta ya no tiene perfil válido.";
+      return;
+    }
+  }
+
+  if (!guardada) {
     wireLoginGate();
     document.getElementById("gateLogin").classList.add("active");
     return;
   }
-  startApp(session);
-})();
+  startApp(guardada);
+}
+
+/* Si el servidor deja caer la sesión mientras se trabaja (token caducado que no
+   se pudo renovar), se vuelve al login. No se toca ni un dato local. */
+if (window.Auth) {
+  Auth.alCambiar((evento) => {
+    if (evento !== "SIGNED_OUT") return;
+    const g = readSession();
+    if (g && g.origen === "supabase" && document.getElementById("shell")?.classList.contains("active")) {
+      localStorage.removeItem("enti_session");
+      toast("Tu sesión ha caducado. Vuelve a entrar.", "off");
+      setTimeout(() => location.reload(), 2500);
+    }
+  });
+}
