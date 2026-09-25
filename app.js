@@ -446,39 +446,174 @@ function tx(store, mode = "readonly") { return db.transaction(store, mode).objec
    no cambia ni una línea.
    Las transacciones atómicas de varias tablas a la vez (venta rápida, cierre
    de caja) siguen usando db.transaction([...]) directo donde ya estaban:
-   pasarlas por aquí una fila a la vez les haría perder la atomicidad. */
+   pasarlas por aquí una fila a la vez les haría perder la atomicidad.
+
+   SYNC-5 sumó 5 entidades (clientes, motos, citas, categorias_inv,
+   cotizaciones); SYNC-6 sumó "ordenes" (mapper distinto por producto — ver la
+   cabecera de sync-mappers.js); SYNC-7A suma "inventario" (SOLO el maestro:
+   `cantidad` nunca viaja por get/save, ver sync-mappers.js y
+   guardarSincronizado() más abajo). Con el motor de sincronización activo (ver
+   prepararModoNube más abajo), get/getAll/save/delete de esas 7 se desvían a
+   `syncBd`/`syncMotor` (entimotors_sync); el resto (ventas_rapidas, dinero,
+   movimientos de caja) sigue exactamente igual, byte por byte, contra
+   entimotors_os_demo — eso es SYNC-7B. */
+const ENTIDADES_SYNC = ["clientes", "motos", "citas", "categorias_inv", "inventario", "cotizaciones", "ordenes",
+  "ventas_rapidas", "creditos", "caja_movimientos"];
+/* SYNC-7B: dinero en modo nube = SOLO LECTURA por DB.*. Se escribe únicamente por las RPC transaccionales
+   (sync-finanzas.js). Nunca hard-delete ni edición directa: se corrige con reversos. */
+const ENTIDADES_FINANCIERAS = ["ventas_rapidas", "creditos", "caja_movimientos"];
+let syncFin = null;
+let syncRest = null;   // SYNC-10: el mismo cliente REST del motor (token, refresco, clasificación) para el importador 3.13
+let syncBd = null;
+let syncMotor = null;
+function modoNubeActivo(store) {
+  return !!(syncMotor && syncBd) && ENTIDADES_SYNC.includes(store);
+}
+/* D-4 (SYNC-7A): "inventario" y "categorias_inv" son solo del administrador en modo nube (mapper.puedeEscribir,
+   ver sync-mappers.js) — un único lugar de donde leer la regla, para no repetir el rol en cada botón. Sin
+   sesión de nube (modoNubeActivo === false) no aplica: el Taller local sigue exactamente igual que antes. */
+function puedeEscribirEntidadNube(store) {
+  const m = window.ENTIMOTORS_SYNC_MAPPERS && window.ENTIMOTORS_SYNC_MAPPERS[store];
+  if (!m || typeof m.puedeEscribir !== "function") return true;
+  return m.puedeEscribir(currentUser && currentUser.rol);
+}
+
+function idbGetAll(store) {
+  return new Promise((resolve, reject) => {
+    const out = [];
+    const req = tx(store).openCursor();
+    req.onsuccess = (e) => {
+      const cur = e.target.result;
+      if (cur) { out.push(cur.value); cur.continue(); } else resolve(out);
+    };
+    req.onerror = () => reject(req.error);
+  });
+}
+function idbGet(store, id) {
+  return new Promise((resolve, reject) => {
+    const req = tx(store).get(id);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+function idbSave(store, value) {
+  return new Promise((resolve, reject) => {
+    const req = tx(store, "readwrite").put(value);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+function idbDelete(store, id) {
+  return new Promise((resolve, reject) => {
+    const req = tx(store, "readwrite").delete(id);
+    req.onsuccess = () => resolve();
+    req.onerror = () => reject(req.error);
+  });
+}
+
+/* Regla de motos.km (SYNC-5, sección 5): no retroceder el kilometraje por
+   accidente. Se resuelve ANTES de escribir, no en el motor (que no conoce
+   reglas de negocio por campo): si el valor nuevo es menor al que ya se
+   conocía para ese id local, se conserva el mayor. */
+async function aplicarNoRetrocederKm(valor) {
+  if (valor.id === undefined || valor.id === null || typeof valor.km !== "number") return valor;
+  const previo = await syncBd.datos.get("motos", valor.id);
+  if (previo && typeof previo.km === "number" && valor.km < previo.km) return { ...valor, km: previo.km };
+  return valor;
+}
+
+/* cotizacion_items no es una entidad del motor (sin rev/updated_at propios:
+   ver sync-mappers.js). Sus renglones se reemplazan enteros con la RPC
+   idempotente sync_guardar_items_cotizacion, encolada en el MISMO outbox
+   (offline-safe, con reintento) justo después de la cabecera: por orden de
+   `seq` el outbox siempre manda la cabecera antes que sus renglones. */
+async function guardarSincronizado(store, value) {
+  // SYNC-7A: "esNuevo" se decide ANTES de escribir (igual que adentro de escribir()): un producto sin id local
+  // todavía es un alta. Se captura aquí porque syncMotor.escribir() muta/asigna id sobre el objeto que devuelve,
+  // no sobre `value` — y una EDICIÓN posterior del mismo repuesto ya trae `value.id` puesto, así que nunca
+  // vuelve a disparar el stock de apertura (ver la cabecera de sync-mappers.js, sección INVENTARIO).
+  const esAltaInventario = store === "inventario" && (value.id === undefined || value.id === null);
+  const cantidadInicial = esAltaInventario ? (Number(value.cantidad) || 0) : null;
+  const v = store === "motos" ? await aplicarNoRetrocederKm(value) : value;
+  const r = await syncMotor.escribir(store, v);
+  if (store === "cotizaciones" && r && r.uid) {
+    const items = (v.items || []).map((it) => ({ nombre: it.nombre, cantidad: it.cantidad, precio: it.precio, inventario_id: null }));
+    await syncMotor.encolarRpc("sync_guardar_items_cotizacion", { p_cotizacion_id: r.uid, p_items: items }, { entidad: "cotizaciones", uid: r.uid });
+  }
+  /* SYNC-6: el mapper "ordenes" del mecánico manda columnas=[]/aCloud()={} a propósito (ver sync-mappers.js),
+     así que syncMotor.escribir() de arriba ya escribió la copia LOCAL pero no empujó nada a la nube. El único
+     camino de escritura del mecánico es avanzar_orden_tecnico (sync-6-mecanicos-ordenes.sql): misma RPC por
+     outbox que sync_guardar_items_cotizacion arriba, offline-safe y con reintento. */
+  if (store === "ordenes" && esMecanicoCuenta() && r && r.uid) {
+    await encolarAvanceTecnico(r.uid, v);
+  }
+  /* SYNC-7A sección 6: el stock CON el que nace un repuesto entra como UN movimiento de ledger "apertura"
+     (sync-7a-inventario.sql, registrar_stock_inicial) — nunca escribiendo `cantidad` por el CRUD del maestro
+     (esa columna es derivada, ver sync-mappers.js). Se encola UNA sola vez (guarda esAltaInventario arriba),
+     por el MISMO outbox que todo lo demás: offline-safe, y si la app se reinicia antes de que confirme, el
+     reintento reutiliza el op_id que quedó guardado en la cola (idempotente por diseño, no por esta función). */
+  if (esAltaInventario && r && r.uid) {
+    await syncMotor.encolarRpc("registrar_stock_inicial", { p_inventario_id: r.uid, p_cantidad: cantidadInicial }, { entidad: "inventario", uid: r.uid });
+  }
+  return r.id;
+}
+
+// Solo estos 7 campos: exactamente los que permite el trigger ordenes_mecanico_avance (fase4d) y que
+// avanzar_orden_tecnico reutiliza — ver la cabecera de sync-6-mecanicos-ordenes.sql.
+function esRutaFoto(v) { return typeof v === "string" && v.length > 0 && !/^data:/i.test(v); }
+async function encolarAvanceTecnico(ordenUid, v) {
+  /* SYNC-9: `fotos` YA NO viaja aquí. Mandar el arreglo completo de la copia local pisaba las fotos que otro
+     dispositivo del mismo mecánico ya había ligado (pérdida demostrada contra la pila real). Cada foto se liga sola,
+     solo-agregar, con agregar_foto_orden (flushFotosPendientes); avanzar_orden_tecnico conserva `fotos` si no viene. */
+  const campos = {
+    estado: v.estado,
+    diagnostico: v.diagnostico ?? null,
+    reparacion_notas: v.reparacionNotas ?? "",
+    calidad_checklist: v.calidadChecklist ?? null,
+    km_salida: v.kmSalida ?? null,
+    falla: v.falla ?? "",
+  };
+  await syncMotor.encolarRpc("avanzar_orden_tecnico", { p_orden_id: ordenUid, p_campos: campos }, { entidad: "ordenes", uid: ordenUid });
+}
+
 const DB = {
-  getAll(store) {
-    return new Promise((resolve, reject) => {
-      const out = [];
-      const req = tx(store).openCursor();
-      req.onsuccess = (e) => {
-        const cur = e.target.result;
-        if (cur) { out.push(cur.value); cur.continue(); } else resolve(out);
-      };
-      req.onerror = () => reject(req.error);
-    });
+  async getAll(store) {
+    if (modoNubeActivo(store)) return syncBd.datos.todos(store);
+    return idbGetAll(store);
   },
-  get(store, id) {
-    return new Promise((resolve, reject) => {
-      const req = tx(store).get(id);
-      req.onsuccess = () => resolve(req.result);
-      req.onerror = () => reject(req.error);
-    });
+  async get(store, id) {
+    if (modoNubeActivo(store)) return syncBd.datos.get(store, id);
+    return idbGet(store, id);
   },
-  save(store, value) {
-    return new Promise((resolve, reject) => {
-      const req = tx(store, "readwrite").put(value);
-      req.onsuccess = () => resolve(req.result);
-      req.onerror = () => reject(req.error);
-    });
+  async save(store, value) {
+    if (modoNubeActivo(store) && ENTIDADES_FINANCIERAS.includes(store)) throw new Error("FINANCIERO_SOLO_RPC: " + store + " solo se registra por su operación");
+    if (modoNubeActivo(store)) {
+      // D-4 (SYNC-7A): solo el administrador edita el maestro de inventario/categorías en modo nube.
+      if (!puedeEscribirEntidadNube(store)) {
+        bloquear(store === "inventario" ? "Solo el administrador edita el inventario" : "Solo el administrador edita las categorías");
+        throw new Error("SIN_PERMISO_" + store);
+      }
+      return guardarSincronizado(store, value);
+    }
+    return idbSave(store, value);
   },
-  delete(store, id) {
-    return new Promise((resolve, reject) => {
-      const req = tx(store, "readwrite").delete(id);
-      req.onsuccess = () => resolve();
-      req.onerror = () => reject(req.error);
-    });
+  async delete(store, id) {
+    if (modoNubeActivo(store) && ENTIDADES_FINANCIERAS.includes(store)) throw new Error("FINANCIERO_SOLO_RPC: el dinero no se borra, se revierte");
+    if (modoNubeActivo(store)) {
+      if (!puedeEscribirEntidadNube(store)) {
+        bloquear(store === "inventario" ? "Solo el administrador edita el inventario" : "Solo el administrador edita las categorías");
+        throw new Error("SIN_PERMISO_" + store);
+      }
+      /* SYNC-6 sección 15: borrar una orden con seguridad (revertir stock si algo salió, RPC transaccional
+         en vez de DB.delete directo) es de SYNC-7B. Mientras tanto se mantiene exactamente el mismo alcance
+         de ANTES de SYNC-6: un borrado local nada más — nunca toca la nube ni pasa por el outbox. Sin este
+         caso especial, el borrado genérico intentaría un soft-delete contra `ordenes` con una columna
+         (deleted_at) que authenticated no tiene concedida (SYNC-2) y sync-engine.js RESTAURARÍA el registro
+         local en cuanto la nube lo rechazara — el botón de "Eliminar" del Taller parecería no funcionar. */
+      if (store === "ordenes") { await syncBd.transaccion(["ordenes"], "readwrite", (t) => t.borrar("ordenes", id)); return; }
+      await syncMotor.escribir(store, { id }, { borrar: true }); return;
+    }
+    return idbDelete(store, id);
   },
   clear(store) {
     return new Promise((resolve, reject) => {
@@ -488,6 +623,287 @@ const DB = {
     });
   },
 };
+
+/* Arma (o desarma) el motor de sincronización para la sesión que acaba de
+   entrar. Se llama DESPUÉS de abrir la base local de siempre y ANTES de la
+   primera lectura (DB.getAll("clientes")) para que el bootstrap de un
+   dispositivo nuevo (SYNC-5 sección 10) ya tenga los datos de la nube
+   cuando la app decide si mostrar el selector demo/blanco.
+   Nunca lanza: sin Supabase configurado, sin ENTIMOTORS_SYNC.enabled o sin
+   red, la app sigue funcionando 100% local como siempre (mismo espíritu que
+   supabase-client.js). */
+async function prepararModoNube(session) {
+  syncMotor = null; syncBd = null; syncFin = null; syncRest = null;
+  if (!session || session.origen !== "supabase" || session.activo === false) return;
+  if (!window.SyncDB || !window.SyncEngine || !window.SyncRest || !window.ENTIMOTORS_SYNC_MAPPERS) return;
+  if (!window.SupabaseCliente || !SupabaseCliente.estado().activo) return;
+
+  window.ENTIMOTORS_SYNC = { enabled: true };
+  try {
+    syncBd = await SyncDB.abrir({ nombre: SyncDB.nombreParaSesion(session) });
+  } catch (e) { syncBd = null; window.ENTIMOTORS_SYNC = { enabled: false }; return; }
+
+  const rest = SyncRest.crear({
+    baseUrl: window.ENTIMOTORS_SUPABASE.url, anonKey: window.ENTIMOTORS_SUPABASE.anonKey,
+    getToken: () => { const s = SupabaseCliente.sesion(); return s ? s.access_token : null; },
+    refrescar: () => SupabaseCliente.refrescarSesion().then((r) => r.ok),
+  });
+  syncRest = rest;
+  syncMotor = SyncEngine.crearMotor({
+    bd: syncBd, rest, mappers: window.ENTIMOTORS_SYNC_MAPPERS, orden: window.ENTIMOTORS_SYNC_ORDEN,
+    sesion: () => (currentUser && currentUser.uid ? { uid: currentUser.uid } : null),
+    autoenvio: true,
+    // SYNC-8: antes de enviar nada con esta sesión se revalida el perfil (rol/activo); inactivo → fail closed
+    validarPerfil: true,
+  });
+  /* SYNC-8: sesión caducada → la cola se PAUSA (nada sale como anónimo; lo pendiente se conserva) hasta un nuevo inicio
+     de sesión. Cuenta desactivada → fail closed: se detiene la sincronización y se cierra la sesión (la cola queda en
+     este dispositivo, sin enviarse). Cualquier cambio de la cola refresca el indicador. */
+  let avisoSesion = false;
+  syncMotor.onCambio((ev) => {
+    if (ev.tipo === "auth-requerida" && !avisoSesion) { avisoSesion = true; toast("Tu sesión caducó: vuelve a iniciar sesión para sincronizar. Lo pendiente se conserva en este dispositivo.", "off"); }
+    if (ev.tipo === "cuenta-inactiva") { syncMotor?.detener(); denegarSesion("Tu cuenta está desactivada. Habla con el administrador."); return; }
+    if (ev.tipo === "rechazada" && ev.datos && !["ventas_rapidas", "creditos", "caja_movimientos", "inventario", "ordenes"].includes(ev.datos.entidad)) {
+      toast(`Un cambio de «${ENTIDAD_LEGIBLE[ev.datos.entidad] || ev.datos.entidad}» no se pudo sincronizar: revísalo en ⚠ Por revisar`, "off");
+    }
+    if (ev.tipo === "rechazada" && ev.datos?.entidad === "ordenes" && !esMecanicoCuenta()) toast("Un cambio de una orden no se pudo sincronizar: revísalo en ⚠ Por revisar", "off");
+    programarChipNube();
+  });
+  // SYNC-7: autorización con PIN (D-7) — solo se arma con sesión de nube activa; las acciones que
+  // la necesitan (ver PinUI.ACCIONES_CON_PIN) están apagadas fuera de modo nube (mismo criterio que
+  // el resto de esta función).
+  if (window.PinUI) window.PinUI.prepararInstancia({ sesion: () => SupabaseCliente.sesion() });
+  // SYNC-7B: dinero y stock por RPC (ver sync-finanzas.js). Se arma para TODA sesión de nube a propósito: si un
+  // mecánico llegara a invocar una operación de dinero, va al servidor (que la niega con 42501) y nunca cae al camino
+  // local histórico de entimotors_os_demo. Las acciones con PIN además se bloquean localmente (accionAutorizada).
+  if (window.SyncFinanzas) {
+    syncFin = SyncFinanzas.crear({ motor: syncMotor, bd: syncBd, enLinea: () => isOnline(), autorizar: (o) => PinUI.autorizarAccion(o) });
+    syncMotor.onCambio((ev) => {
+      if (ev.tipo !== "rechazada" || !["ventas_rapidas", "creditos", "caja_movimientos", "inventario"].includes(ev.datos?.entidad)) return;
+      // una operación que quedó en la cola (sin red) y el servidor rechazó al volver: nunca en silencio
+      toast("Una operación guardada sin conexión fue rechazada: " + (ev.datos.error?.mensaje || "revisa la cola de sincronización"), "off");
+    });
+  }
+  // Bootstrap (SYNC-5 sección 10): con cursor vacío, pull() pagina desde el
+  // principio. Si no hay red, sigue igual — arrancar() reintentará al volver.
+  try { await syncMotor.pullTodo(); } catch (e) { /* sin red: se reintenta al volver a estar online */ }
+  syncMotor.arrancar();
+
+  if (session.rol === "mecanico" && session.perfilId) {
+    /* SYNC-6 sección 9: cuando el servidor rechaza un avance técnico (orden reasignada o cerrada mientras
+       el mecánico estaba desconectado), se avisa con el mensaje exacto de avanzar_orden_tecnico y se refresca
+       la vista con lo último que hay en caché local — no se reabre nada por su cuenta. */
+    syncMotor.onCambio((ev) => {
+      if (ev.tipo !== "rechazada" || ev.datos?.entidad !== "ordenes") return;
+      toast(ev.datos.error?.mensaje || "Ese cambio ya no se pudo aplicar.", "off");
+      if (currentOrderId != null) openOrder(currentOrderId);
+      if (document.getElementById("view-mi-trabajo")?.classList.contains("active")) renderMiTrabajo();
+    });
+    // SYNC-6 sección 11: fotos tomadas sin conexión, encoladas en bd.blobs — se reintentan al volver la red.
+    window.addEventListener("online", () => { flushFotosPendientes(); });
+    flushFotosPendientes();
+  }
+}
+
+/** Sube las fotos de órdenes que quedaron pendientes en bd.blobs (offline). Nunca lanza: mejor esfuerzo. */
+async function flushFotosPendientes() {
+  if (!syncBd || !esMecanicoCuenta() || !window.SyncFotos || !window.ENTIMOTORS_SUPABASE) return;
+  try {
+    /* SYNC-9: mismas garantías de sesión que la cola (SYNC-8): antes de subir, el motor revalida el perfil (cuenta
+       inactiva → se cierra la sesión, cero subidas) y con la sesión caducada no se sube nada. */
+    const f = syncMotor ? await syncMotor.flush() : null;
+    if (f && (["auth", "cuenta-inactiva"].includes(f.omitido) || ["auth", "cuenta-inactiva", "perfil"].includes(f.detenido))) return;
+    const bdFotos = syncBd;
+    const r = await SyncFotos.procesarCola({
+      bd: bdFotos, baseUrl: window.ENTIMOTORS_SUPABASE.url, anonKey: window.ENTIMOTORS_SUPABASE.anonKey,
+      bucket: "entimotors-taller",
+      obtenerToken: () => { const s = SupabaseCliente.sesion(); return s ? s.access_token : null; },
+      refrescar: () => SupabaseCliente.refrescarSesion().then((r) => r.ok),
+      /* Ligar la foto a su orden: UNA operación solo-agregar por el outbox (dependencias, reintentos, pausa por sesión y
+         «⚠ Por revisar» de SYNC-8), con op_id = operation_id de la foto → un reintento o un cierre a mitad nunca la
+         duplica. Se llama ANTES de borrar el blob (sync-fotos.js) y la caché local la muestra ya; la nube confirma. */
+      alSubirUna: async (path, registro) => {
+        const yaEnCola = (await bdFotos.outbox.todos()).some((o) => o.op_id === registro.operation_id);
+        if (!yaEnCola) {
+          await syncMotor.encolarRpc("agregar_foto_orden", { p_orden_id: registro.uid, p_path: path, p_device: await bdFotos.deviceId() },
+            { entidad: "ordenes", uid: registro.uid, op_id: registro.operation_id });
+        }
+        const localId = await bdFotos.mapa.localDe(registro.uid);
+        if (localId == null) return;
+        await bdFotos.transaccion(["ordenes"], "readwrite", async (t) => {
+          const o = await t.get("ordenes", localId);
+          if (o && !(o.fotos || []).includes(path)) { o.fotos = (o.fotos || []).concat([path]); await t.put("ordenes", o); }
+        });
+        if (currentOrderId === localId) openOrder(localId);
+      },
+    });
+    // sin sesión válida la foto espera (no se pierde ni se rechaza): mismo aviso que la cola de SYNC-8
+    if (r && r.detenido === "auth") toast("Tu sesión caducó: vuelve a iniciar sesión para sincronizar. Lo pendiente se conserva en este dispositivo.", "off");
+    if (r && (r.subidas || r.rechazadas)) programarChipNube();
+  } catch (e) { /* mejor esfuerzo: se reintenta en el próximo "online" o la próxima foto */ }
+}
+/* ================= SYNC-7B · DINERO Y STOCK EN MODO NUBE =================
+   Toda afectación de dinero o stock va por una RPC transaccional e idempotente (sync-3-rpc.sql) armada por
+   sync-finanzas.js. Aquí solo se traduce la UI de siempre (ids locales) a identidades de nube (uid) y se
+   refleja el resultado. El modo local (3.13 / rollback) no pasa por aquí: finanzasNube() es false. */
+function finanzasNube() { return !!syncFin && modoNubeActivo("ventas_rapidas"); }
+async function uidDe(entidad, idLocal) { return idLocal == null ? null : syncBd.mapa.uidDe(entidad, idLocal); }
+async function bajarNube(entidades) {
+  for (const e of entidades) { try { await syncMotor.pull(e); } catch (err) { /* sin red: el próximo ciclo lo baja */ } }
+}
+/* Copia local provisional de un registro creado por RPC (venta/crédito) mientras la nube no responde: mismo uid
+   que la operación, así el pull lo reemplaza por la versión del servidor en vez de duplicarlo. No-op si ya existe. */
+async function guardarProvisional(store, uid, registro) {
+  await syncBd.transaccion([store, "mapa"], "readwrite", async (t) => {
+    if (await t.get("mapa", uid)) return;
+    const id = await t.put(store, { ...registro, uid, _rev: 0, _base: null, _pend: true });
+    await t.put("mapa", { uid, entidad: store, local_id: id });
+  });
+  return syncBd.mapa.localDe(uid);
+}
+async function itemsConUid(items) {
+  const out = [];
+  for (const it of items) out.push({ ...it, inventarioUid: it.inventarioId ? await uidDe("inventario", it.inventarioId) : null });
+  return out;
+}
+function errorDeOperacion(r, accion) {
+  const e = new Error(r.error?.mensaje || `No se pudo ${accion}`);
+  e.rechazo = true;
+  return e;
+}
+/* Ejecuta por el outbox. ok/pendiente → sigue; rechazada → la persona ya ve el error: se retira de la cola y lanza. */
+async function ejecutarFinanciera(op, accion) {
+  const r = await syncFin.ejecutar(op);
+  if (r.estado === "rechazada") { await syncFin.descartarRechazo(r.seq); throw errorDeOperacion(r, accion); }
+  return r;
+}
+
+async function registrarVentaNube({ items, clienteId, clienteNombre, metodoPago, efectivoRecibido }) {
+  const total = items.reduce((s, it) => s + it.cantidad * it.precio, 0);
+  const op = syncFin.construir.venta({
+    items: await itemsConUid(items), clienteUid: await uidDe("clientes", clienteId), clienteNombre, metodoPago, efectivoRecibido,
+    ocurrioEn: new Date().toISOString(), offline: !isOnline(), deviceId: await syncBd.deviceId(),
+  });
+  const r = await ejecutarFinanciera(op, "registrar la venta");
+  if (r.estado === "ok") await bajarNube(["inventario", "ventas_rapidas", "caja_movimientos"]);
+  const venta = {
+    items: op.params.p_items.map((x, i) => ({ nombre: x.nombre, cantidad: x.cantidad, precio: x.precio, inventarioId: items[i].inventarioId || null })),
+    clienteId: clienteId || null, clienteNombre: clienteNombre || null, metodoPago, total: SyncFinanzas.r2(r.resultado?.total ?? total),
+    efectivoRecibido: metodoPago === "efectivo" ? Number(efectivoRecibido) || 0 : null,
+    cambio: metodoPago === "efectivo" ? Math.max(0, (Number(efectivoRecibido) || 0) - total) : 0,
+    fechaISO: op.params.p_occurred_at, creadoEn: Date.now(), ...asignacionDelUsuarioActual(),
+  };
+  const id = await guardarProvisional("ventas_rapidas", op.meta.uid, venta);
+  const negativos = r.resultado?.stock_negativo || [];
+  return { id, total: venta.total, venta, faltantes: [], estado: r.estado, stockNegativo: negativos };
+}
+
+async function registrarCreditoNube({ clienteId, clienteNombre, clienteTelefono, items, vencimiento, nota, abono, abonoMetodo, origen, ordenId }) {
+  const op = syncFin.construir.credito({
+    items: await itemsConUid(items), clienteUid: await uidDe("clientes", clienteId), clienteNombre, clienteTelefono, vencimiento, nota,
+    abonoInicial: abono || 0, abonoMetodo, origen, ordenUid: await uidDe("ordenes", ordenId),
+    ocurrioEn: new Date().toISOString(), offline: !isOnline(), deviceId: await syncBd.deviceId(),
+  });
+  const r = await ejecutarFinanciera(op, "registrar el crédito");
+  if (r.estado === "ok") await bajarNube(["inventario", "creditos", "caja_movimientos"]);
+  const total = op.params.p_items.reduce((s, x) => s + x.cantidad * x.precio, 0);
+  const ab = op.params.p_abono_inicial;
+  const credito = {
+    clienteId: clienteId || null, clienteNombre, clienteTelefono: clienteTelefono || "",
+    items: op.params.p_items.map((x) => ({ nombre: x.nombre, cantidad: x.cantidad, precio: x.precio })),
+    total, abonado: ab, saldo: SyncFinanzas.r2(total - ab), estado: ab <= 0 ? "pendiente" : (total - ab <= 0.001 ? "pagado" : "parcial"),
+    vencimiento: vencimiento || null, nota: nota || "", origen: origen || null, ordenId: ordenId || null,
+    historialAbonos: ab > 0 ? [{ idAbono: op.meta.uid + ":ini", monto: ab, metodoPago: abonoMetodo || "efectivo", fechaISO: op.params.p_occurred_at }] : [],
+    fechaISO: op.params.p_occurred_at, creadoEn: Date.now(), ...asignacionDelUsuarioActual(),
+  };
+  const id = await guardarProvisional("creditos", op.meta.uid, credito);
+  return { id, credito: (await syncBd.datos.get("creditos", id)) || credito, faltantes: [], estado: r.estado };
+}
+
+async function registrarAbonoNube(creditoId, monto, metodoPago) {
+  const cred = await syncBd.datos.get("creditos", creditoId);
+  if (!cred) throw new Error("Crédito no encontrado");
+  const op = syncFin.construir.abono({ creditoUid: cred.uid, monto, metodo: metodoPago, ocurrioEn: new Date().toISOString(), deviceId: await syncBd.deviceId() });
+  const r = await ejecutarFinanciera(op, "registrar el abono");
+  if (r.estado === "ok") await bajarNube(["creditos", "caja_movimientos"]);
+  else toast("Sin conexión: el abono se enviará al volver la red (el servidor confirma el saldo)", "off");
+  return (await syncBd.datos.get("creditos", creditoId)) || cred;
+}
+
+async function registrarMovimientoCajaNube(mov) {
+  const op = syncFin.construir.movimientoCaja({ ...mov, metodo: mov.metodoPago, ocurrioEn: new Date().toISOString(), deviceId: await syncBd.deviceId() });
+  const r = await ejecutarFinanciera(op, "registrar el movimiento");
+  if (r.estado === "ok") await bajarNube(["caja_movimientos"]);
+  return r;
+}
+
+/* Ítem de orden: SIEMPRE por agregar_item_orden (la nube calcula el total de la orden con orden_items al
+   finalizar). Si trae repuesto, la RPC mueve el ledger; nunca DB.save de cantidad. */
+async function agregarItemOrdenNube(ord, { nombre, cantidad, precio, inventarioId, costoUnitario }) {
+  const op = syncFin.construir.itemOrden({
+    ordenUid: ord.uid, inventarioId: inventarioId || null, inventarioUid: await uidDe("inventario", inventarioId), nombre, cantidad, precio,
+    offline: !isOnline(), ocurrioEn: new Date().toISOString(), deviceId: await syncBd.deviceId(),
+  });
+  const r = await ejecutarFinanciera(op, "agregar el ítem");
+  return { estado: r.estado, item: { uid: op.params.p_item_id, nombre, cantidad, precio, origenInventarioId: inventarioId || null, costoUnitario: costoUnitario || 0, costoEstimado: false } };
+}
+async function quitarItemOrdenNube(ord, item) {
+  if (!item.uid) return { estado: "local" };   // renglón viejo que nunca llegó a la nube: no movió stock allá
+  const op = syncFin.construir.quitarItemOrden({ itemUid: item.uid, ordenUid: ord.uid, deviceId: await syncBd.deviceId() });
+  return ejecutarFinanciera(op, "quitar el ítem");
+}
+
+/* Finalizar/cobrar: UNA sola RPC (finalizar_orden) crea caja o crédito(+entrada) y cierra la orden, todo o nada.
+   Antes se suben los renglones viejos que nunca llegaron a la nube, para que el total del servidor sea el real. */
+async function finalizarOrdenNube(o, total) {
+  let ord = await DB.get("ordenes", o.id);
+  const items = [];
+  for (const it of (ord.items || [])) {
+    if (it.uid) { items.push(it); continue; }
+    const r = await agregarItemOrdenNube(ord, { nombre: it.nombre, cantidad: it.cantidad, precio: it.precio, inventarioId: it.origenInventarioId, costoUnitario: it.costoUnitario });
+    items.push({ ...it, uid: r.item.uid });
+  }
+  if (items.some((it, i) => it !== (ord.items || [])[i])) { ord.items = items; await DB.save("ordenes", ord); }
+  const op = syncFin.construir.finalizarOrden({
+    ordenUid: ord.uid, tipoCobro: o.tipoCobro === "credito" ? "credito" : "contado", metodoPago: o.metodoPago || "efectivo",
+    abono: Math.min(Number(o.abonoInicial) || 0, total), abonoMetodo: o.abonoMetodo || "efectivo",
+    ocurrioEn: new Date().toISOString(), deviceId: await syncBd.deviceId(),
+  });
+  const r = await ejecutarFinanciera(op, "finalizar la orden");
+  if (r.estado === "ok") await bajarNube(["ordenes", "creditos", "caja_movimientos"]);
+  const creditoUid = op.params.p_credito_id;
+  const creditoId = creditoUid ? await syncBd.mapa.localDe(creditoUid) : null;
+  return { estado: r.estado, total: r.resultado?.total ?? total, margen: r.resultado?.margen, creditoUid, creditoId };
+}
+
+/* Acciones con autorización (reversos, anular, ajuste de stock): SIEMPRE en línea, nunca en la cola.
+   Cajero → modal PIN (autorización de un solo uso ligada a esta acción/registro/dispositivo/monto); admin → directo;
+   mecánico → negado. Devuelve true si se aplicó. */
+async function accionAutorizada(construirFn, datos, entidadesABajar, textoOk) {
+  if (!finanzasNube()) return false;
+  if (esMecanicoCuenta()) { bloquear("Un mecánico no puede hacer esta operación"); return false; }
+  if (!isOnline()) { toast(SyncFinanzas.SIN_CONEXION_PIN, "off"); return false; }
+  let accion;
+  try { accion = construirFn({ ...datos, deviceId: await syncBd.deviceId() }); }
+  catch (e) { toast(e.message, "off"); return false; }
+  const r = await syncFin.conAutorizacion(accion, currentUser?.rol);
+  if (!r.ok) {
+    // PinUI ya avisó sus propios errores (PIN incorrecto, bloqueos…); aquí solo los de la operación en sí
+    if (r.op_id || r.motivo === "sin-conexion" || r.motivo === "sin-permiso") toast(r.mensaje, "off");
+    return false;
+  }
+  await bajarNube(entidadesABajar);
+  toast(textoOk);
+  markDirty();
+  return true;
+}
+async function pedirMotivo(titulo) {
+  const m = await showPrompt("Motivo (queda en la auditoría)", { titulo });
+  if (m === null || m === undefined) return null;
+  if (String(m).trim().length < 3) { toast("El motivo es obligatorio (mínimo 3 caracteres)", "off"); return null; }
+  return String(m).trim();
+}
+
 const ALL_STORES = ["clientes", "motos", "ordenes", "inventario", "citas", "cotizaciones", "ventas_rapidas", "caja_movimientos", "creditos", "web_cms", "categorias_inv", "auditoria"];
 // sync_cola queda FUERA del respaldo a propósito: es un registro de "qué falta
 // subir" que solo tiene sentido en el dispositivo donde se generó. Restaurarla
@@ -602,6 +1018,8 @@ function costoDelItem(it, inventario) {
    request falla, el navegador aborta TODA la transacción automáticamente (no hay
    que revertir nada a mano) y t.onerror/t.onabort se disparan en vez de t.oncomplete. */
 function registrarVentaRapida({ items, clienteId, clienteNombre, metodoPago, efectivoRecibido }) {
+  // SYNC-7B: en modo nube la venta es UNA RPC (venta+renglones+ledger+caja+auditoría, todo o nada)
+  if (finanzasNube()) return registrarVentaNube({ items, clienteId, clienteNombre, metodoPago, efectivoRecibido });
   return new Promise((resolve, reject) => {
     if (!items || !items.length) { reject(new Error("El carrito está vacío")); return; }
 
@@ -666,6 +1084,7 @@ function registrarVentaRapida({ items, clienteId, clienteNombre, metodoPago, efe
    (ver registrarAbonoCredito), y es lo que hace que los créditos se vean
    reflejados en Finanzas y caja. */
 function registrarCredito({ clienteId, clienteNombre, clienteTelefono, items, vencimiento, nota }) {
+  if (finanzasNube()) return registrarCreditoNube({ clienteId, clienteNombre, clienteTelefono, items, vencimiento, nota, abono: 0 });
   return new Promise((resolve, reject) => {
     if (!items || !items.length) { reject(new Error("Agrega al menos un repuesto o servicio")); return; }
 
@@ -717,6 +1136,8 @@ function registrarCredito({ clienteId, clienteNombre, clienteTelefono, items, ve
    idAbono además hace la operación idempotente: si el mismo abono se manda dos
    veces (doble toque, reintento), la segunda se ignora en vez de cobrar doble. */
 function registrarAbonoCredito(creditoId, monto, metodoPago, idAbono) {
+  // SYNC-7B: el saldo lo decide el servidor (registrar_abono_v2); el operation_id es la idempotencia
+  if (finanzasNube()) return registrarAbonoNube(creditoId, monto, metodoPago);
   return new Promise((resolve, reject) => {
     const t = db.transaction(["creditos", "caja_movimientos"], "readwrite");
     const credStore = t.objectStore("creditos");
@@ -773,6 +1194,13 @@ function registrarAbonoCredito(creditoId, monto, metodoPago, idAbono) {
 async function eliminarCredito(id) {
   const cred = await DB.get("creditos", id);
   if (!cred) return;
+  if (finanzasNube()) {
+    // SYNC-7B: un crédito nunca se borra: se revierte (abonos + caja compensatoria + stock), con autorización
+    const motivo = await pedirMotivo("Anular crédito #" + id);
+    if (!motivo) return false;
+    return accionAutorizada((d) => syncFin.construir.reversarCredito(d), { creditoUid: cred.uid, total: cred.total, motivo },
+      ["creditos", "caja_movimientos", "inventario"], "Crédito anulado (queda en el historial)");
+  }
   if (cred.abonado > 0) { toast("No se puede eliminar un crédito que ya tiene abonos registrados", "off"); return; }
 
   const t = db.transaction(["creditos", "inventario"], "readwrite");
@@ -819,6 +1247,8 @@ async function resolverClienteCredito(clienteId, nombreLibre) {
    algo de entrada, registra ese abono de una vez — que es lo que hace que el
    dinero recibido sí entre a caja y el saldo quede en lo que falta. */
 async function cobrarAlCredito({ clienteId, clienteNombre, clienteTelefono, items, abono, abonoMetodo, nota, origen, ordenId }) {
+  // SYNC-7B: crédito + entrada en UNA RPC (registrar_credito con p_abono_inicial): nunca un crédito sin su abono
+  if (finanzasNube()) return registrarCreditoNube({ clienteId, clienteNombre, clienteTelefono, items, vencimiento: null, nota, abono, abonoMetodo, origen, ordenId });
   const { id, credito } = await registrarCredito({ clienteId, clienteNombre, clienteTelefono, items, vencimiento: null, nota });
   if (origen || ordenId) {
     const cred = await DB.get("creditos", id);
@@ -834,6 +1264,8 @@ async function cobrarAlCredito({ clienteId, clienteNombre, clienteTelefono, item
 
 /* ---------------- caja chica: registrar un ingreso de una orden de taller entregada ---------------- */
 function registrarIngresoTaller(orden, total, metodoPago) {
+  // en modo nube el ingreso de una orden lo crea finalizar_orden (ver finalizarOrdenNube): nunca por separado
+  if (finanzasNube()) return Promise.reject(new Error("En modo nube el cobro de la orden va por finalizar_orden"));
   return new Promise((resolve, reject) => {
     const t = db.transaction(["caja_movimientos"], "readwrite");
     t.objectStore("caja_movimientos").add({
@@ -865,6 +1297,8 @@ function markDirty() {
 const HAY_SERVIDOR = false;
 
 function renderSyncChip() {
+  // SYNC-8: con sesión de nube el indicador dice lo que de verdad pasa con la cola (ver renderSyncChipNube)
+  if (syncMotor) { programarChipNube(); return; }
   const dot = document.getElementById("syncDot");
   const label = document.getElementById("syncLabel");
 
@@ -889,6 +1323,92 @@ function renderSyncChip() {
     label.textContent = "En línea · sincronizado";
   }
 }
+
+/* ---------------- SYNC-8 · estado real de la sincronización y lo que requiere revisión ----------------
+   Solo en modo nube (syncMotor armado). Lo que la nube no aceptó, los conflictos, las dependencias rechazadas y el
+   stock negativo por ventas sin conexión se juntan en UN lugar (⚠ Por revisar): nada se pierde en un log. */
+let chipNubeT = null;
+function programarChipNube() {
+  if (chipNubeT) return;
+  chipNubeT = setTimeout(() => { chipNubeT = null; renderSyncChipNube(); }, 150);
+}
+const ENTIDAD_LEGIBLE = { clientes: "Clientes", motos: "Motos", citas: "Citas", categorias_inv: "Categorías", inventario: "Inventario",
+  cotizaciones: "Cotizaciones", ordenes: "Órdenes", ventas_rapidas: "Ventas", creditos: "Créditos", caja_movimientos: "Caja", rpc: "Operación" };
+// SYNC-9: fotos que la nube rechazó de forma definitiva (orden reasignada/cerrada, sin permiso) — nunca en silencio
+async function fotosRechazadas() {
+  if (!syncBd || !window.SyncFotos) return [];
+  try { return await SyncFotos.rechazadas(syncBd); } catch { return []; }
+}
+async function stockEnRevision() {
+  if (!syncBd) return [];
+  try { return (await syncBd.datos.todos("inventario")).filter((r) => r.requiereRevision); } catch { return []; }
+}
+async function renderSyncChipNube() {
+  const dot = document.getElementById("syncDot"), label = document.getElementById("syncLabel"), btn = document.getElementById("btnRevisionSync");
+  if (!syncMotor || !dot || !label) return;
+  let e;
+  try { e = await syncMotor.estado(); } catch { return; }
+  const porRevisar = e.rechazadas + e.conflictos + (await stockEnRevision()).length + (await fotosRechazadas()).length;
+  const pendientes = (e.cola.pending || 0) + (e.cola.syncing || 0);
+  let texto, ok = false;
+  if (e.pausa === "cuenta-inactiva") texto = "Cuenta inactiva · no se sincroniza";
+  else if (e.pausa === "auth") texto = "Sesión caducada · inicia sesión para sincronizar";
+  else if (!isOnline()) texto = pendientes ? `Sin conexión · ${pendientes} cambio${pendientes === 1 ? "" : "s"} sin subir` : "Sin conexión · guardado en este dispositivo";
+  else if (!e.bootstrapCompleto) texto = "Descarga inicial incompleta · reintentando";
+  else if (pendientes) texto = `Subiendo ${pendientes}…`;
+  else { texto = "En línea · sincronizado"; ok = true; }
+  if (e.deOtraPersona) texto += ` · ${e.deOtraPersona} de otra cuenta en espera`;
+  dot.className = ok && !porRevisar ? "dot on" : "dot off";
+  label.textContent = texto;
+  if (btn) { btn.style.display = porRevisar ? "" : "none"; btn.textContent = `⚠ ${porRevisar} por revisar`; }
+}
+function fechaCorta(ms) { return ms ? new Date(ms).toLocaleString() : ""; }
+async function abrirRevisionSync() {
+  if (!syncMotor) return;
+  const r = await syncMotor.revision();
+  const stock = await stockEnRevision();
+  const lista = document.getElementById("revisionSyncLista");
+  const filas = [];
+  for (const x of r.rechazadas) {
+    const que = x.tipo === "dependencia" ? "No se envió: depende de un registro que la nube rechazó" : "La nube no lo aceptó";
+    filas.push(`<div class="card" style="margin:6px 0;padding:8px;"><strong>${esc(ENTIDAD_LEGIBLE[x.entidad] || x.entidad)}</strong> · ${esc(que)}<br>
+      <small>${esc(x.mensaje || x.codigo || "")}${x.creadoEn ? " · " + esc(fechaCorta(x.creadoEn)) : ""}</small><br>
+      <button type="button" class="btn small ghost" data-rev-descartar="${Number(x.seq)}">Entendido, quitar de la lista</button></div>`);
+  }
+  for (const c of r.conflictos) {
+    const que = c.motivo === "borrado_remoto" ? "Se borró en otro dispositivo mientras lo editabas" : "Otro dispositivo cambió el mismo dato";
+    filas.push(`<div class="card" style="margin:6px 0;padding:8px;"><strong>${esc(ENTIDAD_LEGIBLE[c.entidad] || c.entidad)}</strong> · ${esc(que)}<br>
+      <small>${c.campos.length ? "Campos: " + esc(c.campos.join(", ")) + " · " : ""}${esc(fechaCorta(c.creadoEn))}</small><br>
+      <button type="button" class="btn small ghost" data-rev-conflicto="${Number(c.id)}" data-decision="servidor">Usar la versión de la nube</button>
+      ${c.motivo === "borrado_remoto" ? "" : `<button type="button" class="btn small ghost" data-rev-conflicto="${Number(c.id)}" data-decision="mio">Conservar la mía</button>`}</div>`);
+  }
+  for (const b of await fotosRechazadas()) {
+    filas.push(`<div class="card" style="margin:6px 0;padding:8px;"><strong>Fotos</strong> · La nube no aceptó una foto de una orden<br>
+      <small>${esc(b.error || "")}${b.creado_en ? " · " + esc(fechaCorta(b.creado_en)) : ""}</small><br>
+      <button type="button" class="btn small ghost" data-rev-foto="${Number(b.id)}">Entendido, quitar de la lista</button></div>`);
+  }
+  for (const it of stock) {
+    filas.push(`<div class="card" style="margin:6px 0;padding:8px;"><strong>Inventario</strong> · ${esc(it.nombre)}: existencia ${esc(String(it.cantidad))}<br>
+      <small>Una venta hecha sin conexión dejó el stock por debajo de cero. Revisa el conteo con «Ajustar stock».</small></div>`);
+  }
+  if (r.esperandoOtraPersona) filas.push(`<p class="hint">${r.esperandoOtraPersona} cambio(s) de otra cuenta esperan a que esa persona inicie sesión en este dispositivo.</p>`);
+  document.getElementById("revisionSyncResumen").textContent = filas.length ? "Nada de esto se resolvió solo: decide qué hacer con cada uno." : "No hay nada pendiente de revisión.";
+  lista.innerHTML = filas.join("");
+  lista.querySelectorAll("[data-rev-descartar]").forEach((b) => b.addEventListener("click", async () => {
+    await syncMotor.descartarRechazada(Number(b.dataset.revDescartar)); abrirRevisionSync(); renderSyncChip();
+  }));
+  lista.querySelectorAll("[data-rev-foto]").forEach((b) => b.addEventListener("click", async () => {
+    await syncBd.blobs.borrar(Number(b.dataset.revFoto)); abrirRevisionSync(); renderSyncChip();
+  }));
+  lista.querySelectorAll("[data-rev-conflicto]").forEach((b) => b.addEventListener("click", async () => {
+    const res = await syncMotor.resolverConflicto(Number(b.dataset.revConflicto), b.dataset.decision);
+    if (!res.ok) toast("No se pudo resolver: " + res.motivo, "off");
+    abrirRevisionSync(); renderSyncChip();
+  }));
+  document.getElementById("modalRevisionSync").classList.add("active");
+}
+document.getElementById("btnRevisionSync")?.addEventListener("click", () => abrirRevisionSync());
+document.getElementById("btnRevisionSyncCerrar")?.addEventListener("click", () => document.getElementById("modalRevisionSync").classList.remove("active"));
 
 /* ---------------- botones que cobran/registran: bloquea doble-tap ----------------
    en un taller usando esto en pantalla táctil, un toque doble accidental en
@@ -1864,14 +2384,21 @@ async function renderMiTrabajo() {
 
   const abiertas = ordenes.filter(esTrabajoPropio).filter(o => o.estado !== "entregado");
   const entregadas = ordenes.filter(esTrabajoPropio).filter(o => o.estado === "entregado");
+  // SYNC-6: con cuenta real de nube, la orden ya trae cliente/moto aplanados (ver openOrder); las cuentas
+  // locales de TEAM (sin perfilId de verdad) siguen resolviendo por id contra la base del dispositivo, igual
+  // que siempre — esRealDeNube distingue exactamente ese caso.
+  const esRealDeNube = esMecanicoCuenta();
   const tarjeta = (o, historial) => {
-    const m = motoDe(o.motoId);
+    const motoTxt = esRealDeNube ? (o.motoMarca ? `${o.motoMarca} ${o.motoModelo || ""}`.trim() : "Moto")
+      : (() => { const m = motoDe(o.motoId); return m ? `${m.marca} ${m.modelo}` : "Moto"; })();
+    const placa = esRealDeNube ? o.motoPlaca : motoDe(o.motoId)?.placa;
+    const clienteTxt = esRealDeNube ? (o.clienteNombre || "Cliente") : nombreCliente(o.clienteId);
     return `<div class="card orden-mia" data-id="${o.id}" style="margin-bottom:0.6rem; cursor:pointer;">
       <div style="display:flex; justify-content:space-between; gap:0.6rem; align-items:baseline;">
-        <b>#${o.id} — ${esc(m ? `${m.marca} ${m.modelo}` : "Moto")}</b>
+        <b>#${o.id} — ${esc(motoTxt)}</b>
         <span class="pill ${esc(o.estado)}">${esc(etiquetaEtapa(o.estado))}</span>
       </div>
-      <div class="meta">${esc(nombreCliente(o.clienteId))}${m?.placa ? " · placa " + esc(m.placa) : ""}</div>
+      <div class="meta">${esc(clienteTxt)}${placa ? " · placa " + esc(placa) : ""}</div>
       <div class="meta">${esc(o.falla || "Sin descripción de la falla")}</div>
       ${historial ? `<div class="meta">Solo lectura — trabajo entregado.</div>` : ""}
     </div>`;
@@ -2003,7 +2530,9 @@ function chartColors() {
 async function renderFinanzasCharts() {
   if (typeof Chart === "undefined") return; // sin internet la primera vez, la librería no llegó a cargar
 
-  const [movs, ventas, ordenes, inv, creditos] = await Promise.all([DB.getAll("caja_movimientos"), DB.getAll("ventas_rapidas"), DB.getAll("ordenes"), DB.getAll("inventario"), DB.getAll("creditos")]);
+  const [movs, ventasTodas, ordenes, inv, creditosTodos] = await Promise.all([DB.getAll("caja_movimientos"), DB.getAll("ventas_rapidas"), DB.getAll("ordenes"), DB.getAll("inventario"), DB.getAll("creditos")]);
+  // SYNC-7B: lo anulado se conserva (reverso) pero no cuenta como venta ni como deuda
+  const ventas = ventasTodas.filter(v => !v.anulada), creditos = creditosTodos.filter(c => !c.anulado);
   const { grid, text } = chartColors();
   Chart.defaults.color = text;
   Chart.defaults.borderColor = grid;
@@ -2076,8 +2605,29 @@ async function renderFinanzasCharts() {
 /* ================= ÓRDENES ================= */
 let ordenesFiltro = null; // null (todas) | "activas" | "entregadas"
 
+/* SYNC-7B · borrar una orden en modo nube: sin dinero → borrado suave SOLO admin, y la RPC devuelve al inventario
+   los repuestos que salieron (anular_orden); cobrada → NO se borra, se anula (caja/crédito compensados), con PIN
+   para el cajero. Nunca DB.delete de una orden con dinero. */
+async function anularOrdenNube(id) {
+  const o = await DB.get("ordenes", id);
+  if (!o) return;
+  const conDinero = !!o.finalizada;
+  if (!conDinero && currentUser?.rol !== "admin") { bloquear("Solo el administrador elimina órdenes"); return; }
+  const motivo = await pedirMotivo(conDinero ? "Anular orden cobrada #" + id : "Eliminar orden #" + id);
+  if (!motivo) return;
+  const devolverStock = conDinero
+    ? await showConfirm("¿Los repuestos de esta orden vuelven al inventario?", { titulo: "Anular orden", textoOk: "Sí, devolver al inventario" })
+    : true;
+  const ok = await accionAutorizada((d) => syncFin.construir.anularOrden(d), { ordenUid: o.uid, motivo, devolverStock },
+    ["ordenes", "inventario", "creditos", "caja_movimientos"], conDinero ? "Orden anulada (queda en el historial)" : "Orden eliminada");
+  if (!ok) return;
+  renderOrdersList();
+  renderDashboard();
+}
+
 async function renderOrdersList() {
-  const [ordenesAll, motos, clientes] = await Promise.all([DB.getAll("ordenes"), DB.getAll("motos"), DB.getAll("clientes")]);
+  const [ordenesTodas, motos, clientes] = await Promise.all([DB.getAll("ordenes"), DB.getAll("motos"), DB.getAll("clientes")]);
+  const ordenesAll = ordenesTodas.filter(o => !o.anulada);   // SYNC-7B: anulada = se conserva en la nube, no se lista
 
   const entregadasMes = ordenesAll.filter(o => o.estado === "entregado" && o.entregadoEn && sameMonth(new Date(o.entregadoEn), new Date()));
   const activas = ordenesAll.filter(o => o.estado !== "entregado");
@@ -2126,8 +2676,9 @@ async function renderOrdersList() {
     });
   });
   list.querySelectorAll("[data-del]").forEach(btn => {
-    btn.addEventListener("click", (e) => {
+    btn.addEventListener("click", async (e) => {
       e.stopPropagation();
+      if (finanzasNube()) { await anularOrdenNube(Number(btn.dataset.del)); return; }
       requestAdminCode(async () => {
         await DB.delete("ordenes", Number(btn.dataset.del));
         markDirty();
@@ -2150,8 +2701,15 @@ async function openOrder(id) {
     return;
   }
   currentOrderId = id;
-  const moto = await DB.get("motos", o.motoId);
-  const cliente = await DB.get("clientes", o.clienteId);
+  /* SYNC-6: el mecánico no tiene ni tendrá acceso directo a clientes/motos (SYNC-2), así que su copia de la
+     orden trae el cliente y la moto APLANADOS (clienteNombre, motoMarca…, ver ordenes_tecnico_mias() en
+     sync-6-mecanicos-ordenes.sql). El Taller sigue resolviendo por id, exactamente como siempre. */
+  const moto = esMecanicoCuenta()
+    ? { marca: o.motoMarca || "", modelo: o.motoModelo || "", placa: o.motoPlaca || "", km: null }
+    : await DB.get("motos", o.motoId);
+  const cliente = esMecanicoCuenta()
+    ? { nombre: o.clienteNombre || "Cliente", telefono: o.clienteTelefono || "" }
+    : await DB.get("clientes", o.clienteId);
   currentOrderCache = { o, moto, cliente };
 
   document.getElementById("detalleTitulo").textContent = `Orden #${o.id} — ${moto.marca} ${moto.modelo}`;
@@ -2160,14 +2718,15 @@ async function openOrder(id) {
     : "";
   document.getElementById("detalleSub").innerHTML =
     `${esc(cliente.nombre)} · ${esc(cliente.telefono || "sin teléfono")} · placa ${esc(moto.placa || "s/p")}${desdeCita}`;
-  renderDetalleMecanico(o);
+  await renderDetalleMecanico(o);
   document.getElementById("detalleFalla").textContent = o.falla || "(sin descripción)";
   // lo legacy se sigue viendo: si la orden no trae km propio, se muestra el de
   // la moto, igual que antes
   document.getElementById("inputKm").value = o.kmSalida ?? moto.km ?? "";
   document.getElementById("inputKm").previousElementSibling.textContent = o.estado === "entregado" ? "Kilometraje de salida" : "Kilometraje actual";
 
-  document.getElementById("detalleFotos").innerHTML = (o.fotos || []).map(src => `<img src="${src}">`).join("");
+  await renderDetalleFotos(o);
+  renderDetalleItemsTecnico(o);
 
   renderStageTracker(o.estado, o.finalizada);
   await renderStageContent(o);
@@ -2177,10 +2736,55 @@ async function openOrder(id) {
   showView("detalle");
 }
 
+/* Las fotos del Taller son locales (base64, sin cambios de SYNC-6 — ver la cabecera de sync-mappers.js: el
+   Taller no sincroniza fotos todavía). Las de Mi Trabajo viven en Storage y NUNCA con URL pública permanente
+   (SYNC-6 sección 10): se pide una firmada, de corta duración, cada vez que se abre la orden. */
+async function renderDetalleFotos(o) {
+  const cont = document.getElementById("detalleFotos");
+  if (!esMecanicoCuenta()) {
+    cont.innerHTML = (o.fotos || []).map(src => `<img src="${src}">`).join("");
+    return;
+  }
+  cont.innerHTML = `<p class="meta" style="margin:0;">Cargando fotos…</p>`;
+  const urls = await Promise.all((o.fotos || []).map(obtenerUrlFotoFirmada));
+  cont.innerHTML = urls.filter(Boolean).map(u => `<img src="${esc(u)}">`).join("")
+    || `<p class="meta" style="margin:0;">${(o.fotos || []).length ? "No se pudieron cargar las fotos." : "Sin fotos todavía."}</p>`;
+}
+async function obtenerUrlFotoFirmada(path) {
+  if (!esRutaFoto(path) || !window.SyncFotos || !window.ENTIMOTORS_SUPABASE) return null;
+  try {
+    const r = await SyncFotos.firmar({
+      baseUrl: window.ENTIMOTORS_SUPABASE.url, anonKey: window.ENTIMOTORS_SUPABASE.anonKey,
+      bucket: "entimotors-taller", path,
+      obtenerToken: () => { const s = SupabaseCliente.sesion(); return s ? s.access_token : null; },
+      refrescar: () => SupabaseCliente.refrescarSesion().then(r2 => r2.ok),
+    });
+    return r.ok ? r.url : null;
+  } catch (e) { return null; }
+}
+
+/* Ítems de la orden para el mecánico: solo nombre y cantidad, nunca precio ni costo (SYNC-6 sección 7). El
+   Taller ya ve sus ítems con precio en la sección de presupuesto/cobro (renderPresupuestoStage); esto es
+   SOLO para Mi Trabajo, que hoy no mostraba ningún ítem. */
+function renderDetalleItemsTecnico(o) {
+  const cont = document.getElementById("detalleItemsTecnico");
+  if (!cont) return;
+  if (!esMecanicoCuenta()) { cont.innerHTML = ""; cont.style.display = "none"; return; }
+  cont.style.display = "";
+  const items = Array.isArray(o.items) ? o.items : [];
+  cont.innerHTML = `
+    <div class="card" style="margin-bottom:0.6rem;">
+      <h4 class="font-display" style="font-size:0.95rem; margin-bottom:0.4rem;">Repuestos de esta orden</h4>
+      ${items.length
+        ? `<ul style="margin:0; padding-left:1.1rem;">${items.map(it => `<li>${esc(it.nombre)} × ${esc(it.cantidad)}</li>`).join("")}</ul>`
+        : `<p style="color:var(--text-muted); margin:0;">Sin repuestos registrados todavía.</p>`}
+    </div>`;
+}
+
 // Reasignar mecánico / cambiar origen del trabajo, editable mientras la orden
 // no esté finalizada — una vez cobrada, el trabajo queda fijo, igual que su
 // monto (misma razón: no se toca un registro que ya se usó para cobrar).
-function renderDetalleMecanico(o) {
+async function renderDetalleMecanico(o) {
   const wrap = document.getElementById("detalleMecanicoWrap");
   if (o.finalizada) {
     wrap.innerHTML = `Asignada a <b>${esc(o.mecanico || "Sin asignar")}</b> · <span class="pill ${origenTrabajoDe(o) === "negocio" ? "presupuesto" : "entregado"}">${origenTrabajoDe(o) === "negocio" ? "Negocio" : "Taller"}</span>`;
@@ -2197,7 +2801,7 @@ function renderDetalleMecanico(o) {
     · <select id="detalleOrigenSel" style="display:inline-block; width:auto; padding:0.1rem 0.4rem; margin:0;">
         <option value="taller">Taller</option><option value="negocio">Negocio</option>
       </select>`;
-  poblarSelectMecanico("detalleMecanicoSel", o.mecanico, o.mecanicoId);
+  await poblarSelectMecanico("detalleMecanicoSel", o.mecanico, o.mecanicoId);
   document.getElementById("detalleOrigenSel").value = origenTrabajoDe(o);
   document.getElementById("detalleMecanicoSel").addEventListener("change", async (e) => {
     if (!puedeAsignarMecanico()) { bloquear("Solo el administrador asigna trabajo"); return; }
@@ -2491,6 +3095,18 @@ async function renderPresupuestoStage(o) {
     btn.addEventListener("click", async () => {
       const idx = Number(btn.dataset.quitar);
       const ord = await DB.get("ordenes", o.id);
+      if (finanzasNube()) {
+        // SYNC-7B: quitar_item_orden devuelve el stock con un movimiento compensatorio (idempotente por op_id)
+        const it = (ord.items || [])[idx];
+        if (!it) return;
+        try { await quitarItemOrdenNube(ord, it); } catch (err) { toast("No se pudo quitar: " + err.message, "off"); return; }
+        ord.items.splice(idx, 1);
+        await DB.save("ordenes", ord);
+        await bajarNube(["inventario"]);
+        toast(it.origenInventarioId ? "Ítem quitado y stock devuelto al inventario" : "Ítem quitado");
+        renderPresupuestoStage(ord);
+        return;
+      }
       const [removido] = (ord.items || []).splice(idx, 1);
       if (removido?.origenInventarioId) {
         const rep = await DB.get("inventario", removido.origenInventarioId);
@@ -2656,11 +3272,24 @@ function asignacionDelUsuarioActual() {
   return { mecanico: currentUser?.nombre || "", mecanicoId: currentUser?.perfilId || null };
 }
 
+/* SYNC-6: mecánicos reales (perfiles.rol=mecanico), no la lista TEAM local, cuando hay sesión de nube.
+   null = sin nube (o no se pudo leer perfiles): se usa TEAM, exactamente como siempre — nunca se deja el
+   selector vacío por un error de red pasajero. Array (posiblemente vacío): perfiles de verdad. */
+async function mecanicosRealesDisponibles() {
+  if (!(currentUser?.origen === "supabase") || !window.SupabaseCliente?.estado().activo) return null;
+  try {
+    const r = await SupabaseCliente.tabla("perfiles").leer("rol=eq.mecanico&select=id,nombre,activo&order=nombre.asc");
+    return r.ok && Array.isArray(r.datos) ? r.datos : null;
+  } catch (e) { return null; }
+}
+
 /* El <option> sigue valiendo el NOMBRE: los huecos de horario, el aviso de
    choque y "Mover" comparan por nombre y seguirían funcionando igual. El uuid
-   viaja aparte en data-perfil-id, así que cuando la lista pase a venir de
-   `perfiles` (4C-2) solo cambia de dónde salen las opciones, no quién las lee. */
-function poblarSelectMecanico(selectId, seleccionado, seleccionadoId) {
+   viaja aparte en data-perfil-id.
+   SYNC-6: con sesión de nube, las opciones vienen de `perfiles` (rol=mecanico,
+   activo=true) — nunca por coincidencia de nombre, nunca un perfil inactivo
+   como opción nueva. Sin nube, sigue la lista TEAM local de siempre. */
+async function poblarSelectMecanico(selectId, seleccionado, seleccionadoId) {
   const sel = document.getElementById(selectId);
   if (sel && !puedeAsignarMecanico()) {
     // el <label> que lo acompaña se va con él; si no, queda un rótulo huérfano
@@ -2670,13 +3299,28 @@ function poblarSelectMecanico(selectId, seleccionado, seleccionadoId) {
     sel.value = "";
     return;
   }
-  sel.innerHTML = '<option value="">Sin asignar</option>' + TEAM.map(t =>
-    `<option value="${esc(t.nombre)}"${t.perfilId ? ` data-perfil-id="${esc(t.perfilId)}"` : ""}>${esc(t.nombre)}</option>`).join("");
+  const reales = await mecanicosRealesDisponibles();
+  if (!reales) {
+    sel.innerHTML = '<option value="">Sin asignar</option>' + TEAM.map(t =>
+      `<option value="${esc(t.nombre)}"${t.perfilId ? ` data-perfil-id="${esc(t.perfilId)}"` : ""}>${esc(t.nombre)}</option>`).join("");
+  } else {
+    const activos = reales.filter(p => p.activo);
+    let html = '<option value="">Sin asignar</option>' + activos.map(p =>
+      `<option value="${esc(p.nombre)}" data-perfil-id="${esc(p.id)}">${esc(p.nombre)}</option>`).join("");
+    // Ya estaba asignada a alguien que ahora es inactivo: se conserva a la vista (marcado), no se borra
+    // la asignación por sí sola — pero no aparece como opción nueva para nadie más que la busque.
+    if (seleccionadoId && !activos.some(p => p.id === seleccionadoId)) {
+      const inactivo = reales.find(p => p.id === seleccionadoId);
+      const nombreMostrado = inactivo ? inactivo.nombre : (seleccionado || "Mecánico");
+      html += `<option value="${esc(nombreMostrado)}" data-perfil-id="${esc(seleccionadoId)}">${esc(nombreMostrado)} (inactivo)</option>`;
+    }
+    sel.innerHTML = html;
+  }
   if (seleccionadoId) {
     const porId = [...sel.options].find(o => o.dataset.perfilId === seleccionadoId);
     if (porId) { sel.value = porId.value; return; }
   }
-  sel.value = seleccionado && TEAM.some(t => t.nombre === seleccionado) ? seleccionado : "";
+  sel.value = seleccionado && [...sel.options].some(o => o.value === seleccionado) ? seleccionado : "";
 }
 
 async function abrirOrdenDesdeCita(citaId) {
@@ -2710,7 +3354,7 @@ async function abrirOrdenDesdeCita(citaId) {
   }
   document.getElementById("ordenFalla").value = cita.motivo || "";
   renderOrdenClienteChip();
-  poblarSelectMecanico("ordenMecanico", cita.mecanico, cita.mecanicoId);
+  await poblarSelectMecanico("ordenMecanico", cita.mecanico, cita.mecanicoId);
   document.getElementById("ordenOrigenTrabajo").value = "taller";
 
   document.getElementById("ordenDesdeCitaAviso").style.display = "block";
@@ -2727,7 +3371,7 @@ document.getElementById("btnNuevaOrden").addEventListener("click", async () => {
   renderOrdenClienteChip();
   ["ordenNombre", "ordenTelefono", "ordenPlaca", "ordenMarca", "ordenModelo", "ordenKm", "ordenFalla"].forEach(id => document.getElementById(id).value = "");
   document.getElementById("ordenFoto").value = "";
-  poblarSelectMecanico("ordenMecanico", currentUser?.nombre, currentUser?.perfilId);
+  await poblarSelectMecanico("ordenMecanico", currentUser?.nombre, currentUser?.perfilId);
   document.getElementById("ordenOrigenTrabajo").value = "taller";
   document.getElementById("modalOrden").classList.add("active");
 });
@@ -2862,7 +3506,14 @@ alHacerClicUnaVez(document.getElementById("btnAvanzar"), async () => {
     let mensaje = "Trabajo finalizado y guardado como registro";
 
     try {
-      if (total > 0 && o.tipoCobro === "credito") {
+      if (finanzasNube()) {
+        // SYNC-7B: UNA operación transaccional — caja o crédito(+entrada) y cierre de la orden, todo o nada
+        const f = await finalizarOrdenNube(o, total);
+        creditoIdCreado = f.creditoId;
+        mensaje = f.estado === "pendiente"
+          ? "Cobro guardado sin conexión: la orden se cierra en la nube al volver la red"
+          : `Trabajo finalizado · total ${money(f.total)}${f.creditoUid ? " al crédito" : ""}`;
+      } else if (total > 0 && o.tipoCobro === "credito") {
         // al crédito NO entra dinero a caja todavía: se crea la factura pendiente
         // y, si dejó algo de entrada, ese abono sí se registra como ingreso.
         const cliente = await DB.get("clientes", o.clienteId);
@@ -2941,7 +3592,13 @@ document.getElementById("inputKm").addEventListener("change", async (e) => {
   toast("Kilometraje actualizado");
 });
 
-/* ---- fotos ---- */
+/* ---- fotos ----
+   SYNC-6: en Mi Trabajo las fotos NUNCA viajan en base64 — se comprimen (máx. ~1600px, JPEG) y se suben a
+   Storage; el PUT mismo es el chequeo de "¿sigue siendo mía esta orden?" (taller_sube_media, SYNC-2). Sin
+   conexión se quedan en bd.blobs (encolar()) como Blob, nunca como texto, y se reintentan solas al volver la
+   red (flushFotosPendientes, más arriba) o la próxima vez que se abra esta pantalla. El Taller sigue exactamente
+   igual que siempre: base64 local, sin subir a ningún lado todavía (eso queda fuera de SYNC-6, ver
+   sync-mappers.js). */
 document.getElementById("inputFotos").addEventListener("change", async (e) => {
   const files = Array.from(e.target.files || []);
   if (!files.length) return;
@@ -2949,6 +3606,18 @@ document.getElementById("inputFotos").addEventListener("change", async (e) => {
     const o = await DB.get("ordenes", currentOrderId);
     if (!esTrabajoPropio(o)) { e.target.value = ""; bloquear("Ese trabajo no está asignado a ti"); return; }
     if (o?.estado === "entregado") { e.target.value = ""; bloquear("Este trabajo ya fue entregado"); return; }
+    e.target.value = "";
+    if (!window.SyncFotos) { toast("No se pudo procesar la foto en este dispositivo", "off"); return; }
+    toast(files.length === 1 ? "Subiendo foto…" : `Subiendo ${files.length} fotos…`);
+    for (const file of files) {
+      try {
+        const { blob } = await SyncFotos.comprimir(file);
+        await SyncFotos.encolar(syncBd, { ordenUid: o.uid, blob });
+      } catch (err) { toast("No se pudo procesar una foto: " + (err?.message || err), "off"); }
+    }
+    await flushFotosPendientes();
+    openOrder(currentOrderId);
+    return;
   }
   const urls = await Promise.all(files.map(fileToDataUrl));
   const o = await updateOrder(currentOrderId, ord => { ord.fotos = (ord.fotos || []).concat(urls); });
@@ -2977,6 +3646,30 @@ alHacerClicUnaVez(document.getElementById("btnGuardarItem"), async () => {
   // stock en vez de restarlo (rep.cantidad -= cantidad con cantidad negativo).
   if (cantidad <= 0) { toast("La cantidad debe ser mayor a cero", "off"); return; }
   if (precio < 0) { toast("El precio no puede ser negativo", "off"); return; }
+
+  if (finanzasNube()) {
+    // SYNC-7B: agregar_item_orden — el servidor decide la existencia (online bloquea sin stock; offline acepta y marca revisión)
+    let invId = null, nom, costo = 0;
+    if (fromInv) {
+      invId = Number(document.getElementById("itemInventarioSelect").value);
+      const rep = await DB.get("inventario", invId);
+      if (!rep) { toast("Elige un repuesto", "off"); return; }
+      nom = rep.nombre; costo = rep.costoCompra || 0;
+    } else {
+      nom = document.getElementById("itemNombre").value.trim();
+      if (!nom) { toast("Falta el nombre del ítem", "off"); return; }
+    }
+    const ord = await DB.get("ordenes", currentOrderId);
+    let r;
+    try { r = await agregarItemOrdenNube(ord, { nombre: nom, cantidad, precio, inventarioId: invId, costoUnitario: costo }); }
+    catch (err) { toast("No se agregó: " + err.message, "off"); return; }
+    const o2 = await updateOrder(currentOrderId, x => { x.items = (x.items || []).concat([r.item]); });
+    if (r.estado === "ok") await bajarNube(["inventario"]); else toast("Ítem guardado sin conexión: se enviará al volver la red", "off");
+    registrarAuditoria("agregar-item", "ordenes", currentOrderId, `${nom} x${cantidad} a ${money(precio)}`);
+    document.getElementById("modalItem").classList.remove("active");
+    openOrder(o2.id);
+    return;
+  }
 
   if (fromInv) {
     const repId = Number(document.getElementById("itemInventarioSelect").value);
@@ -3554,6 +4247,42 @@ alHacerClicUnaVez(document.getElementById("btnCotAceptar"), async () => {
   const sinStock = [];
   let descontados = 0;
 
+  if (finanzasNube()) {
+    // SYNC-7B: la orden nace vacía y cada renglón entra por agregar_item_orden (el ledger descuenta el stock).
+    // Mismo criterio que siempre: si ya no hay existencia, el renglón pasa como ítem manual y se avisa.
+    const ordenIdN = await DB.save("ordenes", {
+      clienteId, motoId, estado: "recibido", falla: cot.diagnostico || `Trabajo cotizado en la cotización #${cot.id}`,
+      items: [], fotos: [], aprobacion: null, diagnostico: null, reparacionNotas: "", calidadChecklist: null,
+      mecanico: currentUser?.nombre || "—", citaId: null, citaFechaISO: null, cotizacionId: cot.id, creadoEn: Date.now(),
+    });
+    const ordN = await DB.get("ordenes", ordenIdN);
+    for (const it of (cot.items || [])) {
+      const rep = it.inventarioId ? inventario.find(r => r.id === it.inventarioId) : null;
+      let r = null;
+      if (rep) {
+        try { r = await agregarItemOrdenNube(ordN, { nombre: it.nombre, cantidad: it.cantidad, precio: it.precio, inventarioId: rep.id, costoUnitario: rep.costoCompra || 0 }); }
+        catch (err) { sinStock.push(it.nombre); r = null; }
+      }
+      if (!r) {
+        try { r = await agregarItemOrdenNube(ordN, { nombre: it.nombre, cantidad: it.cantidad, precio: it.precio, inventarioId: null }); }
+        catch (err) { toast("No se pudo pasar «" + it.nombre + "» a la orden: " + err.message, "off"); continue; }
+      }
+      items.push(r.item);
+    }
+    await updateOrder(ordenIdN, x => { x.items = items; });
+    await bajarNube(["inventario"]);
+    cot.estado = "aceptada"; cot.ordenId = ordenIdN; cot.aceptadaEn = Date.now();
+    await DB.save("cotizaciones", cot);
+    markDirty();
+    cerrarCotDetalle();
+    toast(sinStock.length ? `Orden #${ordenIdN} creada · sin stock de: ${sinStock.join(", ")}` : `Orden #${ordenIdN} creada desde la cotización`, sinStock.length ? "off" : undefined);
+    await renderCotizaciones();
+    await renderOrdersList();
+    renderDashboard();
+    openOrder(ordenIdN);
+    return;
+  }
+
   for (const it of (cot.items || [])) {
     const rep = it.inventarioId ? inventario.find(r => r.id === it.inventarioId) : null;
     if (rep && rep.cantidad >= it.cantidad) {
@@ -3735,7 +4464,7 @@ async function abrirModalMoverCita(citaId) {
     `${nombre} — ahora está para el ${dt.toLocaleDateString("es-HN")} a las ${cita.hora} con ${cita.mecanico}.`;
   document.getElementById("moverAvisoSinTel").style.display = telefono ? "none" : "block";
 
-  poblarSelectMecanico("moverMecanico", cita.mecanico, cita.mecanicoId);
+  await poblarSelectMecanico("moverMecanico", cita.mecanico, cita.mecanicoId);
   document.getElementById("moverMotivo").value = "cliente";
   document.getElementById("moverFecha").value = cita.fecha;
   await refreshMoverHoraOptions();
@@ -4063,7 +4792,7 @@ async function abrirModalEditarCita(citaId) {
   campoFecha.min = cita.fecha < hoy ? cita.fecha : hoy;
   campoFecha.value = cita.fecha;
 
-  poblarSelectMecanico("citaMecanico", cita.mecanico, cita.mecanicoId);
+  await poblarSelectMecanico("citaMecanico", cita.mecanico, cita.mecanicoId);
   await refreshCitaHoraOptions();
   const selHora = document.getElementById("citaHora");
   // si la hora actual no es uno de los huecos estándar (típico de las citas que
@@ -4098,7 +4827,7 @@ wireAutocompleteCliente(document.getElementById("citaBuscarCliente"), document.g
 document.getElementById("citaBuscarCliente").addEventListener("input", () => { citaClienteSel = null; renderCitaClienteChip(); });
 
 async function refreshCitaClienteSelect() {
-  poblarSelectMecanico("citaMecanico");
+  await poblarSelectMecanico("citaMecanico");
 }
 
 document.getElementById("btnNuevaCita").addEventListener("click", async () => {
@@ -4420,6 +5149,8 @@ async function openClienteDetalle(id) {
 let clienteEnEdicion = null;
 
 async function propagarCambioCliente(clienteId, nombre, telefono) {
+  // SYNC-7B: en modo nube ventas y créditos son registros financieros inmutables (el nombre queda como se facturó)
+  if (finanzasNube()) return 0;
   let tocados = 0;
   for (const cred of (await DB.getAll("creditos")).filter(c => c.clienteId === clienteId)) {
     if (cred.clienteNombre === nombre && cred.clienteTelefono === telefono) continue;
@@ -4444,7 +5175,7 @@ async function abrirModalEditarCliente(clienteId) {
   document.getElementById("editClienteNombre").value = cliente.nombre || "";
   document.getElementById("editClienteTelefono").value = cliente.telefono || "";
 
-  const creditosAbiertos = (await DB.getAll("creditos")).filter(c => c.clienteId === clienteId && c.saldo > 0.01).length;
+  const creditosAbiertos = (await DB.getAll("creditos")).filter(c => c.clienteId === clienteId && !c.anulado && c.saldo > 0.01).length;
   const aviso = document.getElementById("editClienteAviso");
   if (creditosAbiertos) {
     aviso.textContent = `Este cliente tiene ${creditosAbiertos} crédito${creditosAbiertos === 1 ? "" : "s"} pendiente${creditosAbiertos === 1 ? "" : "s"}: el cambio también se aplicará a esa${creditosAbiertos === 1 ? "" : "s"} factura${creditosAbiertos === 1 ? "" : "s"}.`;
@@ -4625,7 +5356,7 @@ async function renderInventario() {
     <tr class="rep-row" data-id="${r.id}">
       <td style="display:flex; align-items:center; gap:0.5rem; cursor:pointer;">${r.foto ? `<img class="thumb-sm" src="${r.foto}">` : ""}${esc(r.nombre)}</td>
       <td style="cursor:pointer;">${esc(r.modelo || "Todos")}</td>
-      <td class="num" style="cursor:pointer;">${r.cantidad}</td>
+      <td class="num" style="cursor:pointer;">${r.cantidad}${r.requiereRevision ? ` <span title="Stock negativo por una venta sin conexión: revisar">⚠</span>` : ""}</td>
       <td class="num" style="cursor:pointer;">${money(r.precio)}</td>
       <td><label style="display:flex; align-items:center; gap:0.4rem; cursor:pointer; margin:0;"><input type="checkbox" class="chk-publicar" data-id="${r.id}" ${r.publicarEnWeb ? "checked" : ""} style="width:1.05rem; height:1.05rem; margin:0; accent-color:var(--red);"></label></td>
     </tr>`).join("");
@@ -4659,12 +5390,28 @@ async function openRepuestoDetalle(id) {
   repDetalleActualId = id;
   document.getElementById("repDetalleNombre").textContent = r.nombre;
   document.getElementById("repDetalleModelo").textContent = `Modelo compatible: ${r.modelo || "Todos"}`;
-  document.getElementById("repDetalleCantidad").textContent = r.cantidad;
+  document.getElementById("repDetalleCantidad").textContent = r.cantidad + (r.requiereRevision ? " ⚠ revisar" : "");
+  // SYNC-7B: ajuste manual por ledger (ajustar_stock). Admin directo, cajero con PIN; el mecánico no lo ve.
+  document.getElementById("btnAjustarStock").style.display = finanzasNube() && ["admin", "cajero"].includes(currentUser?.rol) ? "" : "none";
   document.getElementById("repDetallePrecio").textContent = money(r.precio);
   document.getElementById("repDetalleFotoWrap").innerHTML = r.foto ? `<img src="${r.foto}" style="width:100%; max-height:220px; object-fit:cover; border-radius:0.6rem; border:1px solid var(--border);">` : "";
   document.getElementById("modalRepuestoDetalle").classList.add("active");
 }
 document.getElementById("btnCerrarRepuestoDetalle").addEventListener("click", () => document.getElementById("modalRepuestoDetalle").classList.remove("active"));
+document.getElementById("btnAjustarStock").addEventListener("click", async () => {
+  const r = await DB.get("inventario", repDetalleActualId);
+  if (!r || !finanzasNube()) return;
+  const txt = await showPrompt(`Hay ${r.cantidad}. Diferencia: positiva entra, negativa sale (p. ej. -2)`, { titulo: "Ajustar stock de " + r.nombre });
+  if (txt === null || txt === undefined || String(txt).trim() === "") return;
+  const delta = Number(String(txt).replace(",", "."));
+  if (!Number.isFinite(delta) || delta === 0) { toast("La diferencia debe ser un número distinto de cero", "off"); return; }
+  const motivo = await pedirMotivo("Motivo del ajuste");
+  if (!motivo) return;
+  if (await accionAutorizada((d) => syncFin.construir.ajusteStock(d), { inventarioUid: r.uid, delta, motivo }, ["inventario"], "Stock ajustado")) {
+    openRepuestoDetalle(r.id);
+    renderInventario();
+  }
+});
 document.getElementById("btnEditarRepuesto").addEventListener("click", async () => {
   const r = await DB.get("inventario", repDetalleActualId);
   if (!r) return;
@@ -4733,7 +5480,20 @@ alHacerClicUnaVez(document.getElementById("btnGuardarRepuesto"), async () => {
     foto,
   };
   if (repuestoEditId) registro.id = repuestoEditId;
+  // SYNC-7B: en modo nube la cantidad de un repuesto EXISTENTE nunca se escribe: si cambió, es un conteo que va
+  // por ajustar_stock (ledger, con motivo). El alta sigue entrando por registrar_stock_inicial (SYNC-7A).
+  let conteoNuevo = null, previoNube = null;
+  if (finanzasNube() && repuestoEditId) {
+    previoNube = await DB.get("inventario", repuestoEditId);
+    if (previoNube && Number(previoNube.cantidad) !== cantidad) conteoNuevo = cantidad;
+    registro.cantidad = previoNube ? previoNube.cantidad : cantidad;
+  }
   await DB.save("inventario", registro);
+  if (conteoNuevo !== null) {
+    const motivo = await pedirMotivo(`Conteo: de ${previoNube.cantidad} a ${conteoNuevo}`);
+    if (motivo) await accionAutorizada((d) => syncFin.construir.ajusteStock(d), { inventarioUid: previoNube.uid, conteo: conteoNuevo, motivo }, ["inventario"], "Stock ajustado al conteo");
+    else toast("Los datos se guardaron; la cantidad NO cambió (falta el motivo del ajuste)", "off");
+  }
   markDirty();
   document.getElementById("modalRepuesto").classList.remove("active");
   toast(repuestoEditId ? "Repuesto actualizado" : "Repuesto agregado");
@@ -5085,6 +5845,7 @@ async function cobrarCreditoPOS() {
       nota: "Venta al crédito desde el TPV", origen: "pos",
     });
     ultimoCreditoPOS = credito;
+    if (finanzasNube() && credito?._pend) toast("Crédito guardado sin conexión: se enviará al volver la red", "off");
     imprimirFacturaCredito(credito, abrirVentanaImpresion());
     toast(abono > 0
       ? `Crédito #${id} registrado — abonó ${money(abono)}, queda debiendo ${money(credito.saldo)}`
@@ -5118,10 +5879,12 @@ async function cobrarVentaPOS(metodoPago, efectivoRecibido) {
     : (posClienteLibre || null);
 
   try {
-    const { id, venta, faltantes } = await registrarVentaRapida({
+    const { id, venta, faltantes, estado, stockNegativo } = await registrarVentaRapida({
       items: posCarrito.map(it => ({ inventarioId: it.inventarioId, nombre: it.nombre, cantidad: it.cantidad, precio: it.precio })),
       clienteId, clienteNombre, metodoPago, efectivoRecibido,
     });
+    if (estado === "pendiente") toast("Venta guardada sin conexión: se enviará sola al volver la red", "off");
+    if (stockNegativo?.length) toast("Ojo: la venta dejó stock negativo — el administrador debe revisarlo", "off");
     markDirty();
     registrarAuditoria("venta", "ventas_rapidas", id, `${money(total)} por ${metodoPago}`);
     encolarSync("ventas_rapidas", id, "crear", null);
@@ -5244,7 +6007,8 @@ function motivoNoBorrable(m) {
    distinto del criterio de "Ganancias por línea de negocio" (que cuenta por
    estado==="entregado" sin mirar finalizada) — ver informe de Fase 3A. */
 async function calcularProduccion(desde, hasta) {
-  const [ordenes, ventas, creditos] = await Promise.all([DB.getAll("ordenes"), DB.getAll("ventas_rapidas"), DB.getAll("creditos")]);
+  const [ordenesTodas, ventasTodas, creditosTodos] = await Promise.all([DB.getAll("ordenes"), DB.getAll("ventas_rapidas"), DB.getAll("creditos")]);
+  const ordenes = ordenesTodas.filter(o => !o.anulada), ventas = ventasTodas.filter(v => !v.anulada), creditos = creditosTodos.filter(c => !c.anulado);
   const enRango = (iso) => { const d = (iso || "").slice(0, 10); return !!d && d >= desde && d <= hasta; };
   const totalItems = (x) => (x.items || []).reduce((s, it) => s + it.cantidad * it.precio, 0);
   // se agrupa por identidadMecanico(): por uuid cuando lo hay, y si no por
@@ -5349,7 +6113,7 @@ async function renderFinanzas() {
      borrarlo del inventario la inflaba (costo cero). Ahora manda lo que costaba
      el día de la venta; solo los registros anteriores a la v6 caen al costo
      actual, y se avisa de cuántos son. */
-  const ventas = (await DB.getAll("ventas_rapidas")).filter(v => { const d = v.fechaISO.slice(0, 10); return d >= desde && d <= hasta; });
+  const ventas = (await DB.getAll("ventas_rapidas")).filter(v => { if (v.anulada) return false; const d = v.fechaISO.slice(0, 10); return d >= desde && d <= hasta; });
   let costoVentas = 0;
   let renglonesEstimados = 0;
   const inv = await DB.getAll("inventario");
@@ -5364,7 +6128,7 @@ async function renderFinanzas() {
 
   // saldo pendiente de créditos: es un saldo vivo, no depende del rango de
   // fechas filtrado — por eso se calcula aparte de "filtrados".
-  const creditos = await DB.getAll("creditos");
+  const creditos = (await DB.getAll("creditos")).filter(c => !c.anulado);
   const creditosPendientes = creditos.filter(c => c.estado !== "pagado");
   const cuentasPorCobrar = creditosPendientes.reduce((s, c) => s + c.saldo, 0);
 
@@ -5390,6 +6154,10 @@ async function renderFinanzas() {
 
   const body = document.getElementById("movimientosBody");
   document.getElementById("movimientosEmpty").style.display = filtrados.length ? "none" : "block";
+  // SYNC-7B: qué movimientos ya tienen su compensación, y las ventas (para anular/devolver desde su línea de caja)
+  const revertidos = new Set(movs.map(m => m.reversoDe).filter(Boolean));
+  const ventasPorId = {};
+  if (finanzasNube()) (await DB.getAll("ventas_rapidas")).forEach(v => { ventasPorId[v.id] = v; });
   const metodoLabel = { efectivo: "Efectivo", transferencia: "Transferencia", tarjeta: "Tarjeta" };
   body.innerHTML = filtrados.map(m => `
     <tr>
@@ -5399,10 +6167,11 @@ async function renderFinanzas() {
       <td>${esc(metodoLabel[m.metodoPago] || "—")}</td>
       <td>${esc(m.descripcion || "")}</td>
       <td class="num">${money(m.monto)}</td>
-      <td class="num">${movimientoEsBorrable(m)
+      <td class="num">${finanzasNube() ? accionesCajaNube(m, revertidos, ventasPorId) : movimientoEsBorrable(m)
         ? `<button type="button" class="btn ghost small danger" data-eliminar-movi="${m.id}" title="Eliminar" aria-label="Eliminar movimiento">🗑</button>`
         : `<span class="mov-ligado" title="${esc(motivoNoBorrable(m))}">🔒</span>`}</td>
     </tr>`).join("");
+  if (finanzasNube()) conectarAccionesCajaNube(body, ventasPorId);
   body.querySelectorAll("[data-eliminar-movi]").forEach(btn => {
     btn.addEventListener("click", () => {
       requestAdminCode(async () => {
@@ -5429,11 +6198,71 @@ async function renderFinanzas() {
   await renderRendimiento(desde, hasta);
 }
 
+/* SYNC-7B · caja en modo nube: nada se borra. Un movimiento manual se REVIERTE (reversar_caja); el de una venta se
+   corrige desde la venta (anular = reversar_venta, devolución parcial = registrar_devolucion); los de crédito u
+   orden, desde su origen. Cajero → PIN; admin → directo; todo en línea y auditado. */
+function accionesCajaNube(m, revertidos, ventasPorId) {
+  if (m.reversoDe) return `<span class="mov-ligado" title="Compensación de otro movimiento">↩</span>`;
+  if (m.uid && revertidos.has(m.uid)) return `<span class="mov-ligado" title="Ya revertido">revertido</span>`;
+  const v = m.ventaId != null ? ventasPorId[m.ventaId] : null;
+  if (v) {
+    if (v.anulada) return `<span class="mov-ligado" title="Venta anulada">anulada</span>`;
+    if (m.categoria !== "Venta mostrador") return `<span class="mov-ligado">🔒</span>`;
+    return `<button type="button" class="btn ghost small danger" data-anular-venta="${v.id}" title="Anular venta">Anular</button>
+      <button type="button" class="btn ghost small" data-devolver-venta="${v.id}" title="Devolución">Devolver</button>`;
+  }
+  if (movimientoEsBorrable(m) && m.uid && !m._pend) return `<button type="button" class="btn ghost small danger" data-revertir-movi="${m.id}" title="Revertir" aria-label="Revertir movimiento">↩</button>`;
+  return `<span class="mov-ligado" title="${esc(movimientoEsBorrable(m) ? "Pendiente de sincronizar" : motivoNoBorrable(m))}">🔒</span>`;
+}
+function conectarAccionesCajaNube(body, ventasPorId) {
+  const refrescar = () => { renderFinanzas(); renderDashboard(); };
+  body.querySelectorAll("[data-revertir-movi]").forEach(btn => btn.addEventListener("click", async () => {
+    const mov = await DB.get("caja_movimientos", Number(btn.dataset.revertirMovi));
+    if (!mov) return;
+    const motivo = await pedirMotivo(`Revertir ${mov.tipo} de ${money(mov.monto)}`);
+    if (!motivo) return;
+    if (await accionAutorizada((d) => syncFin.construir.reversarCaja(d), { cajaUid: mov.uid, monto: mov.monto, motivo }, ["caja_movimientos"], "Movimiento revertido (queda en el historial)")) refrescar();
+  }));
+  body.querySelectorAll("[data-anular-venta]").forEach(btn => btn.addEventListener("click", async () => {
+    const v = ventasPorId[Number(btn.dataset.anularVenta)];
+    if (!v) return;
+    const motivo = await pedirMotivo(`Anular venta de ${money(v.total)}`);
+    if (!motivo) return;
+    if (await accionAutorizada((d) => syncFin.construir.reversarVenta(d), { ventaUid: v.uid, total: v.total, motivo }, ["ventas_rapidas", "caja_movimientos", "inventario"], "Venta anulada: stock devuelto y caja compensada")) refrescar();
+  }));
+  body.querySelectorAll("[data-devolver-venta]").forEach(btn => btn.addEventListener("click", async () => {
+    const v = ventasPorId[Number(btn.dataset.devolverVenta)];
+    if (!v) return;
+    const lista = (v.items || []).map((it, i) => `${i + 1}) ${it.nombre} ×${it.cantidad}`).join("  ");
+    const resp = await showPrompt(`Renglón y cantidad a devolver, p. ej. 1:1 — ${lista}`, { titulo: "Devolución" });
+    if (!resp) return;
+    const [n, c] = String(resp).split(":").map(x => Number(x.trim()));
+    const it = (v.items || [])[n - 1];
+    if (!it || !(c > 0) || c > it.cantidad) { toast("Renglón o cantidad inválidos", "off"); return; }
+    const motivo = await pedirMotivo("Devolución de " + it.nombre);
+    if (!motivo) return;
+    if (await accionAutorizada((d) => syncFin.construir.devolucion(d), { ventaUid: v.uid, items: [{ ventaItemUid: it.uid, cantidad: c, precio: it.precio }], motivo },
+      ["ventas_rapidas", "caja_movimientos", "inventario"], "Devolución registrada")) refrescar();
+  }));
+}
+
 document.getElementById("btnFiltrarFinanzas").addEventListener("click", renderFinanzas);
 alHacerClicUnaVez(document.getElementById("btnGuardarMovimiento"), async () => {
   const monto = Number(document.getElementById("moviMonto").value) || 0;
   if (monto <= 0) { toast("El monto debe ser mayor a cero", "off"); return; }
   const tipoMovi = document.getElementById("moviTipo").value;
+  if (finanzasNube()) {
+    try {
+      const r = await registrarMovimientoCajaNube({ tipo: tipoMovi, categoria: document.getElementById("moviCategoria").value, monto,
+        metodoPago: document.getElementById("moviMetodo").value, descripcion: document.getElementById("moviDescripcion").value.trim() });
+      toast(r.estado === "pendiente" ? "Movimiento guardado sin conexión: se enviará al volver la red" : "Movimiento registrado");
+    } catch (e) { toast("No se pudo registrar: " + e.message, "off"); return; }
+    document.getElementById("moviMonto").value = "";
+    document.getElementById("moviDescripcion").value = "";
+    renderFinanzas();
+    renderDashboard();
+    return;
+  }
   const idMovi = await DB.save("caja_movimientos", {
     tipo: tipoMovi,
     categoria: document.getElementById("moviCategoria").value,
@@ -5531,7 +6360,8 @@ function agruparCreditosPorCliente(creditos) {
 }
 
 async function renderCreditos() {
-  const creditos = (await DB.getAll("creditos")).sort((a, b) => b.fechaISO.localeCompare(a.fechaISO));
+  // SYNC-7B: un crédito anulado (reverso) se conserva en la nube pero ya no se cobra ni se lista como deuda
+  const creditos = (await DB.getAll("creditos")).filter(c => !c.anulado).sort((a, b) => b.fechaISO.localeCompare(a.fechaISO));
   creditosCache = {};
   creditos.forEach(c => { creditosCache[c.id] = c; });
 
@@ -5667,8 +6497,10 @@ function abrirCreditoDetalle(clave) {
         ${c.estado !== "pagado" ? `<button type="button" class="btn small" data-act="abonar">Abonar</button>` : ""}
         <button type="button" class="btn wa small" data-act="enviar">📲 Enviar</button>
         <button type="button" class="btn ghost small" data-act="imprimir">🖨️ Factura</button>
-        ${c.abonado === 0 ? `<button type="button" class="btn ghost small danger" data-act="eliminar">🗑</button>` : ""}
+        ${(finanzasNube() ? true : c.abonado === 0) ? `<button type="button" class="btn ghost small danger" data-act="eliminar" title="${finanzasNube() ? "Anular crédito" : "Eliminar"}">🗑</button>` : ""}
       </div>
+      ${finanzasNube() && (c.historialAbonos || []).length ? `<div class="hint" style="margin-top:0.4rem;">Abonos: ${(c.historialAbonos || []).map((a, i) =>
+        `${money(a.monto)} (${new Date(a.fechaISO).toLocaleDateString("es-HN")}) ${a.uid ? `<button type="button" class="btn ghost small" data-act="revertir-abono" data-abono="${i}" title="Revertir abono">↩</button>` : "<em>pendiente</em>"}`).join(" · ")}</div>` : ""}
     </div>
   `).join("");
 
@@ -5693,6 +6525,32 @@ document.getElementById("credDetLista").addEventListener("click", (e) => {
   if (act === "abonar") {
     document.getElementById("modalCreditoDetalle").classList.remove("active");
     abrirModalAbonoCredito(id);
+    return;
+  }
+  if (act === "revertir-abono") {
+    (async () => {
+      const cred = creditosCache[id];
+      const ab = cred?.historialAbonos?.[Number(btn.dataset.abono)];
+      if (!ab) return;
+      const motivo = await pedirMotivo(`Revertir abono de ${money(ab.monto)}`);
+      if (!motivo) return;
+      const ok = await accionAutorizada((d) => syncFin.construir.reversarAbono(d), { abonoUid: ab.uid, monto: ab.monto, motivo },
+        ["creditos", "caja_movimientos"], "Abono revertido (queda en el historial)");
+      if (!ok) return;
+      await renderCreditos();
+      if (creditoDetalleClave && creditosPorCliente[creditoDetalleClave]) abrirCreditoDetalle(creditoDetalleClave);
+    })();
+    return;
+  }
+  if (act === "eliminar" && finanzasNube()) {
+    (async () => {
+      if (await eliminarCredito(id) !== true) return;
+      await renderCreditos();
+      if (!creditosPorCliente[creditoDetalleClave]) {
+        document.getElementById("modalCreditoDetalle").classList.remove("active");
+        creditoDetalleClave = null;
+      } else abrirCreditoDetalle(creditoDetalleClave);
+    })();
     return;
   }
   if (act === "eliminar") {
@@ -6026,6 +6884,12 @@ async function renderAjustes() {
     document.getElementById("ajustesVersion").textContent = activa ? activa.replace("entimotors-v", "") : "sin Service Worker";
   }
   pintarUltimoRespaldo();
+  // SYNC-10: con nube, «Restaurar» y «Empezar de cero» no aplican (ver sus manejadores); el importador 3.13 sí (admin)
+  const nube = demoProhibido();
+  document.getElementById("cardRestaurar").style.display = nube ? "none" : "";
+  document.getElementById("cardEmpezarDeCero").style.display = nube ? "none" : "";
+  document.getElementById("cardImport313").style.display = nube && currentUser?.rol === "admin" ? "" : "none";
+  if (nube && currentUser?.rol === "admin") pintarEstadoImport313();
 }
 
 /* ---- Buscar actualización ahora ----
@@ -6129,7 +6993,7 @@ alHacerClicUnaVez(document.getElementById("btnForzarActualizacion"), buscarActua
    fecha e identificador, para que al restaurarlo se sepa exactamente de dónde
    salió y si el esquema es compatible. */
 
-const VERSION_APP = "3.13.0";
+const VERSION_APP = "3.14.0";
 const VERSION_RESPALDO = 2; // formato del archivo, no de la app
 
 async function armarRespaldo() {
@@ -6287,6 +7151,9 @@ document.getElementById("inputRestaurar").addEventListener("change", async (e) =
   const file = e.target.files[0];
   e.target.value = "";
   if (!file) return;
+  // SYNC-10: con nube, «Restaurar» mezclaría el archivo registro a registro con la base real (y el dinero ni siquiera se
+  // puede escribir así). Un respaldo de la 3.13 va por el importador: validado, atómico y sin duplicar.
+  if (demoProhibido()) { toast("Con la nube no se restaura aquí: usa «Pasar los datos de la versión 3.13 a la nube».", "off"); return; }
 
   let respaldo;
   try { respaldo = JSON.parse(await file.text()); }
@@ -6411,6 +7278,8 @@ alHacerClicUnaVez(document.getElementById("btnConfirmarRestaurar"), async () => 
 });
 
 document.getElementById("btnEmpezarDeCero").addEventListener("click", async () => {
+  // SYNC-10: con nube esto vaciaría entimotors_os_demo (los datos de la 3.13 que quizá aún no se importaron): nunca.
+  if (demoProhibido()) { toast("Con la nube no se borra nada desde este teléfono.", "off"); return; }
   const ok = await showConfirm(
     "Esto borra TODA la información guardada en este dispositivo: clientes, órdenes, ventas, caja, inventario, todo. No se puede deshacer.",
     { titulo: "Borrar todo y empezar de cero", textoOk: "Borrar todo" }
@@ -6427,6 +7296,217 @@ document.getElementById("btnEmpezarDeCero").addEventListener("click", async () =
   });
 });
 
+/* ================= SYNC-10 · pasar los datos de la 3.13 a la nube =================
+   La 3.13 guardaba todo SOLO en este teléfono (entimotors_os_demo). Con la 3.14 y sesión de nube, esos datos siguen ahí
+   pero ya no se ven (la app lee la nube): nunca deben quedar invisibles sin explicación. El administrador los pasa con
+   el importador (import-313.js): fuente → validación → vista previa (solo cantidades) → confirmación → UNA llamada
+   atómica → verificación. Nunca se borra el origen: ni entimotors_os_demo ni el archivo. La marca local
+   (enti_import_313) solo sirve para recuperarse si la app se cierra a mitad; la verdad la tiene el servidor. */
+const CLAVE_IMPORT_313 = "enti_import_313";
+const STORES_313_OPERATIVOS = ["clientes", "motos", "ordenes", "inventario", "citas", "cotizaciones", "ventas_rapidas", "caja_movimientos", "creditos", "categorias_inv"];
+let imp313 = null;   // { prep, origen }
+
+function leerMarcaImport313() { try { return JSON.parse(localStorage.getItem(CLAVE_IMPORT_313) || "null"); } catch (e) { return null; } }
+function guardarMarcaImport313(m) { try { localStorage.setItem(CLAVE_IMPORT_313, JSON.stringify(m)); } catch (e) { /* sin almacenamiento: el servidor sigue mandando */ } }
+const rpcImport313 = (nombre, params, o) => syncRest
+  ? syncRest.rpc(nombre, params, o)
+  : Promise.resolve({ ok: false, clase: "auth", codigo: "SIN_NUBE", mensaje: "No hay sesión de nube." });
+
+/* Lo que la 3.13 dejó en ESTE teléfono. En modo nube DB.getAll de estos stores lee la caché de la nube: aquí se lee
+   entimotors_os_demo directo, solo lectura. */
+async function contarDatosLocales313() {
+  if (!db || db.name !== BASE_TALLER) return 0;
+  let n = 0;
+  for (const s of STORES_313_OPERATIVOS) if (db.objectStoreNames.contains(s)) n += (await idbGetAll(s)).length;
+  return n;
+}
+/* El mismo formato que armarRespaldo() de la 3.13 (versión 2, esquema 6), leído SIEMPRE de entimotors_os_demo. */
+async function armarRespaldoLocal313() {
+  const data = {}, conteos = {};
+  for (const s of ALL_STORES) { data[s] = db.objectStoreNames.contains(s) ? await idbGetAll(s) : []; conteos[s] = data[s].length; }
+  const ahora = new Date().toISOString();
+  return {
+    version: VERSION_RESPALDO, versionApp: "3.13.0",   // los datos son los de la base v6 que escribió la 3.13
+    generadoPor: VERSION_APP, esquemaDB: db.version,
+    idRespaldo: `ENTI-${ahora.slice(0, 10)}-LOCAL313`, exportadoEn: ahora, exportadoPor: currentUser?.nombre || "—",
+    dispositivo: "este-telefono", conteos, totalRegistros: Object.values(conteos).reduce((a, b) => a + b, 0), data,
+  };
+}
+
+async function revisarDatos313() {
+  const el = document.getElementById("aviso313");
+  if (!el) return;
+  el.style.display = "none";
+  if (!demoProhibido() || esMecanicoCuenta()) return;
+  const marca = leerMarcaImport313();
+  if (marca?.estado === "terminado") return;
+  const n = await contarDatosLocales313();
+  if (!n && !["aplicado", "enviando"].includes(marca?.estado)) return;
+  const admin = currentUser?.rol === "admin";
+  let txt;
+  if (marca?.estado === "aplicado") txt = `<b>Los datos de la versión anterior ya están en la nube.</b> Revisa que todo cuadre y dala por terminada.`;
+  else if (marca?.estado === "enviando") txt = `<b>Una importación de los datos de la versión anterior quedó sin confirmar.</b> Ábrela para ver en qué quedó (nada queda a medias).`;
+  else txt = `<b>Este teléfono tiene ${n} registros de la versión anterior (3.13) que todavía no están en la nube.</b> No se han borrado: ${admin ? "pásalos a la nube para verlos aquí." : "pídele al administrador que los pase a la nube."}`;
+  el.innerHTML = txt + (admin ? ` <button type="button" class="btn small primary" id="btnAviso313" style="margin-top:0.5rem;">Revisar e importar</button>` : "");
+  el.style.display = "block";
+  document.getElementById("btnAviso313")?.addEventListener("click", () => abrirImport313());
+}
+
+async function pintarEstadoImport313() {
+  const el = document.getElementById("import313Estado");
+  if (!el) return;
+  const marca = leerMarcaImport313();
+  const n = await contarDatosLocales313();
+  el.textContent = marca?.estado === "terminado" ? `Importación terminada (${marca.idRespaldo || "respaldo"}). Los datos originales siguen en este teléfono.`
+    : marca?.estado === "aplicado" ? "Importado: falta revisar y darlo por terminado."
+    : marca?.estado === "enviando" ? "Hay una importación sin confirmar: ábrela para ver en qué quedó."
+    : n ? `Este teléfono tiene ${n} registros de la 3.13.` : "Este teléfono no tiene datos de la 3.13. También puedes usar un archivo de respaldo.";
+}
+
+function imp313Mostrar(id, html, clase) {
+  const el = document.getElementById(id);
+  if (html === null) { el.style.display = "none"; el.innerHTML = ""; return; }
+  el.style.display = "block"; el.innerHTML = html;
+  if (clase !== undefined) el.className = clase;
+}
+function imp313Reiniciar() {
+  imp313 = null;
+  document.getElementById("imp313Origen").textContent = "";
+  for (const id of ["imp313Resumen", "imp313Avisos", "imp313Destino", "imp313Resultado"]) imp313Mostrar(id, null);
+  document.getElementById("btnConfirmarImp313").style.display = "none";
+  document.getElementById("btnFinalizarImp313").style.display = "none";
+  document.getElementById("imp313Fuente").style.display = "";
+}
+
+async function abrirImport313() {
+  if (!demoProhibido() || currentUser?.rol !== "admin") { toast("Solo el administrador, con sesión de nube, importa los datos del taller.", "off"); return; }
+  imp313Reiniciar();
+  document.getElementById("btnImp313Local").style.display = (await contarDatosLocales313()) ? "" : "none";
+  document.getElementById("modalImport313").classList.add("active");
+  // recuperación tras un cierre: el servidor dice en qué quedó el lote (todo o nada, nunca a medias)
+  const marca = leerMarcaImport313();
+  if (marca?.lote && marca.estado !== "terminado") {
+    const e = await rpcImport313("import_estado", { p_lote: marca.lote });
+    if (e.ok && ["aplicado", "confirmado"].includes(e.datos?.estado)) {
+      guardarMarcaImport313({ ...marca, estado: e.datos.estado === "confirmado" ? "terminado" : "aplicado" });
+      await imp313Verificar(marca, "Los datos ya están en la nube (importación del " + esc(String(marca.en || "").slice(0, 10)) + ").");
+    } else if (e.ok) {
+      imp313Mostrar("imp313Resultado", "La importación anterior no llegó a aplicarse: no quedó nada a medias. Vuelve a elegir los datos para intentarlo otra vez.", "respaldo-estado");
+    } else {
+      imp313Mostrar("imp313Resultado", "No se pudo consultar la nube (" + esc(e.mensaje || "sin conexión") + "). Inténtalo con conexión.", "respaldo-estado mal");
+    }
+  }
+}
+
+async function imp313Verificar(marca, titulo) {
+  const t = await rpcImport313("import_totales", {});
+  const cmp = t.ok && marca.esperado ? Import313.compararTotales(marca.esperado, t.datos) : null;
+  imp313Mostrar("imp313Resultado", `<b>${titulo}</b><br>` + (cmp === null ? "No se pudo verificar ahora contra la nube."
+    : cmp.ok ? "✅ Verificado: clientes, órdenes, inventario, ventas, créditos, abonos y caja cuadran con el respaldo."
+    : "⚠️ No cuadra con el respaldo en: " + esc(cmp.diferencias.join(", ")) + ". No des por terminada la importación: pide ayuda técnica."), `respaldo-estado ${cmp?.ok ? "ok" : "mal"}`);
+  document.getElementById("imp313Fuente").style.display = "none";
+  document.getElementById("btnFinalizarImp313").style.display = cmp?.ok && leerMarcaImport313()?.estado === "aplicado" ? "" : "none";
+}
+
+async function imp313Cargar(respaldo, origen) {
+  imp313Reiniciar();
+  document.getElementById("imp313Origen").textContent = origen;
+  const prep = await Import313.preparar(respaldo);
+  if (prep.avisos?.length) imp313Mostrar("imp313Avisos", prep.avisos.map(esc).join("<br>"), "aviso-fuerte");
+  if (!prep.ok) {
+    imp313Mostrar("imp313Resumen", `<b>⚠️ Este respaldo no se puede importar. No se subió nada.</b><br>${prep.errores.map(esc).join("<br>")}`, "respaldo-estado mal");
+    return;
+  }
+  imp313 = { prep, origen, respaldo };
+  const c = prep.resumen.conteos;
+  const nombres = { clientes: "Clientes", motos: "Motos", ordenes: "Órdenes", productos: "Productos", categorias: "Categorías", citas: "Citas",
+    cotizaciones: "Cotizaciones", ventas: "Ventas", creditos: "Créditos", abonos: "Abonos", movimientosCaja: "Movimientos de caja" };
+  imp313Mostrar("imp313Resumen", `<b>Esto es lo que se pasaría a la nube:</b><div class="respaldo-conteos">${Object.keys(nombres)
+    .map((k) => `<span>${nombres[k]} <b>${c[k]}</b></span>`).join("")}</div>`, "respaldo-estado ok");
+  imp313Mostrar("imp313Destino", "Comprobando la nube…", "aviso-fuerte");
+  const d = await Import313.comprobarDestino(rpcImport313, prep.lote);
+  const yaEsta = ["aplicado", "confirmado"].includes(d.lote?.estado);
+  if (yaEsta) {
+    imp313Mostrar("imp313Destino", "Estos mismos datos ya se importaron antes: no se vuelven a subir.", "aviso-fuerte");
+    guardarMarcaImport313({ ...(leerMarcaImport313() || {}), lote: prep.lote, idRespaldo: prep.cabecera.idRespaldo, esperado: prep.esperado,
+      estado: d.lote.estado === "confirmado" ? "terminado" : "aplicado" });
+    await imp313Verificar(leerMarcaImport313(), "Ya importado.");
+  } else if (d.destino === "EMPTY") {
+    imp313Mostrar("imp313Destino", "La nube del taller está vacía: lista para recibir estos datos.", "aviso-fuerte");
+    document.getElementById("btnConfirmarImp313").style.display = "";
+  } else if (d.destino === "NON_EMPTY") {
+    imp313Mostrar("imp313Destino", "<b>La nube ya tiene datos del taller.</b> Por seguridad no se importa encima (no se mezclan ni se duplican datos). Revísalo con soporte técnico.", "aviso-fuerte peligro");
+  } else {
+    imp313Mostrar("imp313Destino", `No se pudo comprobar la nube (${esc(d.error?.mensaje || "sin conexión")}). Sin esa comprobación no se importa.`, "aviso-fuerte peligro");
+  }
+}
+
+document.getElementById("btnAbrirImport313").addEventListener("click", () => abrirImport313());
+document.getElementById("btnCerrarImp313").addEventListener("click", () => {
+  imp313 = null;
+  document.getElementById("modalImport313").classList.remove("active");
+  revisarDatos313();
+  if (demoProhibido() && currentUser?.rol === "admin") pintarEstadoImport313();
+});
+document.getElementById("btnImp313Local").addEventListener("click", async () => {
+  await imp313Cargar(await armarRespaldoLocal313(), "Datos de este teléfono (versión 3.13)");
+});
+document.getElementById("inputImp313").addEventListener("change", async (e) => {
+  const file = e.target.files[0];
+  e.target.value = "";
+  if (!file) return;
+  if (file.size > Import313.LIMITE_BYTES) { imp313Reiniciar(); imp313Mostrar("imp313Resumen", "El archivo es demasiado grande para importarlo desde el teléfono.", "respaldo-estado mal"); return; }
+  const l = Import313.leerTexto(await file.text());
+  if (!l.ok) { imp313Reiniciar(); imp313Mostrar("imp313Resumen", `<b>⚠️ ${esc(l.errores[0])}</b> No se subió nada.`, "respaldo-estado mal"); return; }
+  await imp313Cargar(l.respaldo, `Archivo: ${file.name}`);
+});
+
+alHacerClicUnaVez(document.getElementById("btnConfirmarImp313"), async () => {
+  if (!imp313) return;
+  const { prep, respaldo } = imp313;
+  const total = Object.values(prep.resumen.conteos).reduce((a, b) => a + b, 0);
+  const ok = await showConfirm(`Se van a subir ${total} registros a la nube del taller, en una sola operación: o entra todo o no entra nada. Los datos de este teléfono y el archivo no se borran.`,
+    { titulo: "Importar a la nube", textoOk: "Importar" });
+  if (!ok) return;
+  if (!isOnline()) { toast("Sin conexión: la importación necesita internet. No se tocó nada.", "off"); return; }
+  // copia del origen ANTES de subir (el archivo elegido ya es su propia copia)
+  // (verificarRespaldo() no sirve aquí: en modo nube compara contra la nube, no contra entimotors_os_demo)
+  if (imp313.origen.startsWith("Datos de este teléfono")) {
+    descargarArchivo(`entimotors-3.13-antes-de-importar-${respaldo.exportadoEn.slice(0, 10)}.json`, JSON.stringify(respaldo));
+  }
+  const marca = { lote: prep.lote, huella: prep.huella, idRespaldo: prep.cabecera.idRespaldo, esperado: prep.esperado, en: new Date().toISOString(), estado: "enviando" };
+  guardarMarcaImport313(marca);
+  document.getElementById("btnConfirmarImp313").style.display = "none";
+  imp313Mostrar("imp313Resultado", "Subiendo… no cierres la app.", "respaldo-estado");
+  const r = await Import313.importar({ rpc: rpcImport313, preparado: prep, enLinea: () => isOnline(),
+    onPaso: (p) => imp313Mostrar("imp313Resultado", { destino: "Comprobando la nube…", iniciar: "Preparando…", aplicar: "Subiendo… no cierres la app.", verificar: "Verificando contra la nube…" }[p] || "…", "respaldo-estado") });
+  if (!r.ok) {
+    if (r.codigo !== "SIN_CONFIRMAR") guardarMarcaImport313({ ...marca, estado: "fallido" });
+    imp313Mostrar("imp313Resultado", `<b>⚠️ No se importó.</b> ${esc(r.mensaje)}`, "respaldo-estado mal");
+    if (r.reintentable || r.codigo === "SIN_RED") document.getElementById("btnConfirmarImp313").style.display = "";
+    return;
+  }
+  guardarMarcaImport313({ ...marca, estado: "aplicado" });
+  localStorage.setItem("enti_modo_datos", "blanco");
+  try { await syncMotor?.pullTodo(); } catch (e) { /* se reintenta solo al volver la red */ }
+  await imp313Verificar(leerMarcaImport313(), r.repetida ? "Estos datos ya estaban en la nube." : "¡Listo! Los datos de la 3.13 están en la nube.");
+  renderOrdersList(); renderClientes(); renderInventario(); renderDashboard();
+});
+
+alHacerClicUnaVez(document.getElementById("btnFinalizarImp313"), async () => {
+  const marca = leerMarcaImport313();
+  if (!marca?.lote) return;
+  const ok = await showConfirm("Darla por terminada cierra la importación: ya no se podrá deshacer ni volver a importar. Hazlo solo si revisaste que todo cuadra.",
+    { titulo: "Terminar la importación", textoOk: "Terminar" });
+  if (!ok) return;
+  const r = await rpcImport313("import_confirmar_lote", { p_lote: marca.lote });
+  if (!r.ok) { toast("No se pudo terminar: " + (r.mensaje || "sin conexión"), "off"); return; }
+  guardarMarcaImport313({ ...marca, estado: "terminado" });
+  document.getElementById("btnFinalizarImp313").style.display = "none";
+  toast("Importación terminada. Los datos originales siguen guardados en este teléfono.");
+  revisarDatos313();
+});
+
 /* ================= datos de prueba adicionales (inventario, clientes, citas) =================
    No hay botón visible en Ajustes a propósito — esto es solo para la cuenta
    "prueba" (ver TEAM), que abre únicamente Wilkin, no el cliente. Se ejecuta
@@ -6436,6 +7516,7 @@ document.getElementById("btnEmpezarDeCero").addEventListener("click", async () =
    dispositivos, así que en cada celular donde se use "prueba" se siembra sola
    la primera vez que se entra ahí. */
 async function sembrarDatosPrueba() {
+  if (demoProhibido()) { console.info("[ENTIMOTORS] sesión de nube: no se siembran datos de prueba"); return; }
   const catsExistentes = await DB.getAll("categorias_inv");
   async function idDeCategoria(nombre) {
     const encontrada = catsExistentes.find(c => c.nombre === nombre);
@@ -6526,6 +7607,7 @@ window.addEventListener("offline", renderSyncChip);
 
 /* ================= datos de ejemplo (solo la primera vez) ================= */
 async function seedIfEmpty() {
+  if (demoProhibido()) { console.info("[ENTIMOTORS] sesión de nube: no se siembran datos de ejemplo"); return; }
   const clientes = await DB.getAll("clientes");
   if (clientes.length) return;
   const c1 = await DB.save("clientes", { nombre: "Carlos Reyes", telefono: "9704-1122" });
@@ -6589,12 +7671,15 @@ async function seedIfEmpty() {
   const inv = await DB.getAll("inventario");
   const aceite = inv.find(r => r.nombre.startsWith("Aceite"));
   const haceDos = new Date(); haceDos.setDate(haceDos.getDate() - 2);
+  // SYNC-7B: nunca se inventa dinero en la nube (solo se registra por RPC real)
+  if (!modoNubeActivo("caja_movimientos")) {
   await DB.save("caja_movimientos", { tipo: "ingreso", categoria: "Servicio taller", monto: 330, metodoPago: "efectivo", descripcion: "Orden de taller #entregada", fechaISO: haceDos.toISOString(), creadoEn: haceDos.getTime() });
   await DB.save("caja_movimientos", { tipo: "egreso", categoria: "Compra de repuestos", monto: 900, metodoPago: "efectivo", descripcion: "Reposición de aceite y pastillas", fechaISO: haceDos.toISOString(), creadoEn: haceDos.getTime() });
   if (aceite) {
     const ventaDemo = { items: [{ inventarioId: aceite.id, nombre: aceite.nombre, cantidad: 2, precio: aceite.precio, costoUnitario: aceite.costoCompra || 0, costoEstimado: false }], clienteId: null, metodoPago: "efectivo", total: aceite.precio * 2, efectivoRecibido: aceite.precio * 2, cambio: 0, fechaISO: new Date().toISOString(), creadoEn: Date.now(), mecanico: "Wilkin" };
     const ventaId = await DB.save("ventas_rapidas", ventaDemo);
     await DB.save("caja_movimientos", { tipo: "ingreso", categoria: "Venta mostrador", monto: ventaDemo.total, metodoPago: "efectivo", descripcion: `Venta rápida #${ventaId}`, ventaId, fechaISO: ventaDemo.fechaISO, creadoEn: Date.now() });
+  }
   }
 
   await DB.save("web_cms", { key: "landing_hero", titulo: "Tu moto en las mejores manos", subtitulo: "Repuestos, mantenimiento y reparación de motocicletas en Honduras" });
@@ -6625,10 +7710,15 @@ async function startApp(session) {
   if (!baseDeEstaSesion) { await denegarSesion("No se pudo preparar tu espacio de trabajo."); return; }
   db = await openDb(baseDeEstaSesion);
 
+  // Antes de la primera lectura: si esta sesión tiene nube, clientes/motos/
+  // citas/categorias_inv/cotizaciones ya vienen de allá (bootstrap SYNC-5 §10).
+  await prepararModoNube(session);
+
   const clientesExistentes = await DB.getAll("clientes");
   const modo = localStorage.getItem("enti_modo_datos");
   if (!clientesExistentes.length && !modo) {
     // base vacía y todavía no se eligió cómo arrancar: preguntamos antes de mostrar nada del sistema
+    prepararGateModo();
     document.getElementById("gateModo").classList.add("active");
     return;
   }
@@ -6637,7 +7727,21 @@ async function startApp(session) {
   await continuarArranque(modo);
 }
 
+/* SYNC-10 · B2 — DEMO DATA MUST NEVER BE WRITTEN TO PRODUCTION CLOUD.
+   Con sesión de nube NUNCA se siembran datos de ejemplo: ni en la nube (es la base real del taller, esté vacía o no —
+   el día del cambio lo está y sigue siendo producción) ni en entimotors_os_demo (después se importaría como si fuera
+   trabajo real). Se decide por la SESIÓN, no por si el motor arrancó ni por lo que haya en la nube: fail closed. El
+   modo demo sigue igual que siempre en una sesión local (sin nube). */
+function demoProhibido() { return currentUser?.origen === "supabase"; }
+function prepararGateModo() {
+  const nube = demoProhibido();
+  document.getElementById("btnModoDemo").style.display = nube ? "none" : "";
+  document.getElementById("gateModoNubeAviso").style.display = nube ? "" : "none";
+  document.getElementById("btnModoImportar").style.display = nube && currentUser?.rol === "admin" ? "" : "none";
+}
+
 async function elegirModoDatos(modo) {
+  if (modo === "demo" && demoProhibido()) modo = "blanco";
   localStorage.setItem("enti_modo_datos", modo);
   document.getElementById("gateModo").classList.remove("active");
   document.getElementById("shell").classList.add("active");
@@ -6645,6 +7749,7 @@ async function elegirModoDatos(modo) {
 }
 document.getElementById("btnModoDemo").addEventListener("click", () => elegirModoDatos("demo"));
 document.getElementById("btnModoBlanco").addEventListener("click", () => elegirModoDatos("blanco"));
+document.getElementById("btnModoImportar").addEventListener("click", async () => { await elegirModoDatos("blanco"); abrirImport313(); });
 
 async function continuarArranque(modo) {
   if (modo === "demo") await seedIfEmpty();
@@ -6686,6 +7791,7 @@ async function continuarArranque(modo) {
   await renderNotificaciones();
   renderSyncChip();
   document.getElementById("fabHome").classList.add("fab-hidden"); // arranca siempre en la página principal
+  revisarDatos313();   // SYNC-10: datos de la 3.13 en este teléfono que aún no están en la nube → a la vista
 
   wireServiceWorkerUpdates();
 }

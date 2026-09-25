@@ -344,7 +344,7 @@
      ni tocar el botón — la acción quedaba muerta sin ningún mensaje.
      Le pasaba al aviso de choque de horario al mover una cita, y a cualquier
      confirmación que se pidiera desde un modal declarado más abajo. */
-  #modalAdminCode, #modalConfirm, #modalPrompt { z-index: 60; }
+  #modalAdminCode, #modalConfirm, #modalPrompt, #modalPinAutorizar { z-index: 60; }
   .modal { background: var(--bg-raise); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); max-width: 480px; width: 100%; padding: 1.4rem; max-height: 88vh; overflow-y: auto; }
   .modal h3 { font-family: 'Teko', sans-serif; text-transform: uppercase; font-size: 1.3rem; margin-bottom: 0.8rem; }
   .modal-actions { display: flex; justify-content: flex-end; gap: 0.5rem; margin-top: 0.6rem; }
@@ -999,7 +999,14 @@
         <b style="display:block; margin-bottom:0.3rem;">Empezar en blanco</b>
         <span class="hint" style="margin:0;">Arranca sin ningún dato de ejemplo — ideal si ya vas a usarlo con tus clientes reales.</span>
       </button>
+      <!-- SYNC-10: solo con sesión de nube (administrador). «Ver un ejemplo» NUNCA se ofrece en la nube: sembraría datos
+           inventados en la base real del taller. -->
+      <button type="button" class="card" id="btnModoImportar" style="cursor:pointer; font-family:inherit; text-align:left; display:none;">
+        <b style="display:block; margin-bottom:0.3rem;">Traer mis datos de la versión anterior</b>
+        <span class="hint" style="margin:0;">Pasa a la nube lo que el taller tenía en el teléfono (versión 3.13), desde este teléfono o desde un archivo de respaldo.</span>
+      </button>
     </div>
+    <p class="hint" id="gateModoNubeAviso" style="display:none; margin:0.4rem 0 0;">Estás conectado a la nube del taller: aquí no se cargan datos de ejemplo.</p>
   </div>
 </div>
 
@@ -1026,6 +1033,7 @@
         <button type="button" class="icon-btn" id="btnCuenta" aria-label="Cuenta y estado de conexión" title="Cuenta">👤</button>
         <div class="account-panel" id="accountPanel">
           <span class="chip" id="syncChip"><span class="dot on" id="syncDot"></span><span id="syncLabel">En línea · datos locales</span></span>
+          <button class="btn small ghost" id="btnRevisionSync" style="display:none;" title="Cambios que la nube no aceptó, conflictos y stock a revisar">⚠ Por revisar</button>
           <button class="btn small ghost" id="offlineToggle" title="Simular pérdida de señal para probar el modo sin internet">Simular sin conexión</button>
           <button class="btn small ghost" id="btnTema" title="Cambiar entre modo claro y oscuro">🌙 Modo oscuro</button>
           <span class="chip user-chip"><span class="who"><span id="loggedUserName">—</span><small id="loggedUserRole"></small></span></span>
@@ -1065,7 +1073,7 @@
       <h2 class="font-display" style="margin-bottom:0.2rem;">Mi trabajo</h2>
       <p style="color:var(--text-muted); margin:0 0 1rem;" id="miTrabajoSub">Acceso para mecánicos.</p>
       <div class="card" id="miTrabajoAlcance" style="margin-bottom:1rem;">
-        <p style="margin:0; color:var(--text-muted);">La asignación y sincronización de trabajos entre dispositivos estará disponible en una versión posterior.</p>
+        <p style="margin:0; color:var(--text-muted);">Aquí aparecen los trabajos que el administrador te asigna. Lo que avances se guarda aunque no haya señal y se envía solo al volver la red.</p>
       </div>
       <h3 class="font-display" style="font-size:0.95rem; margin:0 0 0.5rem;">Mis citas</h3>
       <div id="miTrabajoCitas"></div>
@@ -1082,6 +1090,8 @@
           <p>Un vistazo rápido al taller — se recalcula solo con lo que ya tienes guardado.</p>
         </div>
       </div>
+      <!-- SYNC-10: este teléfono guarda datos de la 3.13 que todavía no están en la nube: nunca quedan invisibles -->
+      <div class="aviso-fuerte" id="aviso313" style="display:none; margin-bottom:1rem;"></div>
 
       <div class="qa-wrap">
         <div class="qa-group">
@@ -1172,6 +1182,9 @@
         </div>
         <div class="photos" id="detalleFotos"></div>
       </div>
+
+      <!-- SYNC-6: solo para Mi Trabajo — nombre y cantidad, nunca precio/costo (renderDetalleItemsTecnico en app.js) -->
+      <div id="detalleItemsTecnico" style="display:none;"></div>
 
       <div id="stageContent"></div>
 
@@ -1487,14 +1500,21 @@
         <p class="hint" style="margin:0.35rem 0 0;" id="ultimoRespaldoInfo"></p>
       </div>
 
-      <div class="card" style="margin-top:1rem;">
+      <div class="card" style="margin-top:1rem; display:none;" id="cardImport313">
+        <h3 class="font-display" style="font-size:0.95rem; margin-bottom:0.4rem;">Pasar los datos de la versión 3.13 a la nube</h3>
+        <p class="hint" style="margin-top:0;">Lleva a la nube lo que el taller guardaba en el teléfono. Primero te mostramos qué trae y nada se sube hasta que confirmes. El teléfono y el archivo no se borran.</p>
+        <p class="hint" id="import313Estado" style="margin:0 0 0.6rem;"></p>
+        <button type="button" class="btn primary small" id="btnAbrirImport313">Revisar e importar</button>
+      </div>
+
+      <div class="card" style="margin-top:1rem;" id="cardRestaurar">
         <h3 class="font-display" style="font-size:0.95rem; margin-bottom:0.4rem;">Restaurar desde un respaldo</h3>
         <p class="hint" style="margin-top:0;">Elige el archivo y te mostramos qué trae antes de tocar nada. Después decides si reemplaza lo que hay o si se suma.</p>
         <label class="btn small" for="inputRestaurar" style="cursor:pointer; display:inline-block;">Elegir archivo de respaldo</label>
         <input type="file" id="inputRestaurar" accept="application/json,.json" style="display:none;">
       </div>
 
-      <div class="card" style="margin-top:1rem;">
+      <div class="card" style="margin-top:1rem;" id="cardEmpezarDeCero">
         <h3 class="font-display" style="font-size:0.95rem; margin-bottom:0.4rem;">Empezar de cero</h3>
         <p class="hint" style="margin-top:0;">Borra TODA la información de este dispositivo (clientes, órdenes, ventas, caja, todo) y vuelve a preguntar cómo arrancar. No se puede deshacer.</p>
         <button type="button" class="btn ghost danger small" id="btnEmpezarDeCero">Borrar todo y empezar de cero</button>
@@ -1993,6 +2013,7 @@
     </div>
     <div class="modal-actions">
       <button class="btn ghost" id="btnCerrarRepuestoDetalle">Cerrar</button>
+      <button class="btn ghost" id="btnAjustarStock" style="display:none;">Ajustar stock</button>
       <button class="btn primary" id="btnEditarRepuesto">Editar</button>
     </div>
   </div>
@@ -2009,6 +2030,36 @@
     <div class="modal-actions">
       <button class="btn ghost" id="btnCancelarAdminCode">Cancelar</button>
       <button class="btn primary" id="btnConfirmarAdminCode">Confirmar</button>
+    </div>
+  </div>
+</div>
+
+<!-- Modal: autorización con PIN del administrador (SYNC-7, D-7) — para anular/devolver/reversar
+     dinero o stock desde una cuenta de cajero. El PIN NUNCA se guarda: solo vive en este campo
+     mientras el modal está abierto (ver pin-ui.js). -->
+<div class="modal-bg" id="modalPinAutorizar">
+  <div class="modal">
+    <h3>Autorización del administrador</h3>
+    <p class="hint" style="margin-top:0;" id="pinAutorizarMsg">Esta acción requiere autorización del administrador.</p>
+    <label>PIN (6 dígitos)</label>
+    <input type="password" id="pinAutorizarInput" inputmode="numeric" pattern="[0-9]*" maxlength="6" autocomplete="off">
+    <p class="gate-error" id="pinAutorizarError"></p>
+    <div class="modal-actions">
+      <button class="btn ghost" id="btnPinAutorizarCancelar">Cancelar</button>
+      <button class="btn primary" id="btnPinAutorizarOk">Confirmar</button>
+    </div>
+  </div>
+</div>
+
+<!-- SYNC-8: lo que la nube no pudo aplicar sola (rechazos, conflictos, dependencias, stock en revisión).
+     Mínimo a propósito: qué pasó, con qué, cuándo — nunca montos ni datos enviados. -->
+<div class="modal-bg" id="modalRevisionSync">
+  <div class="modal">
+    <h3>Cambios por revisar</h3>
+    <p class="hint" style="margin-top:0;" id="revisionSyncResumen"></p>
+    <div id="revisionSyncLista"></div>
+    <div class="modal-actions">
+      <button class="btn ghost" id="btnRevisionSyncCerrar">Cerrar</button>
     </div>
   </div>
 </div>
@@ -2154,6 +2205,31 @@
      Restaurar es la operación más destructiva del sistema, así que nunca ocurre
      sin que la persona vea antes exactamente qué va a entrar y qué va a pasar
      con lo que ya tiene. -->
+<!-- SYNC-10 · importador 3.13 → nube: fuente → validación → vista previa (solo cantidades) → confirmación → resultado -->
+<div class="modal-bg" id="modalImport313">
+  <div class="modal">
+    <h3>Pasar los datos de la 3.13 a la nube</h3>
+    <div id="imp313Fuente">
+      <p class="hint" style="margin-top:0;">¿De dónde salen los datos? Nada se sube todavía.</p>
+      <div style="display:flex; gap:0.5rem; flex-wrap:wrap;">
+        <button type="button" class="btn small" id="btnImp313Local">📱 Los de este teléfono</button>
+        <label class="btn small" for="inputImp313" style="cursor:pointer; display:inline-block;">📄 Un archivo de respaldo</label>
+        <input type="file" id="inputImp313" accept="application/json,.json" style="display:none;">
+      </div>
+    </div>
+    <p class="hint" id="imp313Origen"></p>
+    <div class="respaldo-estado" id="imp313Resumen" style="display:none;"></div>
+    <div class="aviso-fuerte" id="imp313Avisos" style="display:none;"></div>
+    <div class="aviso-fuerte" id="imp313Destino" style="display:none;"></div>
+    <div class="respaldo-estado" id="imp313Resultado" style="display:none;"></div>
+    <div class="modal-actions">
+      <button class="btn ghost" id="btnCerrarImp313">Cerrar</button>
+      <button class="btn primary" id="btnConfirmarImp313" style="display:none;">Importar a la nube</button>
+      <button class="btn" id="btnFinalizarImp313" style="display:none;">Todo cuadra: dar por terminada</button>
+    </div>
+  </div>
+</div>
+
 <div class="modal-bg" id="modalRestaurar">
   <div class="modal">
     <h3>Restaurar copia de seguridad</h3>
@@ -2356,22 +2432,38 @@
      la app sigue funcionando igual. Ver config-local.example.js. -->
 <!-- Declara si esta copia es el taller o «Mi Trabajo». Va primero: app.js lo
      lee al arrancar. Ver build-target.js. -->
-<script src="build-target.js?v=3.13.0"></script>
+<script src="build-target.js?v=3.14.0"></script>
 <!-- Capa de Supabase. Si supabase-config.js no existe o está sin rellenar, los
      cuatro se cargan igual y no hacen nada: la app sigue funcionando entera con
      IndexedDB, como hasta ahora. -->
-<script src="supabase-config.js?v=3.13.0"></script>
-<script src="supabase-client.js?v=3.13.0"></script>
-<script src="auth.js?v=3.13.0"></script>
-<script src="recovery.js?v=3.13.0"></script>
-<script src="config-local.js?v=3.13.0"></script>
+<script src="supabase-config.js?v=3.14.0"></script>
+<script src="supabase-client.js?v=3.14.0"></script>
+<script src="auth.js?v=3.14.0"></script>
+<script src="recovery.js?v=3.14.0"></script>
+<script src="config-local.js?v=3.14.0"></script>
+<!-- Núcleo de sincronización (SYNC-4) + mappers reales (SYNC-5). Apagado por
+     defecto (ver sync-engine.js): sin ENTIMOTORS_SYNC.enabled === true, que
+     app.js solo pone en true dentro de prepararModoNube() para una sesión de
+     Supabase activa, no abren ninguna base ni hacen ninguna petición. -->
+<script src="sync-rest.js?v=3.14.0"></script>
+<script src="sync-db.js?v=3.14.0"></script>
+<script src="sync-engine.js?v=3.14.0"></script>
+<script src="sync-mappers.js?v=3.14.0"></script>
+<script src="sync-fotos.js?v=3.14.0"></script>
+<!-- SYNC-7B: dinero y stock por RPC en modo nube (antes de app.js: prepararModoNube la arma) -->
+<script src="sync-finanzas.js?v=3.14.0"></script>
+<!-- Autorización con PIN administrativo (SYNC-7, D-7): habla con el api-server, nunca con Supabase
+     directo. Va antes de app.js porque prepararModoNube() la inicializa (PinUI.prepararInstancia). -->
+<script src="pin-ui.js?v=3.14.0"></script>
+<!-- SYNC-10: importador 3.13 → nube (validación, vista previa, paquete atómico) -->
+<script src="import-313.js?v=3.14.0"></script>
 <!-- el ?v= debe cambiar cada vez que se toque app.js (junto con CACHE_NAME en
      sw.js) — es la forma más universal de forzar que CUALQUIER navegador
      pida el archivo de nuevo aunque ya tenga guardada una copia vieja en su
      propio caché HTTP, sin depender de que respete el Service Worker. -->
-<script src="app.js?v=3.13.0"></script>
+<script src="app.js?v=3.14.0"></script>
 <!-- Pantalla «Usuarios y equipo»: habla con el api-server, no con IndexedDB.
      Va después de app.js porque solo se invoca al abrir esa vista. -->
-<script src="usuarios.js?v=3.13.0"></script>
+<script src="usuarios.js?v=3.14.0"></script>
 </body>
 </html>
