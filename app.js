@@ -222,6 +222,55 @@ function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 function money(n) { return `L. ${(Number(n) || 0).toFixed(2)}`; }
+
+/* Iconos del sprite SVG de index.html (UI-1C). Lista CERRADA: icono() solo
+   devuelve marcado para estos nombres —los <symbol id="i-…"> del sprite— y
+   para cualquier otra cosa devuelve "". El nombre nunca se interpola si no está
+   en la lista, así que ningún dato (ni HTML ni SVG ajeno) puede colarse por aquí.
+   Decorativo: aria-hidden y focusable=false; la etiqueta la pone el texto del botón. */
+const ICONOS = Object.freeze([
+  "tpv", "cotizacion", "orden", "cita", "moto", "cliente", "persona", "usuarios", "inventario", "finanzas",
+  "credito", "mantenimiento", "web", "ajustes", "stock-bajo", "dashboard", "catalogo", "trabajos", "videos",
+  "menu", "buscar", "notificaciones", "inicio", "sol", "luna", "alerta", "cerrar", "volver",
+  "check", "espera", "lista", "mensaje", "carpeta", "calendario", "billete",
+  "candado", "ojo", "ojo-tachado",
+]);
+const ICONOS_VALIDOS = new Set(ICONOS);
+function icono(nombre) {
+  if (typeof nombre !== "string" || !ICONOS_VALIDOS.has(nombre)) return "";
+  return `<svg class="ic" aria-hidden="true" focusable="false"><use href="#i-${nombre}"></use></svg>`;
+}
+
+/* SECURITY-1E · constantes y estado de «Ajustes → Seguridad» (el código está junto a renderAjustes). Van aquí arriba porque
+   showView() y aplicarPermisosPorRol() las usan y pueden ejecutarse durante el arranque, antes de llegar a esa parte del archivo. */
+const CLAVE_MIN_CARACTERES = 12;
+const CLAVE_MAX_BYTES = 72;
+const CAMPOS_CLAVE = ["claveActual", "claveNueva", "claveConfirmar"];
+const CLAVE_TIMEOUT_MS = 45000;      // el servidor hace hasta 3 llamadas de 8 s a Auth (+ reintentos) antes de responder
+const MENSAJES_CLAVE = Object.freeze({
+  OK: "Contraseña actualizada correctamente.",
+  OK_OTRAS: "Contraseña actualizada correctamente. Las demás sesiones de administrador fueron cerradas.",
+  CAMPOS_VACIOS: "Completa los tres campos.",
+  CLAVE_INCORRECTA: "La contraseña actual no es correcta.",
+  CLAVE_DEBIL: "La nueva contraseña no cumple los requisitos: al menos 12 caracteres, sin «entimotors», tu nombre ni tu usuario, y nada común ni repetitivo.",
+  CLAVE_CORTA: "La nueva contraseña debe tener al menos 12 caracteres.",
+  CLAVE_LARGA: "La nueva contraseña es demasiado larga (máximo 72 bytes, unos 72 caracteres sin acentos).",
+  CLAVES_NO_COINCIDEN: "La confirmación no coincide con la nueva contraseña.",
+  CLAVE_IGUAL_A_LA_ACTUAL: "La nueva contraseña debe ser distinta de la actual.",
+  SESION_INVALIDA: "Tu sesión ya no es válida. Cierra sesión, vuelve a entrar e inténtalo de nuevo.",
+  CAMBIO_EN_CURSO: "Ya hay un cambio de contraseña en curso. Espera un momento antes de volver a intentarlo.",
+  DEMASIADOS_INTENTOS: "Demasiados intentos. Por seguridad, espera antes de volver a intentarlo.",
+  AUTH_NO_DISPONIBLE: "El servicio de cuentas no está disponible en este momento. Inténtalo de nuevo dentro de unos minutos.",
+  DESCONOCIDO: "No se pudo confirmar el cambio. Prueba a entrar más tarde con la contraseña nueva; si no funciona, sigue siendo la anterior.",
+  SOLO_ADMIN: "Solo un administrador activo puede cambiar esta contraseña.",
+  SIN_CONEXION: "Necesitas conexión a Internet para cambiar la contraseña. No se envió nada.",
+  GENERICO: "No se pudo cambiar la contraseña. Inténtalo de nuevo más tarde.",
+});
+
+let enviandoClave = false;          // un solo envío a la vez (además del botón deshabilitado)
+let claveEsperaHasta = 0;           // Retry-After del servidor: el botón no se reactiva antes
+let claveEsperaTimer = null;
+
 function fileToDataUrl(file) {
   return new Promise((resolve) => {
     const r = new FileReader();
@@ -2076,6 +2125,7 @@ function entrarConSesion(session) {
 document.getElementById("btnLogout").addEventListener("click", async () => {
   // Cerrar sesión NO borra nada del taller: ni clientes, ni inventario, ni
   // órdenes, ni la configuración. Solo se va la sesión.
+  limpiarFormClave();   // SECURITY-1E: nada escrito en Ajustes → Seguridad sobrevive al cierre de sesión
   if (window.Auth && Auth.estado().conSesion) { try { await Auth.cerrarSesion(); } catch (e) {} }
   localStorage.removeItem("enti_session");
   location.reload();
@@ -2092,7 +2142,12 @@ function temaActual() {
 function actualizarBotonTema() {
   const btn = document.getElementById("btnTema");
   if (!btn) return;
-  btn.textContent = temaActual() === "dark" ? "☀️ Modo claro" : "🌙 Modo oscuro";
+  // sin innerHTML: el SVG ya está en index.html; aquí solo cambian el símbolo y el texto
+  const oscuro = temaActual() === "dark";
+  document.getElementById("btnTemaIcono")?.setAttribute("href", oscuro ? "#i-sol" : "#i-luna");
+  const texto = document.getElementById("btnTemaTexto");
+  if (texto) texto.textContent = oscuro ? "Modo claro" : "Modo oscuro";
+  else btn.textContent = oscuro ? "Modo claro" : "Modo oscuro";
 }
 document.getElementById("btnTema").addEventListener("click", () => {
   const nuevo = temaActual() === "dark" ? "light" : "dark";
@@ -2124,6 +2179,8 @@ function showView(name) {
     toast("No tienes acceso a esa sección", "off");
     return false;   // quien despacha no debe renderizar la vista tampoco
   }
+  // SECURITY-1E: al salir de Ajustes no queda ninguna contraseña escrita ni a la vista
+  if (name !== "ajustes") limpiarFormClave();
   document.querySelectorAll(".view").forEach(v => v.classList.remove("active"));
   document.getElementById(`view-${name}`).classList.add("active");
   document.querySelectorAll(".nav-item[data-view]").forEach(b => b.classList.toggle("active", b.dataset.view === name));
@@ -2190,7 +2247,7 @@ document.getElementById("buscarGlobalInput").addEventListener("input", async (e)
   clientes.filter(c => c.nombre.toLowerCase().includes(q) || (c.telefono || "").includes(q)).forEach(c => {
     const moto = motos.find(m => m.clienteId === c.id);
     resultados.push({
-      ic: "👤", tipo: "Cliente", titulo: c.nombre,
+      ic: "persona", tipo: "Cliente", titulo: c.nombre,
       sub: moto ? `${moto.marca} ${moto.modelo} · ${moto.placa || "sin placa"}` : "sin moto registrada",
       onClick: () => { cerrarBuscadorGlobal(); showView("clientes"); renderClientes(); openClienteDetalle(c.id); },
     });
@@ -2198,14 +2255,14 @@ document.getElementById("buscarGlobalInput").addEventListener("input", async (e)
   motos.filter(m => (m.placa || "").toLowerCase().includes(q) && !(m.clienteId && clientes.find(c => c.id === m.clienteId && c.nombre.toLowerCase().includes(q)))).forEach(m => {
     const cliente = clientes.find(c => c.id === m.clienteId);
     resultados.push({
-      ic: "🏍️", tipo: "Moto", titulo: `${m.marca} ${m.modelo} — ${m.placa || "sin placa"}`, sub: cliente?.nombre || "sin cliente asociado",
+      ic: "moto", tipo: "Moto", titulo: `${m.marca} ${m.modelo} — ${m.placa || "sin placa"}`, sub: cliente?.nombre || "sin cliente asociado",
       onClick: () => { cerrarBuscadorGlobal(); showView("clientes"); renderClientes(); if (cliente) openClienteDetalle(cliente.id); },
     });
   });
   ordenes.filter(o => (o.falla || "").toLowerCase().includes(q)).forEach(o => {
     const cliente = clientes.find(c => c.id === o.clienteId);
     resultados.push({
-      ic: "🧾", tipo: "Orden", titulo: `Orden #${o.id} — ${STAGES.find(s => s.key === o.estado)?.label || o.estado}`, sub: cliente?.nombre || "",
+      ic: "orden", tipo: "Orden", titulo: `Orden #${o.id} — ${STAGES.find(s => s.key === o.estado)?.label || o.estado}`, sub: cliente?.nombre || "",
       onClick: () => { cerrarBuscadorGlobal(); showView("ordenes"); openOrder(o.id); },
     });
   });
@@ -2214,7 +2271,7 @@ document.getElementById("buscarGlobalInput").addEventListener("input", async (e)
       || (c.motoDesc || "").toLowerCase().includes(q)).forEach(c => {
     const est = estadoCotizacion(c);
     resultados.push({
-      ic: "📝", tipo: "Cotización", titulo: `Cotización #${c.id} — ${c.clienteNombre}`,
+      ic: "cotizacion", tipo: "Cotización", titulo: `Cotización #${c.id} — ${c.clienteNombre}`,
       sub: `${COT_ESTADO_LABEL[est]} · ${money(totalCotizacion(c))}`,
       onClick: () => { cerrarBuscadorGlobal(); showView("cotizaciones"); renderCotizaciones(); abrirCotizacionDetalle(c.id); },
     });
@@ -2223,7 +2280,7 @@ document.getElementById("buscarGlobalInput").addEventListener("input", async (e)
     resultados.push({
       // precioVenta es el campo al día; precio queda de respaldo para los
       // registros viejos que se importaron antes de que existiera
-      ic: "📦", tipo: "Repuesto", titulo: r.nombre, sub: `${r.cantidad} en stock · ${money(r.precioVenta ?? r.precio)}`,
+      ic: "inventario", tipo: "Repuesto", titulo: r.nombre, sub: `${r.cantidad} en stock · ${money(r.precioVenta ?? r.precio)}`,
       onClick: () => { cerrarBuscadorGlobal(); showView("inventario"); renderInventario(); openRepuestoDetalle(r.id); },
     });
   });
@@ -2231,7 +2288,7 @@ document.getElementById("buscarGlobalInput").addEventListener("input", async (e)
   box.innerHTML = resultados.length
     ? resultados.slice(0, 20).map((r, i) => `
       <div class="search-result-row" data-i="${i}">
-        <span class="ic">${r.ic}</span>
+        <span class="ic">${icono(r.ic)}</span>
         <div class="txt"><b>${esc(r.titulo)}</b><span class="sub">${esc(r.tipo)}${r.sub ? " · " + esc(r.sub) : ""}</span></div>
       </div>`).join("")
     : `<div class="empty" style="padding:1rem 0;">Sin resultados</div>`;
@@ -2246,19 +2303,19 @@ async function renderNotificaciones() {
   const avisos = [];
 
   citasAll.filter(c => !citaCerrada(c) && citaWhenInfo(c).diffDays === 0).forEach(c => {
-    avisos.push({ ic: "📅", titulo: "Cita hoy", sub: c.motivo || "Sin motivo especificado", onClick: () => { showView("citas"); renderCitasList(); } });
+    avisos.push({ ic: "cita", titulo: "Cita hoy", sub: c.motivo || "Sin motivo especificado", onClick: () => { showView("citas"); renderCitasList(); } });
   });
   motos.filter(m => ["due", "soon"].includes(mantStatus(m).cls)).forEach(m => {
-    avisos.push({ ic: "🛠️", titulo: `Mantenimiento: ${m.marca} ${m.modelo}`, sub: mantStatus(m).cls === "due" ? "Vencido" : "Por vencer", onClick: () => { showView("clientes"); renderClientes(); } });
+    avisos.push({ ic: "mantenimiento", titulo: `Mantenimiento: ${m.marca} ${m.modelo}`, sub: mantStatus(m).cls === "due" ? "Vencido" : "Por vencer", onClick: () => { showView("clientes"); renderClientes(); } });
   });
   inventario.filter(r => r.cantidad <= (r.stockMinimo ?? 3)).forEach(r => {
-    avisos.push({ ic: "📦", titulo: `Stock bajo: ${r.nombre}`, sub: `Quedan ${r.cantidad}`, onClick: () => { showView("inventario"); renderInventario(); } });
+    avisos.push({ ic: "stock-bajo", titulo: `Stock bajo: ${r.nombre}`, sub: `Quedan ${r.cantidad}`, onClick: () => { showView("inventario"); renderInventario(); } });
   });
   // una cotización a punto de vencer es plata que se puede perder por no llamar
   cotizaciones.filter(c => estadoCotizacion(c) === "pendiente" && diasParaVencer(c) <= DIAS_AVISO_VENCIMIENTO).forEach(c => {
     const dias = diasParaVencer(c);
     avisos.push({
-      ic: "📝",
+      ic: "cotizacion",
       titulo: `Cotización por vencer: ${c.clienteNombre}`,
       sub: `${money(totalCotizacion(c))} · ${dias <= 0 ? "vence hoy" : dias === 1 ? "vence mañana" : `vence en ${dias} días`}`,
       onClick: () => { showView("cotizaciones"); renderCotizaciones(); abrirCotizacionDetalle(c.id); },
@@ -2269,7 +2326,7 @@ async function renderNotificaciones() {
   if (avisos.length) { badge.style.display = "flex"; badge.textContent = avisos.length; } else { badge.style.display = "none"; }
 
   document.getElementById("notifLista").innerHTML = avisos.length
-    ? avisos.map((a, i) => `<div class="notif-row" data-i="${i}"><span class="ic">${a.ic}</span><div class="txt"><b>${esc(a.titulo)}</b><span>${esc(a.sub)}</span></div></div>`).join("")
+    ? avisos.map((a, i) => `<div class="notif-row" data-i="${i}"><span class="ic">${icono(a.ic)}</span><div class="txt"><b>${esc(a.titulo)}</b><span>${esc(a.sub)}</span></div></div>`).join("")
     : `<div class="notif-row" style="cursor:default;"><div class="txt"><span>Todo al día — sin avisos pendientes.</span></div></div>`;
   document.getElementById("notifLista").querySelectorAll(".notif-row[data-i]").forEach((el, i) => {
     el.addEventListener("click", () => { avisos[i].onClick(); document.getElementById("notifPanel").classList.remove("open"); });
@@ -2316,8 +2373,9 @@ document.querySelectorAll(".nav-item[data-view]").forEach(btn => {
   });
 });
 
-// botones de "acceso rápido" en la página principal: mismos 8 destinos que el
-// menú hamburguesa, mismo despacho de render.
+// botones de "acceso rápido" en la página principal: mismos destinos que el
+// menú hamburguesa, mismo despacho de render. Cuáles se ven lo decide
+// aplicarPermisosPorRol (puedeVerVista), igual que en el menú.
 document.querySelectorAll(".qa-btn[data-view]").forEach(btn => {
   btn.addEventListener("click", () => {
     if (showView(btn.dataset.view)) renderByView[btn.dataset.view]?.();
@@ -2333,7 +2391,7 @@ function renderWidgetRow(containerId, items) {
   const el = document.getElementById(containerId);
   if (!el) return;
   el.innerHTML = items.map((m, i) => `
-    <button type="button" class="widget-mini ${m.active ? "active" : ""}" data-i="${i}"><span class="ic">${m.ic}</span><span class="val">${m.val}</span><span class="lbl">${esc(m.lbl)}</span></button>
+    <button type="button" class="widget-mini ${m.active ? "active" : ""}" data-i="${i}"><span class="ic">${icono(m.ic)}</span><span class="val">${m.val}</span><span class="lbl">${esc(m.lbl)}</span></button>
   `).join("");
   el.querySelectorAll(".widget-mini").forEach((btn, i) => {
     const item = items[i];
@@ -2452,12 +2510,12 @@ async function renderDashboard() {
     .reduce((s, o) => s + (o.items || []).reduce((ss, it) => ss + it.cantidad * it.precio, 0), 0);
 
   renderWidgetRow("widgetRow", [
-    { ic: "🧾", val: activas, lbl: "Órdenes activas", goto: "ordenes" },
-    { ic: "📝", val: cotizacionesVivas.length, lbl: "Cotizaciones vivas", goto: "cotizaciones" },
-    { ic: "📅", val: citasHoy, lbl: "Citas hoy", goto: "citas" },
-    { ic: "🛠️", val: mantenimientos, lbl: "Mantenimientos", goto: "clientes" },
-    { ic: "📦", val: repuestosBajos, lbl: "Stock bajo", goto: "inventario" },
-    { ic: "👥", val: clientes.length, lbl: "Clientes", goto: "clientes" },
+    { ic: "orden", val: activas, lbl: "Órdenes activas", goto: "ordenes" },
+    { ic: "cotizacion", val: cotizacionesVivas.length, lbl: "Cotizaciones vivas", goto: "cotizaciones" },
+    { ic: "cita", val: citasHoy, lbl: "Citas hoy", goto: "citas" },
+    { ic: "mantenimiento", val: mantenimientos, lbl: "Mantenimientos", goto: "clientes" },
+    { ic: "stock-bajo", val: repuestosBajos, lbl: "Stock bajo", goto: "inventario" },
+    { ic: "usuarios", val: clientes.length, lbl: "Clientes", goto: "clientes" },
   ]);
 
   const stageColor = { recibido: "var(--text-faint)", diagnostico: "var(--amber)", presupuesto: "var(--amber)", reparacion: "var(--red)", calidad: "var(--red)", entregado: "var(--green)" };
@@ -2633,9 +2691,9 @@ async function renderOrdersList() {
   const activas = ordenesAll.filter(o => o.estado !== "entregado");
 
   renderWidgetRow("ordenesWidgetRow", [
-    { ic: "🧾", val: activas.length, lbl: "Activas", active: ordenesFiltro === "activas", onClick: () => { ordenesFiltro = ordenesFiltro === "activas" ? null : "activas"; renderOrdersList(); } },
-    { ic: "✅", val: entregadasMes.length, lbl: "Entregadas este mes", active: ordenesFiltro === "entregadas", onClick: () => { ordenesFiltro = ordenesFiltro === "entregadas" ? null : "entregadas"; renderOrdersList(); } },
-    { ic: "📋", val: ordenesAll.length, lbl: "Total", active: ordenesFiltro === null, onClick: () => { ordenesFiltro = null; renderOrdersList(); } },
+    { ic: "orden", val: activas.length, lbl: "Activas", active: ordenesFiltro === "activas", onClick: () => { ordenesFiltro = ordenesFiltro === "activas" ? null : "activas"; renderOrdersList(); } },
+    { ic: "check", val: entregadasMes.length, lbl: "Entregadas este mes", active: ordenesFiltro === "entregadas", onClick: () => { ordenesFiltro = ordenesFiltro === "entregadas" ? null : "entregadas"; renderOrdersList(); } },
+    { ic: "lista", val: ordenesAll.length, lbl: "Total", active: ordenesFiltro === null, onClick: () => { ordenesFiltro = null; renderOrdersList(); } },
   ]);
 
   let ordenes = ordenesAll;
@@ -3207,7 +3265,7 @@ let ordenClienteSel = null; // { clienteId, motoId|null } cuando se elige un cli
 function renderOrdenClienteChip() {
   const wrap = document.getElementById("ordenClienteChipWrap");
   wrap.innerHTML = ordenClienteSel
-    ? `<span class="selected-chip">Cliente existente seleccionado <button type="button" id="btnQuitarOrdenClienteSel" title="Quitar selección" aria-label="Quitar cliente seleccionado">✕</button></span>`
+    ? `<span class="selected-chip">Cliente existente seleccionado <button type="button" id="btnQuitarOrdenClienteSel" title="Quitar selección" aria-label="Quitar cliente seleccionado">${icono("cerrar")}</button></span>`
     : "";
   document.getElementById("btnQuitarOrdenClienteSel")?.addEventListener("click", () => {
     ordenClienteSel = null;
@@ -3830,10 +3888,10 @@ async function renderCotizaciones() {
 
   const fijarFiltro = (f) => () => { cotizacionesFiltro = cotizacionesFiltro === f ? "todas" : f; renderCotizaciones(); };
   renderWidgetRow("cotizacionesWidgetRow", [
-    { ic: "📝", val: pendientes.length, lbl: "Pendientes", active: cotizacionesFiltro === "pendientes", onClick: fijarFiltro("pendientes") },
-    { ic: "⏳", val: porVencer.length, lbl: "Por vencer", active: cotizacionesFiltro === "porvencer", onClick: fijarFiltro("porvencer") },
-    { ic: "✅", val: aceptadas.length, lbl: "Aceptadas", active: cotizacionesFiltro === "aceptadas", onClick: fijarFiltro("aceptadas") },
-    { ic: "📋", val: todas.length, lbl: "Todas", active: cotizacionesFiltro === "todas", onClick: () => { cotizacionesFiltro = "todas"; renderCotizaciones(); } },
+    { ic: "cotizacion", val: pendientes.length, lbl: "Pendientes", active: cotizacionesFiltro === "pendientes", onClick: fijarFiltro("pendientes") },
+    { ic: "espera", val: porVencer.length, lbl: "Por vencer", active: cotizacionesFiltro === "porvencer", onClick: fijarFiltro("porvencer") },
+    { ic: "check", val: aceptadas.length, lbl: "Aceptadas", active: cotizacionesFiltro === "aceptadas", onClick: fijarFiltro("aceptadas") },
+    { ic: "lista", val: todas.length, lbl: "Todas", active: cotizacionesFiltro === "todas", onClick: () => { cotizacionesFiltro = "todas"; renderCotizaciones(); } },
   ]);
 
   // el badge del menú avisa de lo único que corre prisa: lo que está por vencer
@@ -3891,7 +3949,7 @@ let cotEditandoId = null;   // null = nueva
 function renderCotClienteChip() {
   const wrap = document.getElementById("cotClienteChipWrap");
   wrap.innerHTML = cotClienteSel
-    ? `<span class="selected-chip">Cliente existente seleccionado <button type="button" id="btnQuitarCotClienteSel" title="Quitar selección" aria-label="Quitar cliente seleccionado">✕</button></span>`
+    ? `<span class="selected-chip">Cliente existente seleccionado <button type="button" id="btnQuitarCotClienteSel" title="Quitar selección" aria-label="Quitar cliente seleccionado">${icono("cerrar")}</button></span>`
     : "";
   document.getElementById("btnQuitarCotClienteSel")?.addEventListener("click", () => {
     cotClienteSel = null;
@@ -4574,11 +4632,11 @@ async function renderCitasList() {
   const porCerrar = abiertas.filter(c => citaWhenInfo(c).diffDays < 0);
 
   renderWidgetRow("citasWidgetRow", [
-    { ic: "📅", val: hoy.length, lbl: "Hoy", active: citasFiltro === "hoy", onClick: () => { citasFiltro = citasFiltro === "hoy" ? null : "hoy"; renderCitasList(); } },
-    { ic: "🗓️", val: semana.length, lbl: "Esta semana", active: citasFiltro === "semana", onClick: () => { citasFiltro = citasFiltro === "semana" ? null : "semana"; renderCitasList(); } },
-    { ic: "💬", val: sinRecordatorio.length, lbl: "Sin recordatorio", active: citasFiltro === "sinRecordatorio", onClick: () => { citasFiltro = citasFiltro === "sinRecordatorio" ? null : "sinRecordatorio"; renderCitasList(); } },
-    { ic: "⏳", val: porCerrar.length, lbl: "Por cerrar", active: citasFiltro === "porCerrar", onClick: () => { citasFiltro = citasFiltro === "porCerrar" ? null : "porCerrar"; renderCitasList(); } },
-    { ic: "📂", val: cerradas.length, lbl: "Historial", active: citasFiltro === "historial", onClick: () => { citasFiltro = citasFiltro === "historial" ? null : "historial"; renderCitasList(); } },
+    { ic: "cita", val: hoy.length, lbl: "Hoy", active: citasFiltro === "hoy", onClick: () => { citasFiltro = citasFiltro === "hoy" ? null : "hoy"; renderCitasList(); } },
+    { ic: "calendario", val: semana.length, lbl: "Esta semana", active: citasFiltro === "semana", onClick: () => { citasFiltro = citasFiltro === "semana" ? null : "semana"; renderCitasList(); } },
+    { ic: "mensaje", val: sinRecordatorio.length, lbl: "Sin recordatorio", active: citasFiltro === "sinRecordatorio", onClick: () => { citasFiltro = citasFiltro === "sinRecordatorio" ? null : "sinRecordatorio"; renderCitasList(); } },
+    { ic: "espera", val: porCerrar.length, lbl: "Por cerrar", active: citasFiltro === "porCerrar", onClick: () => { citasFiltro = citasFiltro === "porCerrar" ? null : "porCerrar"; renderCitasList(); } },
+    { ic: "carpeta", val: cerradas.length, lbl: "Historial", active: citasFiltro === "historial", onClick: () => { citasFiltro = citasFiltro === "historial" ? null : "historial"; renderCitasList(); } },
   ]);
 
   // por defecto la lista muestra solo las citas abiertas: las ya atendidas
@@ -4809,7 +4867,7 @@ async function abrirModalEditarCita(citaId) {
 function renderCitaClienteChip() {
   const wrap = document.getElementById("citaClienteChipWrap");
   wrap.innerHTML = citaClienteSel
-    ? `<span class="selected-chip">Cliente existente seleccionado <button type="button" id="btnQuitarCitaClienteSel" title="Quitar selección" aria-label="Quitar cliente seleccionado">✕</button></span>`
+    ? `<span class="selected-chip">Cliente existente seleccionado <button type="button" id="btnQuitarCitaClienteSel" title="Quitar selección" aria-label="Quitar cliente seleccionado">${icono("cerrar")}</button></span>`
     : "";
   document.getElementById("btnQuitarCitaClienteSel")?.addEventListener("click", () => {
     citaClienteSel = null;
@@ -4993,9 +5051,9 @@ async function renderClientes() {
   const conMantenimiento = clientesAll.filter(c => motos.some(m => m.clienteId === c.id && ["due", "soon"].includes(mantStatus(m).cls)));
 
   renderWidgetRow("clientesWidgetRow", [
-    { ic: "👥", val: clientesAll.length, lbl: "Clientes", active: clientesFiltro === null, onClick: () => { clientesFiltro = null; renderClientes(); } },
-    { ic: "🏍️", val: motos.length, lbl: "Motos", active: clientesFiltro === "motos", onClick: () => { clientesFiltro = clientesFiltro === "motos" ? null : "motos"; renderClientes(); } },
-    { ic: "🛠️", val: countMantenimientos(motos), lbl: "Mantenimiento próximo", active: clientesFiltro === "mantenimiento", onClick: () => { clientesFiltro = clientesFiltro === "mantenimiento" ? null : "mantenimiento"; renderClientes(); } },
+    { ic: "usuarios", val: clientesAll.length, lbl: "Clientes", active: clientesFiltro === null, onClick: () => { clientesFiltro = null; renderClientes(); } },
+    { ic: "moto", val: motos.length, lbl: "Motos", active: clientesFiltro === "motos", onClick: () => { clientesFiltro = clientesFiltro === "motos" ? null : "motos"; renderClientes(); } },
+    { ic: "mantenimiento", val: countMantenimientos(motos), lbl: "Mantenimiento próximo", active: clientesFiltro === "mantenimiento", onClick: () => { clientesFiltro = clientesFiltro === "mantenimiento" ? null : "mantenimiento"; renderClientes(); } },
   ]);
 
   let clientes = clientesAll;
@@ -5339,9 +5397,9 @@ async function renderInventario() {
   const valorTotal = invAll.reduce((s, r) => s + r.cantidad * r.precio, 0);
 
   renderWidgetRow("inventarioWidgetRow", [
-    { ic: "📦", val: invAll.length, lbl: "Repuestos", active: inventarioFiltro === null, onClick: () => { inventarioFiltro = null; renderInventario(); } },
-    { ic: "⚠️", val: stockBajo.length, lbl: "Stock bajo", active: inventarioFiltro === "stockBajo", onClick: () => { inventarioFiltro = inventarioFiltro === "stockBajo" ? null : "stockBajo"; renderInventario(); } },
-    { ic: "💰", val: money(valorTotal), lbl: "Valor en inventario" },
+    { ic: "inventario", val: invAll.length, lbl: "Repuestos", active: inventarioFiltro === null, onClick: () => { inventarioFiltro = null; renderInventario(); } },
+    { ic: "stock-bajo", val: stockBajo.length, lbl: "Stock bajo", active: inventarioFiltro === "stockBajo", onClick: () => { inventarioFiltro = inventarioFiltro === "stockBajo" ? null : "stockBajo"; renderInventario(); } },
+    { ic: "billete", val: money(valorTotal), lbl: "Valor en inventario" },
   ]);
 
   const inv = inventarioFiltro === "stockBajo" ? stockBajo : invAll;
@@ -6659,7 +6717,7 @@ let creditoCarrito = []; // { inventarioId|null, nombre, cantidad, precio, stock
 function renderCreditoClienteChip() {
   const wrap = document.getElementById("creditoClienteChipWrap");
   wrap.innerHTML = creditoClienteSel
-    ? `<span class="selected-chip">Cliente existente seleccionado <button type="button" id="btnQuitarCreditoClienteSel" title="Quitar selección" aria-label="Quitar cliente seleccionado">✕</button></span>`
+    ? `<span class="selected-chip">Cliente existente seleccionado <button type="button" id="btnQuitarCreditoClienteSel" title="Quitar selección" aria-label="Quitar cliente seleccionado">${icono("cerrar")}</button></span>`
     : "";
   document.getElementById("btnQuitarCreditoClienteSel")?.addEventListener("click", () => {
     creditoClienteSel = null;
@@ -6853,9 +6911,22 @@ document.getElementById("btnGuardarCMS").addEventListener("click", async () => {
 /* ================= AJUSTES: respaldo, restauración, reset, permisos ================= */
 function aplicarPermisosPorRol() {
   const ocultas = vistasOcultasParaSesion();
-  document.querySelectorAll(".nav-item[data-view]").forEach(btn => {
-    btn.style.display = ocultas.includes(btn.dataset.view) ? "none" : "";
+  /* Menú lateral y accesos rápidos de la página principal preguntan lo mismo, a
+     la misma función: puedeVerVista. Antes solo se filtraba el menú y el cajero
+     veía «Ajustes» y «Gestor de la web» en la página principal (showView lo
+     rechazaba al pulsar). Esconder no autoriza nada: showView vuelve a preguntar. */
+  for (const selector of [".nav-item[data-view]", ".qa-btn[data-view]"]) {
+    document.querySelectorAll(selector).forEach(btn => {
+      btn.style.display = puedeVerVista(btn.dataset.view) ? "" : "none";
+    });
+  }
+  // un grupo de accesos rápidos sin ningún botón a la vista no deja su título suelto
+  document.querySelectorAll(".qa-group").forEach(grupo => {
+    const botones = Array.from(grupo.querySelectorAll(".qa-btn[data-view]"));
+    grupo.style.display = botones.length > 0 && botones.every(b => b.style.display === "none") ? "none" : "";
   });
+  // Ajustes → Seguridad: la misma pregunta (puedeVerVista) + solo el rol admin; esconder no autoriza (el envío vuelve a comprobar)
+  prepararSeguridad();
   // si un mecánico quedó parado en una vista restringida (por ejemplo, sesión
   // anterior era de admin en este mismo dispositivo), lo regresamos al dashboard
   if (ocultas.some(v => document.getElementById(`view-${v}`)?.classList.contains("active"))) {
@@ -6890,7 +6961,219 @@ async function renderAjustes() {
   document.getElementById("cardEmpezarDeCero").style.display = nube ? "none" : "";
   document.getElementById("cardImport313").style.display = nube && currentUser?.rol === "admin" ? "" : "none";
   if (nube && currentUser?.rol === "admin") pintarEstadoImport313();
+  prepararSeguridad();
 }
+
+/* ================= AJUSTES → SEGURIDAD: contraseña del administrador (SECURITY-1E) =================
+   Cliente de PUT /api/admin/clave (SECURITY-1D, ya en producción). El SERVIDOR es la autoridad: comprueba la contraseña
+   actual, la política completa (nombre, correo, comunes, patrones), el límite de intentos y la sesión. Aquí solo se
+   comprueba lo que no necesita ningún dato ajeno —tres campos, confirmación, distinta de la actual, 12 caracteres, 72 bytes,
+   «entimotors»— para no gastar una petición; nada de eso consume intentos en el servidor tampoco.
+   Las contraseñas viven SOLO en los tres <input>: no se copian a ningún almacenamiento (localStorage, sessionStorage,
+   IndexedDB, cookies), no se registran, y se borran al terminar, al salir de Ajustes y al cerrar sesión. El token es el de
+   la sesión actual del Taller (S1, la que el servidor conserva) y nunca se muestra. Una sola petición a la vez. */
+// constantes y estado de este bloque: declarados al principio del archivo (junto a ICONOS), ver «SECURITY-1E · constantes»
+
+/** Validación LOCAL (sin secretos ajenos). null = se puede enviar; si no, { codigo, campo } con el campo a corregir. */
+function validarCambioClave(actual, nueva, confirmacion) {
+  const texto = (v) => (typeof v === "string" ? v : "");
+  actual = texto(actual); nueva = texto(nueva); confirmacion = texto(confirmacion);
+  if (!actual) return { codigo: "CAMPOS_VACIOS", campo: "claveActual" };
+  if (!nueva) return { codigo: "CAMPOS_VACIOS", campo: "claveNueva" };
+  if (!confirmacion) return { codigo: "CAMPOS_VACIOS", campo: "claveConfirmar" };
+  if (nueva !== confirmacion) return { codigo: "CLAVES_NO_COINCIDEN", campo: "claveConfirmar" };
+  if (nueva === actual) return { codigo: "CLAVE_IGUAL_A_LA_ACTUAL", campo: "claveNueva" };
+  if ([...nueva].length < CLAVE_MIN_CARACTERES) return { codigo: "CLAVE_CORTA", campo: "claveNueva" };
+  if (new TextEncoder().encode(nueva).length > CLAVE_MAX_BYTES) return { codigo: "CLAVE_LARGA", campo: "claveNueva" };
+  if (nueva.normalize("NFKD").replace(/[̀-ͯ\s]/g, "").toLowerCase().includes("entimotors")) return { codigo: "CLAVE_DEBIL", campo: "claveNueva" };
+  return null;
+}
+
+/** Retry-After en segundos (entero ≥ 1), o null. Acepta segundos o fecha HTTP; nunca más de 24 h. */
+function segundosDeEspera(cabecera, cuerpo) {
+  let s = Number(cabecera);
+  if (!Number.isFinite(s) && typeof cabecera === "string" && cabecera) s = (Date.parse(cabecera) - Date.now()) / 1000;
+  if (!Number.isFinite(s) || s <= 0) s = Number(cuerpo?.reintentar_en_s);
+  return Number.isFinite(s) && s > 0 ? Math.min(Math.ceil(s), 86400) : null;
+}
+
+/** Traduce la respuesta del servidor a { tipo: ok|error|aviso, codigo, texto, esperaS, limpiar: [campos] }. Solo textos propios:
+    nunca el cuerpo, un stack ni detalles del proveedor. */
+function interpretarRespuestaClave(status, cuerpo, retryAfter) {
+  const codigo = cuerpo && typeof cuerpo.codigo === "string" ? cuerpo.codigo : "";
+  const todos = CAMPOS_CLAVE.slice();
+  if (status === 200 && cuerpo && cuerpo.ok === true) {
+    return { tipo: "ok", codigo: "OK", texto: cuerpo.otras_sesiones_cerradas === true ? MENSAJES_CLAVE.OK_OTRAS : MENSAJES_CLAVE.OK, esperaS: null, limpiar: todos };
+  }
+  const r = (tipo, c, limpiar = todos, esperaS = null) => ({ tipo, codigo: c, texto: MENSAJES_CLAVE[c], esperaS, limpiar });
+  switch (codigo) {
+    case "CLAVE_INCORRECTA": return r("error", "CLAVE_INCORRECTA", ["claveActual"]);
+    case "CLAVE_DEBIL": return r("error", "CLAVE_DEBIL", ["claveNueva", "claveConfirmar"]);
+    case "CLAVES_NO_COINCIDEN": return r("error", "CLAVES_NO_COINCIDEN", ["claveConfirmar"]);
+    case "CLAVE_IGUAL_A_LA_ACTUAL": return r("error", "CLAVE_IGUAL_A_LA_ACTUAL", ["claveNueva", "claveConfirmar"]);
+    case "SIN_SESION": case "SESION_INVALIDA": return r("error", "SESION_INVALIDA");
+    case "SOLO_ADMIN": case "CUENTA_INACTIVA": return r("error", "SOLO_ADMIN");
+    case "CAMBIO_EN_CURSO": return r("aviso", "CAMBIO_EN_CURSO", todos, segundosDeEspera(retryAfter, cuerpo) ?? 60);
+    case "DEMASIADOS_INTENTOS": return r("aviso", "DEMASIADOS_INTENTOS", todos, segundosDeEspera(retryAfter, cuerpo) ?? 900);
+    case "AUTH_NO_DISPONIBLE":
+      return cuerpo?.estado_cambio === "desconocido" ? r("aviso", "DESCONOCIDO") : r("aviso", "AUTH_NO_DISPONIBLE", todos, 60);
+    default: return r("error", "GENERICO");
+  }
+}
+
+const campoClave = (id) => document.getElementById(id);
+
+/** Vuelve a ocultar las tres contraseñas (type=password, icono y nombre accesible «Mostrar contraseña»). */
+function ocultarClaves() {
+  for (const id of CAMPOS_CLAVE) {
+    const input = campoClave(id);
+    if (input) input.type = "password";
+  }
+  document.querySelectorAll(".btn-ver-clave").forEach((btn) => {
+    btn.setAttribute("aria-pressed", "false");
+    btn.setAttribute("aria-label", "Mostrar contraseña");
+    btn.querySelector("use")?.setAttribute("href", "#i-ojo");
+  });
+}
+
+/** Borra los campos indicados (por defecto los tres) y los deja ocultos. */
+function limpiarFormClave(campos = CAMPOS_CLAVE) {
+  for (const id of campos) {
+    const input = campoClave(id);
+    if (input) input.value = "";
+  }
+  ocultarClaves();
+}
+
+function pintarEstadoClave(tipo, texto) {
+  const el = document.getElementById("claveEstado");
+  if (!el) return;
+  if (!texto) { el.textContent = ""; el.removeAttribute("data-tipo"); return; }
+  el.setAttribute("data-tipo", tipo);
+  // no solo color: el símbolo (y el texto) dicen si salió bien o no; el texto va escapado
+  el.innerHTML = `${icono(tipo === "ok" ? "check" : tipo === "aviso" ? "espera" : "alerta")}<span>${esc(texto)}</span>`;
+}
+
+/** Deshabilita/rehabilita el formulario. Con una espera del servidor pendiente, el botón sigue deshabilitado. */
+function bloquearFormClave(bloquear) {
+  const esperando = Date.now() < claveEsperaHasta;
+  const btn = document.getElementById("btnCambiarClave");
+  if (btn) {
+    btn.disabled = bloquear || esperando;
+    btn.setAttribute("aria-busy", bloquear ? "true" : "false");
+    btn.textContent = bloquear ? "Cambiando…" : "Cambiar contraseña";
+  }
+  for (const id of CAMPOS_CLAVE) { const i = campoClave(id); if (i) i.disabled = bloquear; }
+  document.querySelectorAll(".btn-ver-clave").forEach((b) => { b.disabled = bloquear; });
+}
+
+function programarEsperaClave(segundos) {
+  if (!segundos) return;
+  claveEsperaHasta = Date.now() + segundos * 1000;
+  clearTimeout(claveEsperaTimer);
+  claveEsperaTimer = setTimeout(() => { claveEsperaHasta = 0; if (!enviandoClave) bloquearFormClave(false); }, segundos * 1000);
+}
+
+function textoEspera(segundos) {
+  if (!segundos) return "";
+  const min = Math.ceil(segundos / 60);
+  return segundos < 60 ? ` Podrás intentarlo de nuevo en ${segundos} s.` : ` Podrás intentarlo de nuevo en ${min} min.`;
+}
+
+/** Token de la sesión actual (S1). Si caducó, UNA renovación (misma sesión); nunca otro inicio de sesión. */
+async function tokenSesionActual() {
+  if (!window.SupabaseCliente) return null;
+  let s = SupabaseCliente.sesion();
+  if (!s) {
+    try { await SupabaseCliente.refrescarSesion(); } catch (e) { /* sin sesión */ }
+    s = SupabaseCliente.sesion();
+  }
+  return s && typeof s.access_token === "string" && s.access_token ? s.access_token : null;
+}
+
+async function enviarCambioClave() {
+  if (enviandoClave) return;                                      // doble clic / Enter repetido: una sola petición
+  if (Date.now() < claveEsperaHasta) return;
+  if (!(currentUser?.rol === "admin" && puedeVerVista("ajustes"))) return;
+  const [actual, nueva, confirmacion] = CAMPOS_CLAVE.map((id) => campoClave(id)?.value ?? "");
+  const fallo = validarCambioClave(actual, nueva, confirmacion);
+  if (fallo) {
+    ocultarClaves();
+    pintarEstadoClave("error", MENSAJES_CLAVE[fallo.codigo]);
+    campoClave(fallo.campo)?.focus();
+    return;
+  }
+  if (!isOnline()) { ocultarClaves(); pintarEstadoClave("aviso", MENSAJES_CLAVE.SIN_CONEXION); return; }
+  const base = ((window.ENTIMOTORS_SUPABASE || {}).apiUrl || "").replace(/\/+$/, "");
+  if (!base) { ocultarClaves(); pintarEstadoClave("error", MENSAJES_CLAVE.GENERICO); return; }
+
+  enviandoClave = true;
+  bloquearFormClave(true);
+  ocultarClaves();
+  pintarEstadoClave("aviso", "Cambiando la contraseña…");
+  let resultado;
+  try {
+    const token = await tokenSesionActual();
+    if (!token) {
+      resultado = interpretarRespuestaClave(401, { codigo: "SESION_INVALIDA" }, null);
+    } else {
+      const ctl = typeof AbortController === "function" ? new AbortController() : null;
+      const t = ctl ? setTimeout(() => ctl.abort(), CLAVE_TIMEOUT_MS) : null;
+      let res = null, cuerpo = null;
+      try {
+        res = await fetch(`${base}/api/admin/clave`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+          body: JSON.stringify({ clave_actual: actual, clave_nueva: nueva, clave_confirmacion: confirmacion }),
+          cache: "no-store",
+          credentials: "omit",
+          signal: ctl ? ctl.signal : undefined,
+        });
+        const txt = await res.text();
+        try { cuerpo = txt ? JSON.parse(txt) : null; } catch (e) { cuerpo = null; }
+      } finally { if (t) clearTimeout(t); }
+      resultado = interpretarRespuestaClave(res.status, cuerpo, res.headers?.get?.("Retry-After") ?? null);
+    }
+  } catch (e) {
+    // sin respuesta (red o tiempo agotado): el servidor pudo haber aplicado el cambio → no se reintenta, se dice claro
+    resultado = { tipo: "aviso", codigo: "DESCONOCIDO", texto: MENSAJES_CLAVE.DESCONOCIDO, esperaS: null, limpiar: CAMPOS_CLAVE.slice() };
+  } finally {
+    enviandoClave = false;
+  }
+  limpiarFormClave(resultado.limpiar);
+  programarEsperaClave(resultado.esperaS);
+  bloquearFormClave(false);
+  pintarEstadoClave(resultado.tipo, resultado.texto + (resultado.tipo === "aviso" && resultado.codigo !== "DESCONOCIDO" ? textoEspera(resultado.esperaS) : ""));
+  if (resultado.tipo === "error") campoClave(resultado.limpiar[0])?.focus();
+}
+
+/** Muestra/oculta UNA contraseña. Solo cambia el type: el valor no se toca, no se copia, no se lee. */
+function alternarVerClave(btn) {
+  const input = campoClave(btn?.dataset?.campo);
+  if (!input || !CAMPOS_CLAVE.includes(input.id)) return;
+  const mostrar = input.type === "password";
+  input.type = mostrar ? "text" : "password";
+  btn.setAttribute("aria-pressed", mostrar ? "true" : "false");
+  btn.setAttribute("aria-label", mostrar ? "Ocultar contraseña" : "Mostrar contraseña");
+  btn.querySelector("use")?.setAttribute("href", mostrar ? "#i-ojo-tachado" : "#i-ojo");
+}
+
+/** Estado de la tarjeta al entrar en Ajustes: solo para el administrador; con cuenta del taller (nube) el formulario funciona. */
+function prepararSeguridad() {
+  const card = document.getElementById("cardSeguridad");
+  if (!card) return;
+  const visible = !!currentUser && currentUser.rol === "admin" && puedeVerVista("ajustes");
+  card.style.display = visible ? "" : "none";
+  if (!visible) { limpiarFormClave(); pintarEstadoClave(null, ""); return; }
+  const conCuenta = currentUser.origen === "supabase";
+  document.getElementById("claveSinCuenta").style.display = conCuenta ? "none" : "";
+  document.getElementById("formClaveAdmin").style.display = conCuenta ? "" : "none";
+}
+
+document.getElementById("formClaveAdmin")?.addEventListener("submit", (e) => { e.preventDefault(); enviarCambioClave(); });
+document.querySelectorAll(".btn-ver-clave").forEach((btn) => btn.addEventListener("click", () => alternarVerClave(btn)));
+// al irse de la página (o congelarla el navegador) no queda nada escrito
+window.addEventListener("pagehide", () => limpiarFormClave());
 
 /* ---- Buscar actualización ahora ----
    ANTES este botón desregistraba todos los Service Workers, borraba todas las
@@ -6993,7 +7276,7 @@ alHacerClicUnaVez(document.getElementById("btnForzarActualizacion"), buscarActua
    fecha e identificador, para que al restaurarlo se sepa exactamente de dónde
    salió y si el esquema es compatible. */
 
-const VERSION_APP = "3.14.0";
+const VERSION_APP = "3.14.1";
 const VERSION_RESPALDO = 2; // formato del archivo, no de la app
 
 async function armarRespaldo() {

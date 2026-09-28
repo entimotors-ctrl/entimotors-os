@@ -2,7 +2,7 @@
 // cambiando la app todos los días, "caché primero" deja a los dispositivos ya
 // instalados atascados en una versión vieja para siempre — network-first evita
 // eso y de todos modos cae al caché cuando de verdad no hay señal.
-const CACHE_NAME = "entimotors-v3.14.0";
+const CACHE_NAME = "entimotors-v3.14.1";
 // La capa de Supabase va en el SHELL por el mismo motivo que app.js: index.html
 // la carga antes de arrancar, y sin ella la app tardaría o fallaría al abrirse
 // sin señal. config-local.js NO va aquí (es solo de desarrollo y no se publica)
@@ -10,18 +10,18 @@ const CACHE_NAME = "entimotors-v3.14.0";
 const SHELL = ["./", "./index.html",
   // build-target.js va en el SHELL a propósito: sin él, un arranque sin señal
   // no sabría qué producto es esta copia y asumiría el taller.
-  "./build-target.js?v=3.14.0",
-  "./supabase-config.js?v=3.14.0", "./supabase-client.js?v=3.14.0",
-  "./auth.js?v=3.14.0", "./recovery.js?v=3.14.0",
+  "./build-target.js?v=3.14.1",
+  "./supabase-config.js?v=3.14.1", "./supabase-client.js?v=3.14.1",
+  "./auth.js?v=3.14.1", "./recovery.js?v=3.14.1",
   // Núcleo de sincronización (SYNC-4) + mappers reales (SYNC-5) + fotos de Mi Trabajo (SYNC-6): mismo
   // motivo que la capa de Supabase, index.html los carga antes de app.js.
-  "./sync-rest.js?v=3.14.0", "./sync-db.js?v=3.14.0", "./sync-engine.js?v=3.14.0", "./sync-mappers.js?v=3.14.0",
-  "./sync-fotos.js?v=3.14.0", "./sync-finanzas.js?v=3.14.0",
+  "./sync-rest.js?v=3.14.1", "./sync-db.js?v=3.14.1", "./sync-engine.js?v=3.14.1", "./sync-mappers.js?v=3.14.1",
+  "./sync-fotos.js?v=3.14.1", "./sync-finanzas.js?v=3.14.1",
   // Autorización con PIN administrativo (SYNC-7): mismo motivo, index.html la carga antes de app.js.
-  "./pin-ui.js?v=3.14.0",
+  "./pin-ui.js?v=3.14.1",
   // Importador 3.13 → nube (SYNC-10): mismo motivo, index.html lo carga antes de app.js.
-  "./import-313.js?v=3.14.0",
-  "./app.js?v=3.14.0", "./usuarios.js?v=3.14.0",
+  "./import-313.js?v=3.14.1",
+  "./app.js?v=3.14.1", "./usuarios.js?v=3.14.1",
   "./manifest.json", "./icons/icon-192.png", "./icons/logo-watermark-doc.png"];
 
 // Librerías que convierten la factura en imagen/PDF para poder mandarla por
