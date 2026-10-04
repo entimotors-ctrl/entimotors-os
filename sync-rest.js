@@ -103,6 +103,14 @@
         });
     }
 
+    /* 3.15 (Checkpoint 8A): `cfg.refrescar()` dice POR QUÉ no renovó: true = renovó · "temporal" = red/servidor (la sesión sigue:
+       es un fallo de RED para la cola, que reintenta) · "cuenta-desactivada" = Auth lo confirmó · false/otro = sesión rechazada. */
+    function falloRenovar(ok, status) {
+      if (ok === "temporal") return { ok: false, clase: "red", status: 0, codigo: "RENOVACION_PENDIENTE", mensaje: "No se pudo renovar la sesión ahora (sin red o servidor ocupado)." };
+      if (ok === "cuenta-desactivada") return { ok: false, clase: "auth", status: status, codigo: "CUENTA_DESACTIVADA", mensaje: "La cuenta fue desactivada." };
+      return status === 401 ? { ok: false, clase: "auth", status: 401, codigo: "SESION_CADUCADA", mensaje: "La sesión caducó." }
+        : { ok: false, clase: "auth", status: 0, codigo: "SIN_SESION", mensaje: "No hay sesión válida." };
+    }
     /** Petición completa: token, reintento tras 401, clasificación. Nunca lanza. */
     function pedir(metodo, ruta, query, opciones) {
       opciones = opciones || {};
@@ -114,8 +122,8 @@
           // se intenta refrescar UNA vez y, si sigue sin token, es «auth» (la cola se pausa y espera un inicio de sesión).
           if (cfg.getToken && !token) {
             if (!yaRefrescado && cfg.refrescar) {
-              return Promise.resolve(cfg.refrescar()).catch(function () { return false; }).then(function (ok) {
-                return ok ? conToken(true) : { ok: false, clase: "auth", status: 0, codigo: "SIN_SESION", mensaje: "No hay sesión válida." };
+              return Promise.resolve(cfg.refrescar()).catch(function () { return "temporal"; }).then(function (ok) {
+                return ok === true ? conToken(true) : falloRenovar(ok, 0);
               });
             }
             return { ok: false, clase: "auth", status: 0, codigo: "SIN_SESION", mensaje: "No hay sesión válida." };
@@ -123,8 +131,8 @@
           return unaVez(metodo, u, opciones, token).then(function (r) {
             if (r.falloRed) return { ok: false, clase: "red", status: 0, codigo: r.abortado ? "TIMEOUT" : "SIN_RED", mensaje: r.mensaje };
             if (r.status === 401 && !yaRefrescado && cfg.refrescar) {
-              return Promise.resolve(cfg.refrescar()).catch(function () { return false; }).then(function (ok) {
-                return ok ? conToken(true) : { ok: false, clase: "auth", status: 401, codigo: "SESION_CADUCADA", mensaje: "La sesión caducó." };
+              return Promise.resolve(cfg.refrescar()).catch(function () { return "temporal"; }).then(function (ok) {
+                return ok === true ? conToken(true) : falloRenovar(ok, 401);
               });
             }
             if (r.status >= 200 && r.status < 300) {

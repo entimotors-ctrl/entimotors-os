@@ -82,7 +82,8 @@
       if (!res.ok) {
         return { ok: false, motivo: res.status === 401 ? "sin-sesion"
                             : res.status === 403 ? "sin-permiso" : "rechazado",
-                 mensaje: primeraCadena(datos && typeof datos === "object" ? [datos.error, datos.message, datos.msg] : []) || "No se pudo completar la operación.", http: res.status };
+                 mensaje: primeraCadena(datos && typeof datos === "object" ? [datos.error, datos.message, datos.msg] : []) || "No se pudo completar la operación.", http: res.status,
+                 codigo: datos && typeof datos.codigo === "string" ? datos.codigo : null, datos: datos };
       }
       return { ok: true, datos: datos };
     } catch (e) {
@@ -126,7 +127,9 @@
 
     var us = (r.datos && r.datos.usuarios) || [];
     var filas = us.map(function (u) {
-      var acciones = u.esUsted || u.rol === "admin"
+      // 3.15 (Bloque 4): una cuenta ELIMINADA no tiene acciones (no se reactiva ni cambia de rol); su nombre queda en su historial
+      var acciones = u.eliminado ? '<span class="hint">Usuario eliminado</span>'
+        : u.esUsted || u.rol === "admin"
         ? '<span class="hint">—</span>'
         : '<div style="display:flex; gap:0.35rem; flex-wrap:wrap;">' +
             '<select class="u-rol" data-id="' + esc(u.id) + '" style="padding:0.3rem 0.4rem;">' +
@@ -134,8 +137,9 @@
                 return '<option value="' + x.valor + '"' + (u.rol === x.valor ? " selected" : "") + ">" + x.texto + "</option>";
               }).join("") +
             "</select>" +
-            '<button class="btn small ghost u-estado" data-id="' + esc(u.id) + '" data-activo="' + (u.activo ? "1" : "0") + '">' +
-              (u.activo ? "Dar de baja" : "Reactivar") + "</button>" +
+            // «Dar de baja» se sustituye por «Eliminar usuario»; «Reactivar» queda solo para cuentas dadas de baja ANTES de 3.15
+            (u.activo ? "" : '<button class="btn small ghost u-estado" data-id="' + esc(u.id) + '" data-activo="0">Reactivar</button>') +
+            '<button class="btn small ghost danger u-eliminar" data-id="' + esc(u.id) + '" data-nombre="' + esc(u.nombre) + '">Eliminar usuario</button>' +
             '<button class="btn small ghost u-editar" data-id="' + esc(u.id) + '" data-nombre="' + esc(u.nombre) +
               '" data-telefono="' + esc(u.telefono) + '">Editar</button>' +
             /* «Generar enlace» solo para cuentas ACTIVAS: una cuenta dada de baja no puede entrar aunque tenga contraseña nueva,
@@ -148,7 +152,7 @@
         "<td>" + esc(u.correo) + "</td>" +
         "<td>" + (esc(u.telefono) || '<span class="hint">—</span>') + "</td>" +
         "<td>" + esc(NOMBRE_ROL[u.rol] || u.rol) + "</td>" +
-        '<td>' + (u.activo ? "Activo" : '<span style="opacity:.65;">Inactivo</span>') + "</td>" +
+        '<td>' + (u.eliminado ? '<span style="opacity:.65;">Eliminado</span>' : u.activo ? "Activo" : '<span style="opacity:.65;">Inactivo</span>') + "</td>" +
         "<td>" + acciones + "</td></tr>";
     }).join("");
 
@@ -183,8 +187,8 @@
         '<div class="table-scroll"><table><thead><tr>' +
           "<th>Nombre</th><th>Correo</th><th>Teléfono</th><th>Rol</th><th>Estado</th><th>Acciones</th>" +
         "</tr></thead><tbody>" + filas + "</tbody></table></div>" +
-        '<p class="hint" style="margin:0.6rem 0 0;">Dar de baja no borra nada: la persona deja de poder entrar, ' +
-        "pero su historial en órdenes, ventas y bitácora se queda como está.</p>" +
+        '<p class="hint" style="margin:0.6rem 0 0;">Eliminar usuario no borra su historial: la persona deja de poder entrar (en todos sus ' +
+        "dispositivos), pero sus órdenes, ventas, caja, mensajes y bitácora se quedan como están, con su nombre. Pide el PIN del propietario.</p>" +
       "</div>";
 
     enganchar();
@@ -260,7 +264,78 @@
     if (r.motivo === "sin-permiso") return "Solo el administrador puede gestionar usuarios.";
     if (r.motivo === "enlace-invalido") return "El servidor no devolvió un enlace utilizable. Inténtalo de nuevo.";
     if (r.motivo === "copia-fallida") return "No se pudo copiar automáticamente. Selecciona el enlace y cópialo a mano.";
+    // 3.15 (Bloque 4) · Eliminar usuario
+    if (r.motivo === "sin-conexion-eliminar") return "Sin conexión: eliminar un usuario necesita conexión para la autorización segura. No se hizo nada.";
+    if (r.motivo === "no-disponible" || r.motivo === "sin-pin-ui") return "La autorización con PIN no está disponible en este momento. No se hizo nada.";
+    if (r.motivo === "trabajo-activo") return "Tiene trabajo activo nuevo: vuelve a intentarlo para ver el detalle.";
+    if (r.motivo === "autorizacion-invalida") return "La autorización con PIN no es válida o caducó. Vuelve a intentarlo.";
+    if (r.motivo === "no-eliminable") return "Esa cuenta no se puede eliminar desde aquí.";
+    if (r.motivo === "no-existe") return "Ese usuario ya no existe.";
+    if (r.motivo === "acceso-sin-cerrar") return "Se eliminó en ENTIMOTORS (ya no ve ningún dato), pero no se pudo cerrar su acceso en el servidor de cuentas. Vuelve a intentarlo.";
     return r.mensaje || "No se pudo completar la operación.";
+  }
+
+  /* ── 3.15 (Bloque 4) · ELIMINAR USUARIO ──────────────────────────────────────────────────────────────────────────────────────
+     1) impacto (servidor): trabajo activo e historial · 2) decisión explícita: si tiene trabajo activo, queda «Sin asignar» para que lo
+     reasigne el admin (nunca se pasa solo a otra persona) · 3) PIN del propietario (autorización de un solo uso para ESTA persona, esta
+     sesión y este dispositivo) · 4) eliminar. Un op_id por intento: el doble clic, el reintento y la respuesta perdida dan UNA operación.
+     Sin conexión no se hace nada. */
+  function nuevoOp() {
+    var c = global.crypto;
+    if (c && typeof c.randomUUID === "function") return c.randomUUID();
+    return global.SyncDB && typeof SyncDB.uuid === "function" ? SyncDB.uuid() : null;
+  }
+  async function idDispositivo() {
+    try { return typeof syncBd !== "undefined" && syncBd ? await syncBd.deviceId() : null; } catch (e) { return null; }
+  }
+  async function eliminarUsuario(boton, id, nombre) {
+    if (enCurso) return;
+    var r;
+    if (navigator.onLine === false) { r = { ok: false, motivo: "sin-conexion-eliminar" }; aviso(textoPlanoDeFallo(r)); return; }
+    if (typeof showConfirm !== "function") { r = { ok: false, motivo: "no-disponible" }; aviso(textoPlanoDeFallo(r)); return; }
+    enCurso = true; if (boton) boton.disabled = true;
+    try {
+      r = await pedir("GET", "/" + id + "/impacto");
+      if (!r.ok) { aviso(textoPlanoDeFallo(r)); return; }
+      var x = (r.datos && r.datos.impacto) || {};
+      var ords = (x.ordenes_activas || []).length, cits = (x.citas_abiertas || []).length, h = x.historial || {};
+      var activo = ords + cits;
+      var texto = nombre + " perderá el acceso a ENTIMOTORS en todos sus dispositivos: sus sesiones se cerrarán y ya no podrá entrar.\n\n" +
+        "Su historial NO se borra: " + (h.ordenes || 0) + " orden(es), " + (h.ventas || 0) + " venta(s), " + (h.caja || 0) + " movimiento(s) de caja y " +
+        (h.mensajes || 0) + " mensaje(s) se conservan con su nombre." +
+        (activo ? "\n\nTiene trabajo ACTIVO: " + ords + " orden(es) abierta(s) y " + cits + " cita(s) pendiente(s). Quedarán «Sin asignar» para que " +
+          "las reasignes tú; nadie las recibe automáticamente. Si prefieres reasignarlas antes, cancela." : "") +
+        "\n\nDespués se pedirá el PIN del propietario.";
+      var ok = await showConfirm(texto, { titulo: "Eliminar usuario", textoOk: activo ? "Desasignar " + activo + " y eliminar" : "Eliminar usuario" });
+      if (!ok) return;
+      if (!global.PinUI) { r = { ok: false, motivo: "sin-pin-ui" }; aviso(textoPlanoDeFallo(r)); return; }
+      var dev = await idDispositivo();
+      var aut = await PinUI.autorizarAccion({ accion: "eliminar_usuario", rol: "admin", registroId: id, deviceId: dev });
+      if (!aut || !aut.ok) return;   // PinUI ya explicó el motivo (PIN incorrecto, bloqueado, sin PIN configurado…)
+      var cuerpo = { op_id: nuevoOp(), autorizacion_id: aut.autorizacion_id, device_id: dev, desasignar: activo > 0 };
+      r = await pedir("POST", "/" + id + "/eliminar", cuerpo);
+      // respuesta perdida (red/tiempo): se repite UNA vez con el MISMO op_id; si ya se aplicó, el servidor devuelve lo mismo
+      if (!r.ok && (r.motivo === "sin-conexion" || r.motivo === "tiempo-agotado")) r = await pedir("POST", "/" + id + "/eliminar", cuerpo);
+      for (var intento = 0; !r.ok && r.http === 502 && r.datos && r.datos.eliminado && intento < 2; intento++) {
+        // eliminado en ENTIMOTORS pero el servidor de cuentas no respondió: se reintenta el cierre de acceso (sin pedir otra vez el PIN)
+        if (!(await showConfirm(r.mensaje + " ¿Reintentar ahora?", { titulo: "Cerrar su acceso", textoOk: "Reintentar" }))) break;
+        r = await pedir("POST", "/" + id + "/eliminar", cuerpo);
+      }
+      if (!r.ok) {
+        // los rechazos de esta acción tienen texto FIJO local (el del servidor no se refleja): ver textoPlanoDeFallo
+        var MOTIVO_ELIMINAR = { TRABAJO_ACTIVO: "trabajo-activo", AUTORIZACION_INVALIDA: "autorizacion-invalida", AUTORIZACION_REQUERIDA: "autorizacion-invalida",
+          NO_PERMITIDO: "no-eliminable", PROPIA_CUENTA: "no-eliminable", NO_EXISTE: "no-existe" };
+        if (MOTIVO_ELIMINAR[r.codigo]) r = { ok: false, motivo: MOTIVO_ELIMINAR[r.codigo] };
+        else if (r.http === 502) r = { ok: false, motivo: "acceso-sin-cerrar" };
+        aviso(textoPlanoDeFallo(r));
+        return;
+      }
+      var d = r.datos || {};
+      bien(nombre + " ya no puede entrar" + (d.sesiones_revocadas ? " (" + d.sesiones_revocadas + " sesión(es) cerrada(s))" : "") +
+        ". Su historial se conserva." + ((d.ordenes_desasignadas || []).length + (d.citas_desasignadas || []).length
+          ? " Quedaron sin asignar " + (d.ordenes_desasignadas || []).length + " orden(es) y " + (d.citas_desasignadas || []).length + " cita(s)." : ""));
+      render();
+    } finally { enCurso = false; if (boton) boton.disabled = false; }
   }
 
   function enganchar() {
@@ -291,6 +366,10 @@
         bien(b.dataset.activo === "1" ? "Usuario dado de baja" : "Usuario reactivado");
         render();
       });
+    });
+
+    document.querySelectorAll(".u-eliminar").forEach(function (b) {
+      b.addEventListener("click", function () { eliminarUsuario(b, b.dataset.id, b.dataset.nombre); });
     });
 
     document.querySelectorAll(".u-editar").forEach(function (b) {

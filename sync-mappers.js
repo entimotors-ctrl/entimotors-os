@@ -118,10 +118,10 @@
  *       - subida: una RPC idempotente (sync_guardar_items_cotizacion, SYNC-5,
  *         mismo patrón sync_op_iniciar/sync_op_guardar que agregar_item_orden)
  *         reemplaza TODOS los renglones. item.inventarioId es un id LOCAL
- *         (entero, propio del dispositivo) — como `inventario` no se sincroniza
- *         todavía, no hay forma de resolverlo a un uid de nube: se manda
- *         inventario_id = null a propósito (limitación conocida, no se inventa
- *         una referencia cruzada que no existe).
+ *         (entero, propio del dispositivo). 3.15 (Bloque 1A): desde SYNC-7A el
+ *         inventario sí se sincroniza, así que el renglón viaja con el uid de nube
+ *         del repuesto (mapa local↔uid) y baja resuelto al id local (refsALocal).
+ *         Antes se mandaba inventario_id = null y la conversión perdía el vínculo.
  * ==========================================================================*/
 (function (global) {
   "use strict";
@@ -238,7 +238,7 @@
     cotizaciones: {
       entidad: "cotizaciones", tabla: "cotizaciones", store: "cotizaciones",
       // embebe los renglones hijos en la misma bajada (ver la nota de cabecera): no hay entidad "cotizacion_items".
-      select: "*,cotizacion_items(id,inventario_id,nombre,cantidad,precio)",
+      select: "*,cotizacion_items(id,inventario_id,tipo,nombre,cantidad,precio)",
       columnas: ["cliente_nombre", "cliente_telefono", "moto_desc", "diagnostico", "notas", "validez_dias", "vence_en", "estado"],
       tiempos: ["vence_en"],
       fks: [{ local: "clienteId", cloud: "cliente_id", entidad: "clientes" }, { local: "motoId", cloud: "moto_id", entidad: "motos" }],
@@ -262,10 +262,33 @@
         };
         // SYNC-8: solo si la fila trae los renglones embebidos (la descarga). La respuesta de un PATCH de la cabecera no
         // los trae: devolver [] ahí borraba de la caché los renglones que sí existen.
+        // 3.15 (Bloque 1A): el renglón conserva el repuesto de origen por su uid de nube (inventario_id); refsALocal lo
+        // traduce al id local del repuesto. Un renglón manual baja con inventarioUid = null. El precio es el del renglón
+        // (histórico), nunca el precio actual del producto.
         if (Array.isArray(r.cotizacion_items)) c.items = r.cotizacion_items.map(function (it) {
-          return { nombre: it.nombre, cantidad: Number(it.cantidad), precio: Number(it.precio), inventarioId: null };
+          // 3.15 (Bloque 2): tipo = mano_obra | repuesto_inventario | repuesto_manual | null (renglón viejo sin clasificar)
+          return { nombre: it.nombre, cantidad: Number(it.cantidad), precio: Number(it.precio), inventarioUid: it.inventario_id || null, inventarioId: null,
+            tipo: it.tipo || null };
         });
+        // la conversión la decide el servidor (convertir_cotizacion): bajan de solo lectura, nunca suben por el CRUD
+        if (r.orden_id !== undefined) c.ordenUid = r.orden_id || null;
+        if (r.aceptada_en !== undefined) c.aceptadaEn = r.aceptada_en ? new Date(r.aceptada_en).getTime() : null;
         return c;
+      },
+      soloServidor: ["ordenUid", "aceptadaEn", "ordenId"],
+      // uid de nube → id local, dentro de la misma transacción del pull (el repuesto de cada renglón y la orden resultante)
+      refsALocal: async function (c, resolver) {
+        var out = Object.assign({}, c);
+        if (Array.isArray(c.items)) {
+          var items = [];
+          for (var i = 0; i < c.items.length; i++) {
+            var it = c.items[i];
+            items.push(Object.assign({}, it, { inventarioId: it.inventarioUid ? await resolver(it.inventarioUid) : null }));
+          }
+          out.items = items;
+        }
+        if (c.ordenUid !== undefined) out.ordenId = c.ordenUid ? await resolver(c.ordenUid) : null;
+        return out;
       },
     },
     // SYNC-6: ver la cabecera del archivo — el Taller y Mi Trabajo usan objetos
@@ -273,6 +296,8 @@
     ordenes: esMecanico ? {
       entidad: "ordenes", tabla: "rpc/ordenes_tecnico_mias", store: "ordenes",
       columnas: [], tiempos: [], fks: [],
+      // 3.15 (Bloque 3): la función filtra por asignación → lo que deja de devolver (reasignada) se retira al conciliar (barrer)
+      barrer: true,
       // El mecánico nunca empuja por aquí (ver cabecera): devuelve vacío por si algo llamara a escribir() por error.
       aCloud: function () { return {}; },
       aLocal: function (r) {
@@ -297,8 +322,10 @@
       entidad: "ordenes", tabla: "ordenes", store: "ordenes",
       // Sin fotos a propósito (ver cabecera). SYNC-8: los ítems BAJAN embebidos (solo lectura: suben por
       // agregar_item_orden/quitar_item_orden, nunca por `columnas`).
-      select: "*,orden_items(id,inventario_id,nombre,cantidad,precio,costo_unitario,costo_estimado,creado_en)",
-      soloServidor: ["finalizada", "anulada", "finalizadoEn", "entregadoEn"],
+      select: "*,orden_items(id,inventario_id,tipo,nombre,cantidad,precio,costo_unitario,costo_estimado,cantidad_aplicada,aplicada_legado,creado_en)",
+      // 3.15 (Bloque 2): el estado del presupuesto lo decide SOLO el servidor (decidir_presupuesto_orden / convertir / finalizar): nunca sube
+      // por el CRUD y una aprobación sin confirmar jamás se pinta como aprobada.
+      soloServidor: ["finalizada", "anulada", "finalizadoEn", "entregadoEn", "presupuestoEstado", "aprobadoEn", "rechazadoEn", "aprobacionVia", "fotosNube"],
       columnas: ["estado", "falla", "diagnostico", "reparacion_notas", "calidad_checklist",
         "mecanico", "mecanico_id", "origen_trabajo", "km_salida", "garantia_dias"],
       tiempos: [],
@@ -327,15 +354,27 @@
           finalizada: !!r.finalizada,
           anulada: !!r.anulada,
         };
+        /* 3.15 (Bloque 8): la EVIDENCIA que suben los mecánicos (rutas de Storage en ordenes.fotos, agregar_foto_orden) llega al Taller en un
+           campo APARTE, de solo lectura (no está en `columnas`: nunca sube) y decidido por el servidor. Las fotos propias del Taller
+           (`fotos`, en el dispositivo) no se tocan ni se mezclan. Solo rutas: nada en base64 viaja por aquí. */
+        if (r.fotos !== undefined) c.fotosNube = Array.isArray(r.fotos) ? r.fotos.filter(function (x) { return typeof x === "string" && x.length > 0 && !/^data:/i.test(x); }) : [];
         // SYNC-8: fechas de cobro/entrega (el reporte de producción las usa) solo si la fila las trae
         if (r.finalizado_en !== undefined) c.finalizadoEn = r.finalizado_en ? new Date(r.finalizado_en).getTime() : null;
         if (r.entregado_en !== undefined) c.entregadoEn = r.entregado_en ? new Date(r.entregado_en).getTime() : null;
+        if (r.presupuesto_estado !== undefined) {
+          c.presupuestoEstado = r.presupuesto_estado || "pendiente";
+          c.aprobadoEn = r.aprobado_en ? new Date(r.aprobado_en).getTime() : null;
+          c.rechazadoEn = r.rechazado_en ? new Date(r.rechazado_en).getTime() : null;
+          c.aprobacionVia = r.aprobacion_via || null;
+        }
         if (Array.isArray(r.orden_items)) {
           c.items = r.orden_items.slice().sort(function (a, b) { return String(a.creado_en || "").localeCompare(String(b.creado_en || "")) || String(a.id).localeCompare(String(b.id)); })
             .map(function (it) {
               return { uid: it.id, nombre: it.nombre, cantidad: Number(it.cantidad), precio: Number(it.precio),
                 costoUnitario: Number(it.costo_unitario) || 0, costoEstimado: !!it.costo_estimado,
-                inventarioUid: it.inventario_id || null, origenInventarioId: null };
+                inventarioUid: it.inventario_id || null, origenInventarioId: null,
+                // 3.15 (Bloque 2): tipo del renglón y cuánto stock tiene aplicado HOY (solo lectura: lo mueve el servidor)
+                tipo: it.tipo || null, cantidadAplicada: Number(it.cantidad_aplicada) || 0, aplicadaLegado: Number(it.aplicada_legado) || 0 };
             });
         }
         return c;
@@ -350,10 +389,32 @@
         }
         return Object.assign({}, c, { items: items });
       },
-      // los renglones que SOLO existen aquí (sin uid: nunca llegaron a la nube) no se pierden al bajar
-      fusionarLocal: function (local, c) {
+      /* 3.15 (F-1): una operación `agregar_item_orden` RECHAZADA por la nube es la única representación de un renglón que solo existe
+         en este dispositivo. Mientras siga en la cola (la persona no la ha quitado de «por revisar»), ese renglón —y solo ese: el que
+         nombra p_item_id— no se destruye al bajar una versión más nueva de la orden. No se reenvía ni cambia de estado: solo se retiene. */
+      retieneLocal: function (op) {
+        return !!(op && op.estado === "rejected" && op.kind === "rpc" && op.rpc === "agregar_item_orden" && op.params && op.params.p_item_id);
+      },
+      // los renglones que SOLO existen aquí no se pierden al bajar: los que no tienen uid (nunca llegaron a la nube) y los retenidos por
+      // una operación rechazada de ESTA orden (F-1). Si el servidor ya trae un renglón con ese id, manda el del servidor (sin duplicar).
+      // Si la copia local del renglón retenido ya no está (una versión anterior de la app la quitó al bajar), se repone tal cual desde
+      // los datos de la propia operación rechazada: nada inventado, nada enviado.
+      fusionarLocal: function (local, c, ops) {
         if (!Array.isArray(c.items)) return c;
-        var soloLocales = (local.items || []).filter(function (it) { return it && !it.uid; });
+        var self = this, retenidos = {}, orden = [], enNube = {}, puestos = {};
+        (ops || []).forEach(function (op) {
+          if (!self.retieneLocal(op) || (op.params.p_orden_id && op.params.p_orden_id !== local.uid) || retenidos[op.params.p_item_id]) return;
+          retenidos[op.params.p_item_id] = op; orden.push(op.params.p_item_id);
+        });
+        c.items.forEach(function (it) { if (it && it.uid) enNube[it.uid] = true; });
+        var soloLocales = (local.items || []).filter(function (it) { return it && (!it.uid || (retenidos[it.uid] && !enNube[it.uid])); });
+        soloLocales.forEach(function (it) { if (it.uid) puestos[it.uid] = true; });
+        orden.forEach(function (id) {
+          if (enNube[id] || puestos[id]) return;
+          var p = retenidos[id].params;
+          soloLocales.push({ uid: id, tipo: p.p_tipo || null, nombre: p.p_nombre, cantidad: Number(p.p_cantidad), precio: Number(p.p_precio), costoUnitario: 0, costoEstimado: false,
+            inventarioUid: p.p_inventario_id || null, origenInventarioId: null, cantidadAplicada: 0, aplicadaLegado: 0 });
+        });
         return soloLocales.length ? Object.assign({}, c, { items: c.items.concat(soloLocales) }) : c;
       },
     },
@@ -426,6 +487,14 @@
         };
       },
       refsALocal: async function (c, resolver) { return Object.assign({}, c, { items: await itemsALocal(c.items, resolver) }); },
+      /* 3.15 (protección temporal): un `registrar_credito` RECHAZADO es la única representación completa (conceptos y nota) de un crédito
+         que la nube todavía no tiene. Deja de serlo cuando la copia local ya viene confirmada por el servidor (tiene revisión o base).
+         Los abonos y las demás operaciones de dinero NO entran: lo que deciden ya existe en la nube. Aquí no hay fusión al bajar: un
+         crédito que la nube no tiene nunca llega en una descarga, así que su copia local no se toca. */
+      retieneLocal: function (op, local) {
+        if (!(op && op.estado === "rejected" && op.kind === "rpc" && op.rpc === "registrar_credito" && op.params && op.params.p_credito_id)) return false;
+        return !(local && (local._base || local._rev > 0));
+      },
     },
     caja_movimientos: {
       entidad: "caja_movimientos", tabla: "caja_movimientos", store: "caja_movimientos", soloLectura: true,
@@ -444,12 +513,51 @@
   };
   if (!esMecanico) Object.keys(financieros).forEach(function (k) { mappers[k] = financieros[k]; });
 
+  /* 3.15 · BLOQUE 3 · MENSAJES admin → mecánico (sync-15c-mensajes-realtime.sql). SOLO LECTURA por el CRUD: se envían con la RPC
+     enviar_mensaje y se marcan leídos con marcar_mensaje_leido, ambas por el outbox (ver app.js). RLS decide qué baja: el
+     destinatario (mecánico activo) o el administrador. La relación con la orden/cita viaja como uid (ordenUid/citaUid) y se
+     resuelve al mostrar con el mapa: no se declara como fk para no dejar «pendiente» un mensaje de una orden que ya no es suya.
+     store: el almacén `auditoria` de la caché de sync (creado en v1 y nunca usado por ella): así la base local NO sube de
+     versión y volver a la 3.14.1 no la encuentra «más nueva» (VersionError → modo local). Ver SyncDB.ALMACEN_MENSAJES. */
+  var ms2 = function (v) { return v ? new Date(v).getTime() : null; };
+  mappers.mensajes = {
+    entidad: "mensajes", tabla: "mensajes", store: (global.SyncDB && global.SyncDB.ALMACEN_MENSAJES) || "auditoria", soloLectura: true,
+    columnas: [], tiempos: [], fks: [],
+    aCloud: function () { return {}; },
+    aLocal: function (r) {
+      return {
+        remitenteId: r.remitente_id || null, remitenteNombre: r.remitente_nombre || "", destinatarioId: r.destinatario_id || null,
+        texto: r.texto || "", ordenUid: r.orden_id || null, citaUid: r.cita_id || null,
+        creadoEn: ms2(r.creado_en), leidoEn: ms2(r.leido_en), enviado: true,
+      };
+    },
+  };
+  /* 3.15 · BLOQUE 3 · CITAS del mecánico: sus citas abiertas que todavía no son orden (rpc/citas_tecnico_mias). SYNC-2 le cerró la
+     tabla `citas`; al atenderse la cita (se crea la orden) deja de aparecer y el trabajo sigue en la orden: un solo trabajo. */
+  if (esMecanico) {
+    mappers.citas = {
+      entidad: "citas", tabla: "rpc/citas_tecnico_mias", store: "citas", soloLectura: true, barrer: true,
+      columnas: [], tiempos: [], fks: [],
+      aCloud: function () { return {}; },
+      aLocal: function (r) {
+        return {
+          fecha: r.fecha, hora: r.hora, motivo: r.motivo || "", estado: r.estado || null, confirmada: !!r.confirmada,
+          mecanico: r.mecanico || "", mecanicoId: r.mecanico_id || null,
+          nombreTmp: r.cliente_nombre || "", telefonoTmp: r.cliente_telefono || "", clienteId: null,
+        };
+      },
+    };
+  }
+
   // "inventario" va DESPUÉS de "categorias_inv" (SYNC-7A): su fk categoriaId se resuelve por el mapa
   // local↔uid, que solo existe una vez que categorias_inv ya se sincronizó (mismo motivo que "ordenes" va
   // después de "clientes"/"motos").
   var orden = ["clientes", "motos", "citas", "categorias_inv", "inventario", "cotizaciones", "ordenes"];
   // SYNC-7B: el dinero va al final — sus llaves foráneas (clientes, ordenes, ventas, créditos) ya están en el mapa.
-  if (!esMecanico) orden = orden.concat(["ventas_rapidas", "creditos", "caja_movimientos"]);
+  if (!esMecanico) orden = orden.concat(["ventas_rapidas", "creditos", "caja_movimientos", "mensajes"]);
+  // 3.15 (Bloque 3): el mecánico solo descarga lo que PUEDE leer (sus citas, sus órdenes, sus mensajes). Hasta 3.14.1 pedía
+  // además clientes/motos/categorías/inventario/cotizaciones: 5 peticiones por ciclo que RLS devolvía siempre vacías.
+  else orden = ["citas", "ordenes", "mensajes"];
 
   global.ENTIMOTORS_SYNC_MAPPERS = mappers;
   global.ENTIMOTORS_SYNC_ORDEN = orden;

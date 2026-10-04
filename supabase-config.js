@@ -27,5 +27,10 @@ window.ENTIMOTORS_SUPABASE = {
   // Si se deja vacía, esa pantalla avisa y el resto de la app va igual; por eso
   // pruebas/multiusuario/25-config-produccion-apiurl.test.mjs falla si este
   // archivo se publica sin ella.
-  apiUrl: "https://entimotors-1.onrender.com"
+  apiUrl: "https://entimotors-1.onrender.com",
+
+  // 3.15 (Bloque 6): Gestor Web REAL (panel del sitio, con su propio inicio de sesión en el servidor). Solo el administrador lo ve en
+  // el taller; se abre en otra pestaña sin pasarle nada. URL pública (no es un secreto), en UN solo lugar. entimotors.com redirige
+  // aquí con 301: se usa la canónica con «www».
+  gestorWebUrl: "https://www.entimotors.com/admin.html"
 };

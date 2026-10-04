@@ -156,7 +156,10 @@
         if (!res.ok) {
           var msg = (cuerpo && typeof cuerpo === "object" ? primeraCadena([cuerpo.message, cuerpo.msg, cuerpo.error_description, cuerpo.error]) : "") ||
                     (typeof res.statusText === "string" ? res.statusText : "");
-          return mal(res.status === 401 || res.status === 403 ? "sin-permiso" : "error-servidor", msg, res.status);
+          var fallo = mal(res.status === 401 || res.status === 403 ? "sin-permiso" : "error-servidor", msg, res.status);
+          // 3.15 (Checkpoint 8A): el código de GoTrue (p. ej. user_banned, refresh_token_not_found) es la EVIDENCIA del servidor
+          if (cuerpo && typeof cuerpo === "object") fallo.codigo = primeraCadena([cuerpo.error_code, cuerpo.code]) || null;
+          return fallo;
         }
         return bien(cuerpo, rango ? { rango: rango } : null);
       });
@@ -165,6 +168,18 @@
       var esCorte = err && (err.name === "AbortError");
       return mal(esCorte ? "tiempo-agotado" : "sin-conexion", err && err.message ? err.message : String(err));
     });
+  }
+
+  /* 3.15 (Checkpoint 8A): clase de un fallo de Auth (ver refrescarSesion). */
+  function clasificarFallo(r) {
+    if (!r || r.ok) return null;
+    if (r.motivo === "sin-conexion" || r.motivo === "tiempo-agotado" || r.motivo === "respuesta-invalida") return "transporte";
+    if (r.motivo === "sin-sesion") return "rechazada";   // no hay refresh token: no hay nada que renovar (hace falta entrar)
+    var h = Number(r.http) || 0;
+    if (h === 0 || h >= 500 || h === 429 || h === 408) return "servidor-temporal";
+    if (r.codigo === "user_banned") return "cuenta-desactivada";
+    if (h === 400 || h === 401 || h === 403 || h === 404) return "rechazada";
+    return "servidor-temporal";
   }
 
   // -- 4 - Lo que se expone -------------------------------------------------
@@ -203,13 +218,30 @@
       });
     },
 
+    /* 3.15 (Checkpoint 8A) · Renovar NUNCA confunde un problema de RED con una sesión terminada. Todo fallo sale con `clase`:
+         · "transporte"        sin red, DNS, conexión cortada, tiempo agotado, o una respuesta 200 que no es la de Auth (portal cautivo,
+                               «lie-fi»): la sesión SIGUE; se reintenta.
+         · "servidor-temporal" 5xx, 429, 408: la sesión SIGUE; se reintenta.
+         · "rechazada"         Auth contestó que este refresh token ya no vale (sesión revocada, cerrada en todos los dispositivos,
+                               usuario borrado, token inválido): se OLVIDA la sesión local — no se sigue con credenciales inválidas.
+         · "cuenta-desactivada" Auth contestó error_code user_banned (así desactiva una cuenta el Bloque 4): evidencia POSITIVA.
+       Solo "rechazada" y "cuenta-desactivada" cierran sesión. */
+    clasificarFallo: clasificarFallo,
+    puedeRenovar: function () { return !!(sesion && sesion.refresh_token); },
     refrescarSesion: function () {
-      if (!sesion || !sesion.refresh_token) return Promise.resolve(mal("sin-sesion"));
+      if (!sesion || !sesion.refresh_token) { var sin = mal("sin-sesion"); sin.clase = "rechazada"; return Promise.resolve(sin); }
       return pedir("/auth/v1/token?grant_type=refresh_token", {
         metodo: "POST", conSesion: false, cuerpo: { refresh_token: sesion.refresh_token }
       }).then(function (r) {
-        if (!r.ok) return r;
+        if (!r.ok) {
+          r.clase = clasificarFallo(r);
+          if (r.clase === "rechazada" || r.clase === "cuenta-desactivada") guardarSesion(null);
+          return r;
+        }
         var d = r.datos || {};
+        if (typeof d !== "object" || typeof d.access_token !== "string" || !d.access_token) {
+          var raro = mal("respuesta-invalida", "la renovación no devolvió una sesión"); raro.clase = "transporte"; return raro;
+        }
         guardarSesion({
           access_token: d.access_token,
           refresh_token: d.refresh_token,
@@ -220,11 +252,28 @@
       });
     },
 
+    /* 3.15 (Bloque 8 · decisión del propietario): «Cerrar sesión» cierra SOLO ESTE dispositivo: POST /auth/v1/logout?scope=local
+       (GoTrue revoca la sesión del token y sus refresh tokens; las otras sesiones de la cuenta siguen). Antes era sin scope = GLOBAL
+       (expulsaba a los demás dispositivos legítimos de la misma cuenta).
+       Las revocaciones de SEGURIDAD no pasan por aquí y siguen siendo totales: eliminar/desactivar usuario (backend: ban +
+       revocar_sesiones_usuario borra TODAS sus sesiones) y cambio de contraseña del admin (backend: scope=others).
+       · token vencido con refresh token: se renueva para poder cerrar la sesión EN EL SERVIDOR (no quedarse viva allí);
+       · corte de red: un reintento; si tampoco, la sesión local se borra IGUAL (desde este dispositivo ya no se puede usar) y el
+         resultado dice servidor = "no-confirmada". Nunca se guarda una credencial para reintentar después. */
     cerrarSesion: function () {
-      var p = sesionVigente()
-        ? pedir("/auth/v1/logout", { metodo: "POST" })
-        : Promise.resolve(bien(null));
-      return p.then(function () { guardarSesion(null); return bien(null); });
+      var cerrarEnServidor = function (reintento) {
+        return pedir("/auth/v1/logout?scope=local", { metodo: "POST" }).then(function (r) {
+          if (r.ok || r.http === 401 || r.http === 403 || r.http === 404) return "cerrada";   // ya no existía en el servidor: también está cerrada
+          if (!reintento && clasificarFallo(r) !== "rechazada") return cerrarEnServidor(true);
+          return "no-confirmada";
+        });
+      };
+      var p;
+      if (sesionVigente()) p = cerrarEnServidor(false);
+      else if (sesion && sesion.refresh_token) p = API.refrescarSesion().then(function (r) { return r.ok ? cerrarEnServidor(false) : (r.clase === "rechazada" || r.clase === "cuenta-desactivada" ? "cerrada" : "no-confirmada"); });
+      else p = Promise.resolve("sin-sesion");
+      return p.then(function (servidor) { guardarSesion(null); return bien({ servidor: servidor }); },
+                    function () { guardarSesion(null); return bien({ servidor: "no-confirmada" }); });
     },
 
     sesion: function () { return sesionVigente() ? sesion : null; },

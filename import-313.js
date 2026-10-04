@@ -110,17 +110,97 @@
     return { ok: true, respaldo: r };
   }
 
+  /** 3.15 (Bloques 5–6) · «¿qué es este archivo?», por su CONTENIDO (nunca por el nombre, la extensión ni la versión que lo exportó).
+      Única clase que el importador acepta: «legado-v6» = datos de la base LOCAL v6 de la 3.13 (version 2, esquemaDB 6, solo sus
+      almacenes, ninguna fila con campos de caché de la nube). La exporta la 3.13 y TAMBIÉN la 3.14.x cuando lee esa misma base
+      (el respaldo real JEIEKQ del teléfono dice versionApp «3.14.0»): rechazar por «versionApp ≥ 3.14» cerraría la puerta al registro
+      119. Misma regla que operacion/respaldo/lib/respaldo.mjs (clasificarArchivo). */
+  var CAMPOS_CACHE = ["uid", "_rev", "_base", "_pend"];
+  function clasificarArchivo(r) {
+    if (!objeto(r) || Array.isArray(r)) return "desconocido";
+    if (r.formato === "entimotors-respaldo-negocio") return "negocio-3.15";
+    if (r.formato === "entimotors-copia-dispositivo" && r.alcance === "cache-nube") return "cache-nube";
+    if (!objeto(r.data)) return "desconocido";
+    var conCache = Object.keys(r.data).some(function (k) {
+      return Array.isArray(r.data[k]) && r.data[k].some(function (x) { return objeto(x) && CAMPOS_CACHE.some(function (c) { return x[c] !== undefined; }); });
+    });
+    if (conCache) return "cache-nube";
+    var marcaOk = r.formato === undefined || (r.formato === "entimotors-copia-dispositivo" && r.alcance === "datos-locales");
+    var soloSusAlmacenes = Object.keys(r.data).every(function (k) { return STORES.indexOf(k) >= 0; });
+    if (r.version === VERSION_RESPALDO && r.esquemaDB === ESQUEMA_313 && marcaOk && soloSusAlmacenes) return "legado-v6";
+    return "desconocido";
+  }
+
+  /* 3.15 (Bloque 6) · ¿qué registros de ESTE archivo/teléfono ya están en la nube? Por el MISMO uuid determinista con que el importador
+     los sube (uuidDe(tabla, id local)): no depende de una marca local de un dispositivo, ni de qué lote los subió. El servidor solo
+     responde cuáles existen (migracion_313_presentes). Nada se marca ni se descarta: un registro nuevo (p. ej. el 119) sigue a la vista. */
+  var TABLA_NUBE = { clientes: "clientes", motos: "motos", ordenes: "ordenes", inventario: "inventario", citas: "citas", cotizaciones: "cotizaciones",
+    ventas_rapidas: "ventas", caja_movimientos: "caja_movimientos", creditos: "creditos", categorias_inv: "categorias_inv" };
+  async function identidadesNube(r) {
+    var porTabla = {}, lista = [];
+    for (var s in TABLA_NUBE) {
+      var filas = r && r.data && Array.isArray(r.data[s]) ? r.data[s] : [];
+      for (var i = 0; i < filas.length; i++) {
+        if (!objeto(filas[i]) || filas[i].id === undefined || filas[i].id === null) continue;
+        var u = await uuidDe(TABLA_NUBE[s], filas[i].id);
+        (porTabla[TABLA_NUBE[s]] = porTabla[TABLA_NUBE[s]] || []).push(u);
+        lista.push({ store: s, id: filas[i].id, uuid: u });
+      }
+    }
+    return { porTabla: porTabla, lista: lista };
+  }
+  /** Registros que PARECEN de la siembra de ejemplo (firma fija de clientes y placas + lo que cuelga de ellos). Solo INFORMA: nunca
+      se ocultan ni se descartan por esto (un producto sembrado, p. ej. «Aceite 20W-50», se quedó como real en la nube). → {"store:id": true} */
+  function posibleEjemplo(r) {
+    var d = (r && r.data) || {}, out = {}, cli = {}, moto = {};
+    (d.clientes || []).forEach(function (x) { if (objeto(x) && FIRMA_DEMO_CLIENTES.indexOf(String(x.nombre) + "|" + String(x.telefono)) >= 0) { cli[x.id] = true; out["clientes:" + x.id] = true; } });
+    (d.motos || []).forEach(function (x) { if (objeto(x) && (FIRMA_DEMO_PLACAS.indexOf(String(x.placa)) >= 0 || cli[x.clienteId])) { moto[x.id] = true; out["motos:" + x.id] = true; } });
+    ["ordenes", "citas", "cotizaciones", "ventas_rapidas", "creditos"].forEach(function (s) {
+      (d[s] || []).forEach(function (x) { if (objeto(x) && (cli[x.clienteId] || moto[x.motoId])) out[s + ":" + x.id] = true; });
+    });
+    return out;
+  }
+  /** consultar(porTabla) → Promise<{ok, datos:{tabla:[uuid presentes]}}>. Devuelve {ok, total, enNube, faltan:[{store,id,uuid}]}. */
+  async function pendientesEnNube(r, consultar) {
+    var ids = await identidadesNube(r);
+    if (!ids.lista.length) return { ok: true, total: 0, enNube: 0, faltan: [] };
+    var resp = await consultar(ids.porTabla);
+    if (!resp || !resp.ok || !objeto(resp.datos)) return { ok: false, total: ids.lista.length, motivo: (resp && (resp.mensaje || resp.codigo)) || "sin respuesta" };
+    var presentes = {};
+    Object.keys(resp.datos).forEach(function (t) { (resp.datos[t] || []).forEach(function (u) { presentes[u] = true; }); });
+    var ej = posibleEjemplo(r);
+    var faltan = ids.lista.filter(function (x) { return !presentes[x.uuid]; })
+      .map(function (x) { return { store: x.store, id: x.id, uuid: x.uuid, posibleEjemplo: !!ej[x.store + ":" + x.id] }; });
+    return { ok: true, total: ids.lista.length, enNube: ids.lista.length - faltan.length, faltan: faltan };
+  }
+
   /** Valida estructura, versión, ids, referencias y cuadre del dinero. Errores = no se importa NADA. Avisos = se importa
       con la corrección indicada (referencia a algo borrado → vacía; foto base64 → se queda en el respaldo). */
   function validar(r) {
     var errores = [], avisos = [];
     var mal = function (m) { if (errores.length < 50) errores.push(m); };
     if (!objeto(r) || Array.isArray(r)) return { ok: false, errores: ["El archivo no es un respaldo de ENTIMOTORS."], avisos: [] };
-    if (!objeto(r.data)) return { ok: false, errores: ["El archivo no trae datos (falta «data»)."], avisos: [] };
+    var clase = clasificarArchivo(r);
+    if (clase === "negocio-3.15") return { ok: false, clase: clase, errores: ["Es un respaldo de EMPRESA de la versión 3.15 (base de datos + fotos): no se importa aquí. Se restaura solo con el procedimiento del administrador técnico, en un entorno aislado."], avisos: [] };
+    if (clase === "cache-nube") return { ok: false, clase: clase, errores: ["Es una copia de la CACHÉ DE LA NUBE (versión " + (r.versionApp || "3.14+") + "): esos datos ya están en la nube. Importarla los duplicaría. Aquí solo entran los datos que la 3.13 guardaba en el teléfono."], avisos: [] };
+    if (!objeto(r.data)) return { ok: false, clase: clase, errores: ["El archivo no trae datos (falta «data»)."], avisos: [] };
+    if (clase !== "legado-v6") {
+      var porque = r.version !== VERSION_RESPALDO ? "formato " + JSON.stringify(r.version) + " (se espera " + VERSION_RESPALDO + ")"
+        : r.esquemaDB !== ESQUEMA_313 ? "esquema " + JSON.stringify(r.esquemaDB) + " (se espera " + ESQUEMA_313 + ")"
+        : Object.keys(r.data).some(function (k) { return STORES.indexOf(k) < 0; })
+          ? "trae tablas que esta versión no conoce: " + Object.keys(r.data).filter(function (k) { return STORES.indexOf(k) < 0; }).join(", ")
+          : "trae marcas que un respaldo de la 3.13 no tiene";
+      return { ok: false, clase: clase, errores: ["No es un respaldo de la versión 3.13 reconocible: " + porque + ". Solo se importan respaldos de los datos que la 3.13 guardaba en el teléfono."], avisos: [] };
+    }
+    // alterado o recortado: la cabecera cuenta lo que trae (conteos por tabla, abajo; y el total aquí)
+    if (typeof r.totalRegistros === "number") {
+      var suma = Object.keys(r.data).reduce(function (a, k) { return a + (Array.isArray(r.data[k]) ? r.data[k].length : 0); }, 0);
+      if (suma !== r.totalRegistros) mal("Respaldo alterado o incompleto: dice " + r.totalRegistros + " registros y trae " + suma + ".");
+    }
     if (r.version !== VERSION_RESPALDO) mal("Formato de respaldo " + JSON.stringify(r.version) + " no compatible (se espera " + VERSION_RESPALDO + ").");
     if (r.esquemaDB !== ESQUEMA_313) mal("Esquema " + JSON.stringify(r.esquemaDB) + " no compatible (se espera el de la 3.13: " + ESQUEMA_313 + ").");
     if (typeof r.versionApp !== "string" || !/^3\.\d+\.\d+$/.test(r.versionApp)) mal("Versión de la app desconocida.");
-    else if (!/^3\.13\./.test(r.versionApp)) avisos.push("El respaldo es de la versión " + r.versionApp + " (no 3.13): revisa bien la vista previa.");
+    else if (!/^3\.13\./.test(r.versionApp)) avisos.push("Exportado por la versión " + r.versionApp + " desde la base de la 3.13 del teléfono: revisa bien la vista previa.");
     var desconocidas = Object.keys(r.data).filter(function (k) { return STORES.indexOf(k) < 0; });
     if (desconocidas.length) mal("El respaldo trae tablas que esta versión no conoce: " + desconocidas.join(", ") + ".");
     var total = 0;
@@ -489,7 +569,7 @@
   var API = {
     FIRMA_DEMO_CLIENTES: FIRMA_DEMO_CLIENTES, FIRMA_DEMO_PLACAS: FIRMA_DEMO_PLACAS,
     STORES: STORES, CLASIFICACION: CLASIFICACION, DISPOSITIVO: DISPOSITIVO, LIMITE_BYTES: LIMITE_BYTES, LIMITE_FILAS: LIMITE_FILAS,
-    leerTexto: leerTexto, validar: validar, resumen: resumen, construirPaquete: construirPaquete, esperado: esperado,
+    leerTexto: leerTexto, validar: validar, clasificarArchivo: clasificarArchivo, pendientesEnNube: pendientesEnNube, identidadesNube: identidadesNube, posibleEjemplo: posibleEjemplo, TABLA_NUBE: TABLA_NUBE, resumen: resumen, construirPaquete: construirPaquete, esperado: esperado,
     compararTotales: compararTotales, nubeVacia: nubeVacia, preparar: preparar, comprobarDestino: comprobarDestino, importar: importar,
     uuidDe: uuidDe, sha256Hex: sha256Hex,
   };

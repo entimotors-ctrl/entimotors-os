@@ -16,8 +16,10 @@
  * ACCIONES_CON_PIN — mismo catálogo que api-server/src/lib/pin.ts y sync-engine.js (ACCIONES_CON_PIN):
  *   ajustar_stock · reversar_venta · registrar_devolucion · reversar_abono ·
  *   reversar_credito · reversar_caja · anular_orden
- * El admin NUNCA pasa por aquí (el backend rechaza con ADMIN_NO_NECESITA_PIN si se le pide):
- * quien llama debe comprobar el rol ANTES de invocar pedirAutorizacion (ver `admin` abajo).
+ * 3.15 (Bloque 4) · OWNER-PIN-POLICY: las DESTRUCTIVAS (anular/reversar lo cerrado, eliminar usuario) piden el PIN del
+ * propietario TAMBIÉN al administrador; las SENSIBLES (ajustar stock, devolución) solo al cajero (el admin las hace con su sesión).
+ * Mismo catálogo que api-server/src/lib/pin.ts y public.sync_accion_destructiva (sync-15d). La autorización queda ligada en el
+ * servidor a acción + registro + dispositivo + SESIÓN, dura segundos y es de un solo uso: cerrar sesión la inutiliza.
  *
  * SYNC-7 sección 15 (offline): antes de pedir el PIN se comprueba conexión — sin red, se avisa
  * "esta operación requiere conexión…" y se corta ahí. Nunca se encola (sync-engine.js igual lo
@@ -39,7 +41,19 @@
     reversar_credito: "creditos",
     reversar_caja: "caja_movimientos",
     anular_orden: "ordenes",
+    eliminar_usuario: "perfiles",
+    restaurar_respaldo: "respaldos",   // 3.15 (Bloque 5): contrato de la futura restauración en la nube (sin endpoint todavía)
   };
+  /* DESTRUCTIVAS: PIN para todos (incluido el admin). El resto de ACCIONES_CON_PIN son SENSIBLES (solo el cajero lo necesita). */
+  var DESTRUCTIVAS = { reversar_venta: true, reversar_abono: true, reversar_credito: true, reversar_caja: true, anular_orden: true, eliminar_usuario: true, restaurar_respaldo: true };
+  /* Qué se está autorizando, en palabras del taller (el modal lo dice antes de pedir el PIN). */
+  var DESCRIPCION = {
+    ajustar_stock: "Ajustar el stock de un repuesto", registrar_devolucion: "Registrar una devolución", reversar_venta: "Anular una venta ya cobrada",
+    reversar_abono: "Revertir un abono", reversar_credito: "Anular un crédito", reversar_caja: "Revertir un movimiento de caja",
+    anular_orden: "Anular una orden cobrada", eliminar_usuario: "Eliminar un usuario (pierde el acceso; su historial se conserva)",
+    restaurar_respaldo: "Restaurar un respaldo en la nube (REEMPLAZA los datos actuales del taller)",
+  };
+  function esDestructiva(accion) { return DESTRUCTIVAS[accion] === true; }
 
   function redondear2(n) { return Math.round((Number(n) + Number.EPSILON) * 100) / 100; }
 
@@ -48,7 +62,8 @@
     switch (codigo) {
       case "PIN_INCORRECTO":
         return "PIN incorrecto." + (datos && datos.intentos_restantes !== undefined ? " Intentos restantes: " + datos.intentos_restantes + "." : "");
-      case "SIN_PIN": return "El administrador todavía no configuró el PIN de autorización.";
+      case "SIN_PIN": return "Todavía no hay PIN del propietario. Configúralo en Ajustes → PIN del propietario: sin él, las acciones destructivas quedan bloqueadas.";
+      case "SESION_INVALIDA": return "Tu sesión ya no es válida. Inicia sesión de nuevo.";
       case "CUENTA_INACTIVA": return "La cuenta del administrador no está activa.";
       case "BLOQUEADO_ADMIN": return "Las autorizaciones están bloqueadas. El administrador debe desbloquearlas desde Ajustes.";
       case "BLOQUEADO_GLOBAL": case "BLOQUEADO_SOLICITANTE": {
@@ -85,10 +100,13 @@
       var accion = o.accion, rol = o.rol, registroId = o.registroId, monto = o.monto, deviceId = o.deviceId || null;
       var entidad = ACCIONES_CON_PIN[accion];
       if (!entidad) return { ok: false, motivo: "accion-desconocida", mensaje: "Acción no reconocida." };
-      if (rol === "admin") return { ok: true, admin: true, autorizacion_id: null, expira_en: null };
-      if (rol !== "cajero") return { ok: false, motivo: "sin-permiso", mensaje: "Tu rol no puede pedir esta autorización." };
+      // el admin solo pasa sin PIN en lo SENSIBLE; lo DESTRUCTIVO lo autoriza con el PIN del propietario como cualquiera
+      if (rol === "admin" && !esDestructiva(accion)) return { ok: true, admin: true, autorizacion_id: null, expira_en: null };
+      if (rol !== "cajero" && rol !== "admin") return { ok: false, motivo: "sin-permiso", mensaje: "Tu rol no puede pedir esta autorización." };
+      if (accion === "eliminar_usuario" && rol !== "admin") return { ok: false, motivo: "sin-permiso", mensaje: "Solo el administrador elimina usuarios." };
+      if (accion === "restaurar_respaldo" && rol !== "admin") return { ok: false, motivo: "sin-permiso", mensaje: "Solo el administrador restaura un respaldo." };
       if (!enLinea()) {
-        return { ok: false, motivo: "sin-conexion", mensaje: "Esta operación requiere conexión para obtener autorización del administrador." };
+        return { ok: false, motivo: "sin-conexion", mensaje: "Sin conexión: esta acción necesita conexión para la autorización segura con el PIN. No se hizo nada." };
       }
       var base = baseApi();
       if (!base) return { ok: false, motivo: "sin-servidor", mensaje: "Falta configurar el servidor (apiUrl)." };
@@ -96,7 +114,8 @@
       if (!token) return { ok: false, motivo: "sin-sesion", mensaje: "Inicia sesión de nuevo." };
       if (!f) return { ok: false, motivo: "sin-fetch", mensaje: "No se pudo contactar al servidor." };
 
-      var pin = await pedirPin({ accion: accion, entidad: entidad, registroId: registroId, monto: monto });
+      var pin = await pedirPin({ accion: accion, entidad: entidad, registroId: registroId, monto: monto, rol: rol, destructiva: esDestructiva(accion),
+        descripcion: DESCRIPCION[accion] || accion });
       if (pin === null || pin === undefined) return { ok: false, motivo: "cancelado", mensaje: "" };
       if (!/^[0-9]{6}$/.test(String(pin))) return { ok: false, motivo: "pin-invalido", mensaje: "El PIN son 6 dígitos." };
 
@@ -122,7 +141,7 @@
         return { ok: false, motivo: "sin-conexion", mensaje: "No se pudo contactar al servidor." };
       }
       if (res.status === 201 && datos && typeof datos.autorizacion_id === "string") {
-        return { ok: true, admin: false, autorizacion_id: datos.autorizacion_id, expira_en: datos.expira_en || null };
+        return { ok: true, admin: rol === "admin", autorizacion_id: datos.autorizacion_id, expira_en: datos.expira_en || null };
       }
       var codigo = (datos && typeof datos.codigo === "string" && datos.codigo) || "";
       return {
@@ -146,7 +165,10 @@
       if (!modal || !input || !okBtn || !cancelBtn) { resolve(null); return; }
 
       var msg = document.getElementById("pinAutorizarMsg");
-      if (msg) msg.textContent = "Esta acción requiere autorización del administrador.";
+      // qué se autoriza, y de quién es el PIN (el mensaje de error nunca dice qué parte del PIN estaba bien)
+      if (msg) msg.textContent = (info && info.descripcion ? info.descripcion + ". " : "") + (info && info.destructiva
+        ? "Es una acción destructiva: escribe el PIN del propietario."
+        : "Esta acción requiere autorización del administrador.");
       if (err) err.textContent = "";
       input.value = "";
       modal.classList.add("active");
@@ -199,7 +221,7 @@
   }
 
   global.PinUI = {
-    crear: crear, mensajeParaCodigo: mensajeParaCodigo, ACCIONES_CON_PIN: ACCIONES_CON_PIN,
+    crear: crear, mensajeParaCodigo: mensajeParaCodigo, ACCIONES_CON_PIN: ACCIONES_CON_PIN, DESTRUCTIVAS: DESTRUCTIVAS, esDestructiva: esDestructiva,
     prepararInstancia: prepararInstancia, autorizarAccion: autorizarAccion,
   };
 })(typeof window !== "undefined" ? window : this);

@@ -28,6 +28,11 @@
   var oyentes = [];
   var temporizadorRefresco = null;
   var restaurando = false;  // cortafuegos anti-bucle
+  /* 3.15 (Checkpoint 8A): reintentos de renovación tras un fallo de RED o del servidor (nunca cierran la sesión) y el motivo de la
+     última salida, para que la app diga la verdad («tu sesión terminó» ≠ «tu cuenta fue desactivada»). */
+  var ESPERAS_REINTENTO_MS = [15000, 30000, 60000, 120000, 300000];
+  var reintentos = 0;
+  var motivoSalida = null;  // "sesion-revocada" | "cuenta-desactivada" | "cerrada" | null
 
   /* La sesión de recuperación vive AQUÍ y solo aquí: en memoria, en una
      variable aparte. No entra en `sesion` de supabase-client.js, así que
@@ -82,13 +87,40 @@
     var falta = s.expires_at * 1000 - Date.now() - MARGEN_REFRESCO_MS;
     if (falta < 5000) falta = 5000;
     if (falta > 2147483000) return;                 // más allá del máximo de setTimeout
-    temporizadorRefresco = setTimeout(function () {
-      SB.refrescarSesion().then(function (r) {
-        if (r.ok) { avisar("TOKEN_REFRESHED"); programarRefresco(); }
-        else { guardarPerfil(null); avisar("SIGNED_OUT"); }
-      });
-    }, falta);
+    temporizadorRefresco = setTimeout(function () { temporizadorRefresco = null; renovar(); }, falta);
   }
+  function programarReintento() {
+    if (temporizadorRefresco) clearTimeout(temporizadorRefresco);
+    var espera = ESPERAS_REINTENTO_MS[Math.min(reintentos, ESPERAS_REINTENTO_MS.length - 1)];
+    reintentos++;
+    temporizadorRefresco = setTimeout(function () { temporizadorRefresco = null; renovar(); }, espera);
+  }
+  /* 3.15 (Checkpoint 8A) · UNA sola puerta para renovar (el temporizador, el arranque y la sincronización pasan por aquí):
+     · ok → sigue, se reprograma;
+     · transporte / servidor-temporal → la sesión NO se toca: se reintenta (15 s, 30 s, 1 min, 2 min, luego cada 5 min y al volver la red);
+     · rechazada / cuenta-desactivada (evidencia de Auth) → fuera, con su motivo. */
+  var renovando = null;
+  function renovar() {
+    if (!SB) return Promise.resolve(mal("sin-cliente"));
+    if (renovando) return renovando;
+    renovando = SB.refrescarSesion().then(function (r) {
+      if (r.ok) { reintentos = 0; avisar("TOKEN_REFRESHED"); programarRefresco(); return r; }
+      var clase = r.clase || (SB.clasificarFallo ? SB.clasificarFallo(r) : "rechazada");
+      if (clase === "rechazada" || clase === "cuenta-desactivada") {
+        if (temporizadorRefresco) { clearTimeout(temporizadorRefresco); temporizadorRefresco = null; }
+        reintentos = 0;
+        motivoSalida = clase === "cuenta-desactivada" ? "cuenta-desactivada" : "sesion-revocada";
+        guardarPerfil(null); avisar("SIGNED_OUT");
+      } else {
+        programarReintento();
+      }
+      r.clase = clase;
+      return r;
+    }).then(function (r) { renovando = null; return r; }, function (e) { renovando = null; throw e; });
+    return renovando;
+  }
+  // al volver la red, si había una renovación pendiente por un corte, se intenta ya (sin esperar el siguiente reintento)
+  if (global.addEventListener) global.addEventListener("online", function () { if (reintentos > 0 && SB && SB.puedeRenovar && SB.puedeRenovar()) renovar(); });
 
   // ── API ───────────────────────────────────────────────────────────────────
   var API = {
@@ -129,6 +161,7 @@
             return SB.cerrarSesion().then(function () { guardarPerfil(null); return p; });
           }
           guardarPerfil(p.datos);
+          motivoSalida = null; reintentos = 0;
           programarRefresco();
           avisar("SIGNED_IN");
           return bien(p.datos);
@@ -137,7 +170,14 @@
     },
 
     /* PASO 8 · salir. No borra ni un dato local. */
+    /* 3.15 (Checkpoint 8A): renovar por la puerta única (lo usan la sincronización, las fotos y el arranque). Devuelve el
+       resultado de supabase-client con su `clase`. */
+    renovar: function () { return renovar(); },
+    /* Por qué terminó la última sesión: "sesion-revocada" | "cuenta-desactivada" | "cerrada" | null. */
+    motivoSalida: function () { return motivoSalida; },
+
     cerrarSesion: function () {
+      motivoSalida = "cerrada"; reintentos = 0;
       if (temporizadorRefresco) { clearTimeout(temporizadorRefresco); temporizadorRefresco = null; }
       var p = SB ? SB.cerrarSesion() : Promise.resolve(bien(null));
       return p.then(function () {
@@ -155,6 +195,22 @@
 
       if (!SB || !SB.estado().activo) { return Promise.resolve(terminar(mal("supabase-no-configurado"))); }
       var s = SB.sesion();
+      if (!s && SB.puedeRenovar && SB.puedeRenovar()) {
+        /* 3.15 (Checkpoint 8A): el access token venció (la app estuvo cerrada > 1 h) pero hay refresh token: se RENUEVA antes de
+           decidir. Rechazo de Auth → fuera con su motivo. Corte de red / servidor caído → se sigue con el perfil guardado (sin
+           confirmar) y se reintenta; nada sale a la nube sin un token válido mientras tanto. */
+        return renovar().then(function (rr) {
+          if (rr.ok) { restaurando = false; return API.restaurarSesion(); }
+          if (rr.clase === "rechazada" || rr.clase === "cuenta-desactivada") {
+            avisar("INITIAL_SESSION");
+            return terminar(mal(rr.clase === "cuenta-desactivada" ? "cuenta-desactivada" : "sesion-revocada"));
+          }
+          var g = leerPerfilGuardado();
+          if (g) { perfil = g; avisar("INITIAL_SESSION"); return terminar(Object.assign(bien(g), { sinConfirmar: true })); }
+          avisar("INITIAL_SESSION");
+          return terminar(mal("sin-conexion"));
+        });
+      }
       if (!s) {
         guardarPerfil(null);
         avisar("INITIAL_SESSION");

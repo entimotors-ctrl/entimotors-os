@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-<title>ENTIMOTORS OS — Demo local</title>
+<title>ENTIMOTORS OS</title>
 <link rel="manifest" href="manifest.json">
 <meta name="theme-color" content="#0a0a0a">
 <link rel="icon" href="icons/icon-192.png">
@@ -17,8 +17,11 @@
     if (t === "light" || t === "dark") document.documentElement.setAttribute("data-theme", t);
   })();
 </script>
-<!-- Requiere internet la primera vez; el service worker la cachea después para que los gráficos también funcionen sin conexión. -->
-<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<!-- Requiere internet la primera vez; el service worker la cachea después para que los gráficos también funcionen sin conexión.
+     3.15 (Bloque 7): async. Era el ÚNICO recurso externo y bloqueaba TODO el documento: con señal que conecta pero no responde («lie-fi»),
+     la app no llegaba a arrancar hasta que el CDN respondiera o expirara (el service worker, red primero, no tiene plazo). Los gráficos solo
+     se usan en Finanzas y ya se omiten si la librería no está (renderFinanzasCharts); al llegar, se dibujan (app.js, «libChart»). -->
+<script id="libChart" src="https://cdn.jsdelivr.net/npm/chart.js" async></script>
 <style>
   @font-face {
     font-family: 'Inter'; font-weight: 400; font-style: normal; font-display: swap;
@@ -37,9 +40,12 @@
     src: url(data:font/woff2;base64,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) format('woff2');
   }
 
+  /* 3.15 (Bloque 7) · CONTRASTE: el texto secundario (--text-faint) quedaba en 3,0–3,5:1 en ambos temas y el ámbar claro en 4,25:1 (WCAG AA
+     pide 4,5:1 en letra pequeña). Mismo tono, solo más oscuro (claro: #948c7f→#736d63, ámbar #a3660a→#965e09) o más claro (oscuro:
+     #6b6663→#8b8581): ≥4,6:1 sobre el fondo y los paneles. */
   :root {
     --bg: #0a0a0a; --bg-raise: #111111; --panel: rgba(255,255,255,0.035); --panel-strong: rgba(255,255,255,0.07);
-    --border: rgba(255,255,255,0.10); --text: #f2f0ee; --text-muted: #9c9793; --text-faint: #6b6663;
+    --border: rgba(255,255,255,0.10); --text: #f2f0ee; --text-muted: #9c9793; --text-faint: #8b8581;
     --red: #e11d48; --red-soft: rgba(225,29,72,0.14); --red-border: rgba(225,29,72,0.4); --red-hover: #ff2c5c;
     --green: #34d399; --green-soft: rgba(52,211,153,0.14); --amber: #f5a524; --amber-soft: rgba(245,165,36,0.16);
     --line: rgba(255,255,255,0.12); --shadow: 0 20px 45px -14px rgba(0,0,0,0.6);
@@ -48,24 +54,24 @@
   @media (prefers-color-scheme: light) {
     :root {
       --bg: #f6f3ef; --bg-raise: #ffffff; --panel: rgba(20,15,10,0.035); --panel-strong: rgba(20,15,10,0.06);
-      --border: rgba(20,15,10,0.12); --text: #1a1613; --text-muted: #6b6357; --text-faint: #948c7f;
+      --border: rgba(20,15,10,0.12); --text: #1a1613; --text-muted: #6b6357; --text-faint: #736d63;
       --red: #c81440; --red-soft: rgba(200,20,64,0.09); --red-border: rgba(200,20,64,0.32); --red-hover: #a80f36;
-      --green: #147a4f; --green-soft: rgba(20,122,79,0.12); --amber: #a3660a; --amber-soft: rgba(163,102,10,0.14);
+      --green: #147a4f; --green-soft: rgba(20,122,79,0.12); --amber: #965e09; --amber-soft: rgba(163,102,10,0.14);
       --line: rgba(20,15,10,0.14); --shadow: 0 20px 45px -14px rgba(20,15,10,0.18);
     }
   }
   :root[data-theme="dark"] {
     --bg: #0a0a0a; --bg-raise: #111111; --panel: rgba(255,255,255,0.035); --panel-strong: rgba(255,255,255,0.07);
-    --border: rgba(255,255,255,0.10); --text: #f2f0ee; --text-muted: #9c9793; --text-faint: #6b6663;
+    --border: rgba(255,255,255,0.10); --text: #f2f0ee; --text-muted: #9c9793; --text-faint: #8b8581;
     --red: #e11d48; --red-soft: rgba(225,29,72,0.14); --red-border: rgba(225,29,72,0.4); --red-hover: #ff2c5c;
     --green: #34d399; --green-soft: rgba(52,211,153,0.14); --amber: #f5a524; --amber-soft: rgba(245,165,36,0.16);
     --line: rgba(255,255,255,0.12); --shadow: 0 20px 45px -14px rgba(0,0,0,0.6);
   }
   :root[data-theme="light"] {
     --bg: #f6f3ef; --bg-raise: #ffffff; --panel: rgba(20,15,10,0.035); --panel-strong: rgba(20,15,10,0.06);
-    --border: rgba(20,15,10,0.12); --text: #1a1613; --text-muted: #6b6357; --text-faint: #948c7f;
+    --border: rgba(20,15,10,0.12); --text: #1a1613; --text-muted: #6b6357; --text-faint: #736d63;
     --red: #c81440; --red-soft: rgba(200,20,64,0.09); --red-border: rgba(200,20,64,0.32); --red-hover: #a80f36;
-    --green: #147a4f; --green-soft: rgba(20,122,79,0.12); --amber: #a3660a; --amber-soft: rgba(163,102,10,0.14);
+    --green: #147a4f; --green-soft: rgba(20,122,79,0.12); --amber: #965e09; --amber-soft: rgba(163,102,10,0.14);
     --line: rgba(20,15,10,0.14); --shadow: 0 20px 45px -14px rgba(20,15,10,0.18);
   }
 
@@ -321,6 +327,25 @@
   .cot-item-fila button:hover { color: var(--red); }
   .cot-vacia { padding: 0.9rem 0.7rem; text-align: center; color: var(--text-faint); font-size: 0.83rem; }
 
+  /* 3.15 · Bloque 2: renglones separados por tipo (taller / repuestos del negocio / manuales / sin clasificar) */
+  .renglon-seccion { padding: 0.4rem 0.7rem; font-size: 0.72rem; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase;
+    color: var(--text-muted); background: var(--surface-2, rgba(127,127,127,0.08)); display: flex; justify-content: space-between; gap: 0.5rem; }
+  .renglon-seccion + .cot-item-fila { border-top: none; }
+  tr.renglon-seccion td { padding: 0.45rem 0.4rem; font-size: 0.72rem; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; color: var(--text-muted); }
+  .renglon-tag { display: inline-block; font-size: 0.68rem; font-weight: 600; border-radius: 0.3rem; padding: 0 0.3rem; margin-left: 0.3rem; border: 1px solid var(--border); color: var(--text-faint); }
+  .renglon-tag.ok { color: var(--green); border-color: var(--green); }
+  .renglon-tag.espera { color: var(--amber); border-color: var(--amber); }
+  .renglon-productos { width: 100%; margin-top: 0.4rem; min-height: 7.5rem; }
+  .renglon-subtotal { display: flex; justify-content: space-between; font-size: 0.95rem; margin: 0.2rem 0 0.4rem; font-variant-numeric: tabular-nums; }
+  .presupuesto-estado { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; font-size: 0.85rem; margin-bottom: 0.6rem; }
+  .presupuesto-estado .pill { text-transform: none; }
+  .presupuesto-aviso { font-size: 0.83rem; border-left: 3px solid var(--amber); padding: 0.4rem 0.6rem; margin: 0.5rem 0; }
+  .presupuesto-aviso.error { border-left-color: var(--red); }
+  .tabla-renglones td .acciones { display: inline-flex; gap: 0.2rem; }
+  @media (max-width: 560px) {
+    .tabla-renglones th:nth-child(3), .tabla-renglones td:nth-child(3) { display: none; }
+  }
+
   .cot-totales { display: grid; gap: 0.25rem; margin-bottom: 0.9rem; font-size: 0.88rem; }
   .cot-totales div { display: flex; justify-content: space-between; }
   .cot-totales .grande { font-size: 1.05rem; font-weight: 700; border-top: 1px solid var(--border); padding-top: 0.45rem; margin-top: 0.2rem; }
@@ -394,7 +419,7 @@
      ni tocar el botón — la acción quedaba muerta sin ningún mensaje.
      Le pasaba al aviso de choque de horario al mover una cita, y a cualquier
      confirmación que se pidiera desde un modal declarado más abajo. */
-  #modalAdminCode, #modalConfirm, #modalPrompt, #modalPinAutorizar { z-index: 60; }
+  #modalAdminCode, #modalConfirm, #modalPrompt, #modalPinAutorizar, #modalCoincidencias { z-index: 60; }   /* + 3.15 (8A): el selector de cliente se abre desde Crédito y desde Cobrar servicio */
   .modal { background: var(--bg-raise); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); max-width: 480px; width: 100%; padding: 1.4rem; max-height: 88vh; overflow-y: auto; }
   .modal h3 { font-family: 'Teko', sans-serif; text-transform: uppercase; font-size: 1.3rem; margin-bottom: 0.8rem; }
   .modal-actions { display: flex; justify-content: flex-end; gap: 0.5rem; margin-top: 0.6rem; }
@@ -520,6 +545,10 @@
 
   .dash-section-head { display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: 0.4rem; margin: 1.8rem 0 1rem; }
   .dash-section-head h3 { font-family: 'Teko', sans-serif; text-transform: uppercase; font-size: 1.3rem; }
+  /* 3.15 (Bloque 6): Netlify inyecta en los sitios publicados su «HUD» (insignia pública / barra del propietario) dentro de estos
+     iframes. No es parte de ENTIMOTORS y no debe verse en Mi Trabajo. La solución de fondo es desactivarlo en la configuración del
+     sitio de Netlify (acción del propietario); esto lo oculta mientras tanto, sin tocar la app, la PWA ni la caché. */
+  iframe#nl-badge-frame, iframe#nl-hud-frame { display: none !important; }
   .demo-flag { font-size: 0.74rem; color: var(--text-faint); background: var(--panel-strong); border-radius: 999px; padding: 0.2rem 0.65rem; }
 
   /* ---- Finanzas y caja: apartado formal ---- */
@@ -665,6 +694,9 @@
     background: var(--bg); padding: 1.5rem;
   }
   .gate.active { display: flex; }
+  #gateAlmacen { z-index: 10000; }
+  .mensaje-mt.no-leido { border-left: 3px solid var(--amber, #f59e0b); }
+  #miTrabajoVivo[data-estado="conectado"], #mensajesVivo[data-estado="conectado"] { color: var(--green, #34d399); }
   .gate-card { max-width: 380px; width: 100%; text-align: center; }
   .gate-card img { height: 56px; margin-bottom: 1.2rem; }
   .gate-card h1 { font-family: 'Teko', sans-serif; text-transform: uppercase; font-size: 1.8rem; margin-bottom: 0.5rem; }
@@ -804,6 +836,26 @@
      una PC angosta conserva su barra lateral; por debajo de 640px cualquier
      dispositivo (incluida una PC con la ventana muy chica) usa el cajón,
      porque ya no cabe la barra lateral fija de ningún modo. */
+  /* la fila de estado/usuario se convierte en un menú desplegable («Cuenta») para no amontonarse.
+     3.15 (Bloque 7): antes solo en móvil/tablet (bloque de abajo); con RATÓN entre 641 y 900 px (PC con ventana a media pantalla, zoom
+     de Windows) la fila completa seguía en la barra y se salía del ancho (hallazgo heredado de 3.14: ~990 px de barra en 753 px). Ahora
+     el desplegable se usa hasta 1100 px con cualquier puntero; la barra lateral fija de escritorio NO cambia (sigue su propia regla). */
+  @media (max-width: 1100px) {
+    .account-wrap { display: inline-flex; position: relative; }
+    #btnCuenta { display: inline-flex; }
+    .account-panel {
+      display: none; flex-direction: column; align-items: stretch; gap: 0.6rem;
+      position: absolute; top: 100%; right: 0; margin-top: 0.5rem; width: min(260px, 88vw);
+      background: var(--bg-raise); border: 1px solid var(--border); border-radius: var(--radius);
+      box-shadow: var(--shadow); z-index: 70; padding: 0.9rem;
+    }
+    .account-panel.open { display: flex; }
+    .account-panel .chip { white-space: normal; width: 100%; }
+    .account-panel .user-chip { background: var(--panel); padding: 0.6rem 0.7rem; border-radius: 0.6rem; max-width: none; }
+    .account-panel .user-chip .who > span, .account-panel .user-chip .who small { overflow: visible; text-overflow: clip; white-space: normal; overflow-wrap: anywhere; }
+    .account-panel button.btn { width: 100%; }
+  }
+
   @media (max-width: 900px) and (pointer: coarse), (max-width: 640px) {
     #btnMenuToggle { display: inline-flex; }
     #shell.active { grid-template-columns: 1fr; grid-template-rows: auto 1fr; }
@@ -818,20 +870,6 @@
        avisos (anclado a su borde derecho) no sobresalga de la pantalla. */
     .top-right { justify-content: flex-end; gap: 0.5rem; flex-grow: 1; }
 
-    /* la fila de estado/usuario se convierte en un menú desplegable para no amontonarse */
-    .account-wrap { display: inline-flex; position: relative; }
-    #btnCuenta { display: inline-flex; }
-    .account-panel {
-      display: none; flex-direction: column; align-items: stretch; gap: 0.6rem;
-      position: absolute; top: 100%; right: 0; margin-top: 0.5rem; width: min(260px, 88vw);
-      background: var(--bg-raise); border: 1px solid var(--border); border-radius: var(--radius);
-      box-shadow: var(--shadow); z-index: 70; padding: 0.9rem;
-    }
-    .account-panel.open { display: flex; }
-    .account-panel .chip { white-space: normal; width: 100%; }
-    .account-panel .user-chip { background: var(--panel); padding: 0.6rem 0.7rem; border-radius: 0.6rem; max-width: none; }
-    .account-panel .user-chip .who > span, .account-panel .user-chip .who small { overflow: visible; text-overflow: clip; white-space: normal; overflow-wrap: anywhere; }
-    .account-panel button.btn { width: 100%; }
 
     #sidebar {
       position: fixed; top: 0; left: 0; bottom: 0; z-index: 210; width: min(78vw, 300px);
@@ -1053,7 +1091,9 @@
         <li>Abre ENTIMOTORS OS desde su propio ícono, no desde el navegador.</li>
       </ol>
     </div>
-    <div class="gate-dev"><a href="#" id="devBypassLink">Continuar aquí solo para pruebas de desarrollo →</a></div>
+    <!-- 3.15 (Bloque 6): antes decía «solo para pruebas de desarrollo», pero es la única forma de usarlo en un navegador que no instala
+         aplicaciones (p. ej. Firefox de escritorio). Se conserva la función con un texto honesto; retirarla es decisión del propietario. -->
+    <div class="gate-dev"><a href="#" id="devBypassLink">Usar en esta pestaña sin instalar →</a></div>
   </div>
 </div>
 
@@ -1088,6 +1128,23 @@
 </div>
 
 <!-- GATE 3: elegir modo de datos (solo la primera vez, con la base vacía) -->
+<!-- 3.15 (Bloque 3): el almacenamiento local de ENTIMOTORS no abre o se cerró. NO es «sin Internet» (eso funciona offline).
+     Se bloquea para no guardar trabajo que no quedaría protegido; nada se borra. -->
+<div class="gate" id="gateAlmacen" role="alertdialog" aria-labelledby="gateAlmacenTitulo">
+  <div class="gate-card" style="max-width:460px;">
+    <img src="icons/icon-192.png" alt="ENTIMOTORS">
+    <h1 id="gateAlmacenTitulo">No se puede guardar en este dispositivo</h1>
+    <p class="desc" id="gateAlmacenTexto"></p>
+    <p class="desc"><b>No es un problema de Internet.</b> Para no perder trabajo, ENTIMOTORS no deja registrar nada hasta que el almacenamiento vuelva a funcionar. No se borró nada: lo pendiente sigue guardado en este dispositivo.</p>
+    <div style="display:flex; gap:0.6rem; justify-content:center; flex-wrap:wrap; margin:0.8rem 0;">
+      <button type="button" class="btn" id="btnAlmacenReintentar">Reintentar</button>
+      <button type="button" class="btn ghost" id="btnAlmacenRecargar">Cerrar y volver a abrir</button>
+    </div>
+    <p class="hint" style="margin:0;">Si sigue igual, avisa al administrador <b>antes</b> de borrar los datos del navegador o reinstalar la app.</p>
+    <p class="hint" id="gateAlmacenDetalle" style="margin:0.4rem 0 0; font-size:0.75rem;"></p>
+  </div>
+</div>
+
 <div class="gate" id="gateModo">
   <div class="gate-card" style="max-width:460px;">
     <img src="icons/icon-192.png" alt="ENTIMOTORS">
@@ -1109,7 +1166,7 @@
         <span class="hint" style="margin:0;">Pasa a la nube lo que el taller tenía en el teléfono (versión 3.13), desde este teléfono o desde un archivo de respaldo.</span>
       </button>
     </div>
-    <p class="hint" id="gateModoNubeAviso" style="display:none; margin:0.4rem 0 0;">Estás conectado a la nube del taller: aquí no se cargan datos de ejemplo.</p>
+    <p class="hint" id="gateModoNubeAviso" style="display:none; margin:0.4rem 0 0;">Estás conectado a la nube del taller.</p>
   </div>
 </div>
 
@@ -1119,7 +1176,7 @@
       <button type="button" id="btnMenuToggle" aria-label="Abrir menú"><svg class="ic" aria-hidden="true" focusable="false"><use href="#i-menu"></use></svg></button>
       <img src="icons/icon-192.png" alt="">
       <span class="name">ENTI<em>MOTORS</em></span>
-      <span class="tag">OS · demo local</span>
+      <span class="tag" id="topbarTag">OS</span>
     </div>
     <div class="top-right">
       <button type="button" class="icon-btn" id="btnBuscarGlobal" aria-label="Buscar cliente, orden o repuesto" title="Buscar (Ctrl+K)"><svg class="ic" aria-hidden="true" focusable="false"><use href="#i-buscar"></use></svg></button>
@@ -1137,7 +1194,8 @@
         <div class="account-panel" id="accountPanel">
           <span class="chip" id="syncChip"><span class="dot on" id="syncDot"></span><span id="syncLabel">En línea · datos locales</span></span>
           <button class="btn small ghost" id="btnRevisionSync" style="display:none;" title="Cambios que la nube no aceptó, conflictos y stock a revisar">⚠ Por revisar</button>
-          <button class="btn small ghost" id="offlineToggle" title="Simular pérdida de señal para probar el modo sin internet">Simular sin conexión</button>
+          <!-- 3.15 (Bloque 6): herramienta de DESARROLLO, oculta en el producto (solo con config-local.js). El modo sin internet real no depende de ella. -->
+          <button class="btn small ghost" id="offlineToggle" style="display:none;" title=""></button>
           <button class="btn small ghost" id="btnTema" title="Cambiar entre modo claro y oscuro"><svg class="ic" aria-hidden="true" focusable="false"><use id="btnTemaIcono" href="#i-luna"></use></svg> <span id="btnTemaTexto">Modo oscuro</span></button>
           <span class="chip user-chip"><span class="who"><span id="loggedUserName">—</span><small id="loggedUserRole"></small></span></span>
           <button class="btn small ghost" id="btnLogout">Cerrar sesión</button>
@@ -1149,18 +1207,19 @@
   <div id="sidebarBackdrop"></div>
   <div id="sidebar">
     <div class="nav-grp">Taller</div>
-    <button class="nav-item" data-view="mi-trabajo"><svg class="ic" aria-hidden="true" focusable="false"><use href="#i-mantenimiento"></use></svg>Mi trabajo</button>
+    <button class="nav-item" data-view="mi-trabajo"><svg class="ic" aria-hidden="true" focusable="false"><use href="#i-mantenimiento"></use></svg>Mi trabajo<span class="badge" id="navMiTrabajoBadge" style="display:none;"></span></button>
     <button class="nav-item active" data-view="dashboard"><svg class="ic" aria-hidden="true" focusable="false"><use href="#i-dashboard"></use></svg>Página principal</button>
     <button class="nav-item" data-view="pos"><svg class="ic" aria-hidden="true" focusable="false"><use href="#i-tpv"></use></svg>Venta rápida (TPV)</button>
     <button class="nav-item" data-view="ordenes"><svg class="ic" aria-hidden="true" focusable="false"><use href="#i-orden"></use></svg>Órdenes de servicio</button>
     <button class="nav-item" data-view="cotizaciones"><svg class="ic" aria-hidden="true" focusable="false"><use href="#i-cotizacion"></use></svg>Cotizaciones<span class="badge" id="cotizacionesBadge" style="display:none;"></span></button>
     <button class="nav-item" data-view="citas"><svg class="ic" aria-hidden="true" focusable="false"><use href="#i-cita"></use></svg>Citas<span class="badge" id="citasBadge" style="display:none;"></span></button>
+    <button class="nav-item" data-view="mensajes"><svg class="ic" aria-hidden="true" focusable="false"><use href="#i-usuarios"></use></svg>Mensajes al equipo</button>
     <button class="nav-item" data-view="clientes"><svg class="ic" aria-hidden="true" focusable="false"><use href="#i-cliente"></use></svg>Clientes y motos</button>
     <button class="nav-item" data-view="inventario"><svg class="ic" aria-hidden="true" focusable="false"><use href="#i-inventario"></use></svg>Inventario</button>
     <button class="nav-item" data-view="finanzas"><svg class="ic" aria-hidden="true" focusable="false"><use href="#i-finanzas"></use></svg>Finanzas y caja</button>
     <button class="nav-item" data-view="creditos"><svg class="ic" aria-hidden="true" focusable="false"><use href="#i-credito"></use></svg>Créditos</button>
     <div class="nav-grp">Sitio web</div>
-    <button class="nav-item" data-view="web-cms"><svg class="ic" aria-hidden="true" focusable="false"><use href="#i-web"></use></svg>Gestor de la web<span class="badge" id="citasWebBadge" style="display:none;"></span></button>
+    <button class="nav-item" data-view="web-cms"><svg class="ic" aria-hidden="true" focusable="false"><use href="#i-web"></use></svg>Gestor Web ↗</button>
     <button class="nav-item disabled" title="Se administra hoy desde admin.html — se integra en una siguiente etapa"><svg class="ic" aria-hidden="true" focusable="false"><use href="#i-catalogo"></use></svg>Catálogo</button>
     <button class="nav-item disabled" title="Se administra hoy desde admin.html — se integra en una siguiente etapa"><svg class="ic" aria-hidden="true" focusable="false"><use href="#i-trabajos"></use></svg>Trabajos</button>
     <button class="nav-item disabled" title="Se administra hoy desde admin.html — se integra en una siguiente etapa"><svg class="ic" aria-hidden="true" focusable="false"><use href="#i-videos"></use></svg>Videos</button>
@@ -1178,6 +1237,9 @@
       <div class="card" id="miTrabajoAlcance" style="margin-bottom:1rem;">
         <p style="margin:0; color:var(--text-muted);">Aquí aparecen los trabajos que el administrador te asigna. Lo que avances se guarda aunque no haya señal y se envía solo al volver la red.</p>
       </div>
+      <p class="hint" id="miTrabajoVivo" style="margin:-0.4rem 0 0.8rem;"></p>
+      <h3 class="font-display" style="font-size:0.95rem; margin:0 0 0.5rem;">Mensajes del administrador <span class="badge" id="miTrabajoMsgBadge" style="display:none;"></span></h3>
+      <div id="miTrabajoMensajes" style="margin-bottom:1.2rem;"></div>
       <h3 class="font-display" style="font-size:0.95rem; margin:0 0 0.5rem;">Mis citas</h3>
       <div id="miTrabajoCitas"></div>
       <h3 class="font-display" style="font-size:0.95rem; margin:1.2rem 0 0.5rem;">Mis órdenes abiertas</h3>
@@ -1217,7 +1279,7 @@
             <svg class="ic qa-tool t4" aria-hidden="true" focusable="false"><use href="#i-ajustes"></use></svg><svg class="ic qa-tool t5" aria-hidden="true" focusable="false"><use href="#i-mantenimiento"></use></svg><svg class="ic qa-tool t6" aria-hidden="true" focusable="false"><use href="#i-ajustes"></use></svg>
           </div>
           <div class="qa-grid">
-            <button type="button" class="qa-btn" data-view="web-cms"><span class="qa-top"><span class="qa-ic"><svg class="ic" aria-hidden="true" focusable="false"><use href="#i-web"></use></svg></span><span class="qa-num">9</span></span><span class="qa-lbl">Gestor de la web</span></button>
+            <button type="button" class="qa-btn" data-view="web-cms"><span class="qa-top"><span class="qa-ic"><svg class="ic" aria-hidden="true" focusable="false"><use href="#i-web"></use></svg></span><span class="qa-num">9</span></span><span class="qa-lbl">Gestor Web ↗</span></button>
             <button type="button" class="qa-btn" data-view="ajustes"><span class="qa-top"><span class="qa-ic"><svg class="ic" aria-hidden="true" focusable="false"><use href="#i-ajustes"></use></svg></span><span class="qa-num">10</span></span><span class="qa-lbl">Ajustes</span></button>
           </div>
         </div>
@@ -1226,14 +1288,31 @@
       <div class="widget-row" id="widgetRow"></div>
       <div class="widget-grid" id="widgetGrid"></div>
 
-      <div class="dash-section-head">
-        <h3>Sitio web</h3>
-        <span class="demo-flag">Datos de ejemplo · conecta una analítica real para ver números de verdad</span>
-      </div>
-      <div class="widget-grid" id="webWidgetGrid"></div>
+      <!-- 3.15 (Bloque 6): aquí había visitas web INVENTADAS («Datos de ejemplo»). Sin analítica real conectada, no se muestra nada. -->
     </section>
 
     <!-- COTIZACIONES -->
+    <!-- 3.15 (Bloque 3): mensajes del administrador a UN mecánico (no es un chat). El mecánico los ve en Mi Trabajo. -->
+    <section class="view" id="view-mensajes">
+      <div class="view-head">
+        <div>
+          <h2>Mensajes al equipo</h2>
+          <p>Una nota directa para un mecánico. Le aparece en Mi Trabajo al momento; si no hay señal, se envía sola al volver.</p>
+        </div>
+      </div>
+      <p class="hint" id="mensajesVivo" style="margin:-0.4rem 0 0.8rem;"></p>
+      <div class="card" id="mensajesForm" style="margin-bottom:1rem;">
+        <div class="grid-2">
+          <div><label for="msgDestinatario">Para</label><select id="msgDestinatario"></select></div>
+          <div><label for="msgOrden">Orden relacionada (opcional)</label><select id="msgOrden"><option value="">Sin orden relacionada</option></select></div>
+        </div>
+        <label for="msgTexto" style="margin-top:0.6rem;">Mensaje</label>
+        <textarea id="msgTexto" rows="3" maxlength="2000" placeholder="Ej.: Cuando termines los frenos, revisa también la cadena."></textarea>
+        <div style="display:flex; justify-content:flex-end; margin-top:0.6rem;"><button type="button" class="btn" id="btnMsgEnviar">Enviar</button></div>
+      </div>
+      <div id="mensajesLista"></div>
+    </section>
+
     <section class="view" id="view-cotizaciones">
       <div class="view-head">
         <div>
@@ -1267,7 +1346,10 @@
           <p id="detalleSub"></p>
           <p id="detalleMecanicoWrap" style="margin:0.2rem 0 0; font-size:0.85rem; color:var(--text-muted);"></p>
         </div>
-        <button class="btn ghost" id="btnVolverOrdenes">&larr; Volver</button>
+        <div style="display:flex; gap:0.5rem; flex-wrap:wrap; align-items:flex-start;">
+          <button class="btn ghost small" id="btnMensajeOrden" style="display:none;" title="Enviar un mensaje al mecánico de esta orden">Mensaje al mecánico</button>
+          <button class="btn ghost" id="btnVolverOrdenes">&larr; Volver</button>
+        </div>
       </div>
 
       <div class="stages" id="stageTracker"></div>
@@ -1369,7 +1451,7 @@
       <div class="pos-layout">
         <div>
           <div class="pos-buscar-row">
-            <input type="text" id="posBuscar" placeholder="Buscar por nombre o escanear código de barras…">
+            <input type="text" id="posBuscar" placeholder="Buscar por nombre o escanear código de barras…" aria-label="Buscar repuesto por nombre o código de barras">
             <button type="button" class="btn ghost small" id="btnAgregarServicioPOS" title="Cobrar un servicio que no está en el inventario">🔧 Cobrar servicio</button>
           </div>
           <div class="pos-cats" id="posCategorias"></div>
@@ -1380,8 +1462,11 @@
           <div id="posCarrito"><div class="empty" style="padding:1rem 0;">Toca un producto para agregarlo</div></div>
           <div class="pos-total-row"><span>Total</span><span class="big" id="posTotal">L. 0.00</span></div>
 
-          <label id="posClienteLabel">Cliente (opcional)</label>
+          <label id="posClienteLabel" for="posCliente">Cliente (opcional)</label>
           <select id="posCliente"><option value="">Cliente de mostrador</option></select>
+          <!-- 3.15 (Checkpoint 8A): o un nombre escrito para ESTA venta (queda en la factura tal cual); registrarlo es opcional -->
+          <input type="text" id="posClienteNombre" maxlength="80" autocomplete="off" placeholder="…o escribe el nombre para la factura" style="margin-top:0.4rem;">
+          <button type="button" class="btn ghost small" id="btnPosAgregarCliente" style="display:none; margin-top:0.35rem;">➕ Agregar como cliente</button>
 
           <label>Tipo de cobro</label>
           <div class="seg-toggle" id="posTipoCobro">
@@ -1390,7 +1475,7 @@
           </div>
 
           <div id="posContadoBox">
-            <label>Método de pago</label>
+            <label for="posMetodo">Método de pago</label>
             <select id="posMetodo">
               <option value="efectivo">Efectivo</option>
               <option value="transferencia">Transferencia</option>
@@ -1398,7 +1483,7 @@
             </select>
 
             <div id="posEfectivoBox">
-              <label>Efectivo recibido</label>
+              <label for="posEfectivoRecibido">Efectivo recibido</label>
               <input type="number" id="posEfectivoRecibido" min="0" step="0.01">
               <p class="hint" style="margin-top:-0.5rem;">Cambio a devolver: <b id="posCambio">L. 0.00</b></p>
             </div>
@@ -1431,7 +1516,7 @@
     <!-- FINANZAS Y CAJA -->
     <section class="view fin-view" id="view-finanzas">
       <div class="view-head">
-        <div><h2>Finanzas y caja</h2><p>Estado de caja, cuentas por cobrar y el resumen de utilidad del taller.</p></div>
+        <div><h2>Finanzas y caja</h2><p>Lo cobrado (dinero que entró), lo que se debe y la utilidad bruta con el costo histórico de cada repuesto. Día de Honduras.</p></div>
         <button class="btn ghost small" id="btnImprimirCierre">🖨 Cierre del día</button>
       </div>
 
@@ -1467,27 +1552,27 @@
         <h3 class="font-display" style="font-size:0.95rem; margin-bottom:0.2rem;">Registrar movimiento</h3>
         <p class="hint" style="margin-top:0;">Ingresos y egresos que no vienen de una venta o un crédito — apertura de caja, compras, planilla, etc.</p>
         <div class="field-row">
-          <div><label>Tipo</label>
+          <div><label for="moviTipo">Tipo</label>
             <select id="moviTipo"><option value="ingreso">Ingreso</option><option value="egreso">Egreso</option></select>
           </div>
-          <div><label>Categoría</label>
+          <div><label for="moviCategoria">Categoría</label>
             <select id="moviCategoria">
               <option>Apertura de caja</option><option>Cierre de caja</option>
               <option>Compra de repuestos</option><option>Servicios / renta</option>
               <option>Planilla</option><option>Otro</option>
             </select>
           </div>
-          <div><label>Monto (L.)</label><input type="number" id="moviMonto" min="0" step="0.01"></div>
+          <div><label for="moviMonto">Monto (L.)</label><input type="number" id="moviMonto" min="0" step="0.01"></div>
         </div>
         <div class="field-row" style="grid-template-columns:1fr 2fr;">
-          <div><label>Método de pago</label>
+          <div><label for="moviMetodo">Método de pago</label>
             <select id="moviMetodo">
               <option value="efectivo">Efectivo</option>
               <option value="transferencia">Transferencia</option>
               <option value="tarjeta">Tarjeta</option>
             </select>
           </div>
-          <div><label>Descripción</label><input type="text" id="moviDescripcion" placeholder="Detalle del movimiento"></div>
+          <div><label for="moviDescripcion">Descripción</label><input type="text" id="moviDescripcion" placeholder="Detalle del movimiento"></div>
         </div>
         <button class="btn primary small" id="btnGuardarMovimiento">Registrar</button>
       </div>
@@ -1495,9 +1580,9 @@
       <div class="view-head" style="margin-top:1.4rem;">
         <div><h3 style="font-family:'Teko',sans-serif; text-transform:uppercase; font-size:1.2rem;">Movimientos</h3></div>
         <div class="filtros-fecha" style="flex:1 1 320px;">
-          <div class="filtro-fechas-group"><label>Desde</label><input type="date" id="finDesde"></div>
-          <div class="filtro-fechas-group"><label>Hasta</label><input type="date" id="finHasta"></div>
-          <div class="filtro-fechas-group"><label>Tipo</label>
+          <div class="filtro-fechas-group"><label for="finDesde">Desde</label><input type="date" id="finDesde"></div>
+          <div class="filtro-fechas-group"><label for="finHasta">Hasta</label><input type="date" id="finHasta"></div>
+          <div class="filtro-fechas-group"><label for="finTipoFiltro">Tipo</label>
             <select id="finTipoFiltro">
               <option value="">Todos</option><option value="ingreso">Ingresos</option><option value="egreso">Egresos</option>
             </select>
@@ -1520,8 +1605,8 @@
         <span class="demo-flag" id="finanzasChartsFlag" style="display:none;">Aún no hay movimientos suficientes — usa el TPV o Finanzas para ver datos aquí</span>
       </div>
       <div class="charts-grid compact">
-        <div class="card chart-card"><h4>Ingresos vs Gastos (últimos 7 días)</h4><div class="chart-canvas-wrap"><canvas id="chartIngresosGastos"></canvas></div></div>
-        <div class="card chart-card"><h4>Ganancias por línea de negocio</h4><div class="chart-canvas-wrap"><canvas id="chartOrigenIngresos"></canvas></div></div>
+        <div class="card chart-card"><h4>Cobrado vs gastos (últimos 7 días)</h4><div class="chart-canvas-wrap"><canvas id="chartIngresosGastos"></canvas></div></div>
+        <div class="card chart-card"><h4>Facturado por línea de negocio (todo el historial)</h4><div class="chart-canvas-wrap"><canvas id="chartOrigenIngresos"></canvas></div></div>
         <div class="card chart-card"><h4>Top 5 repuestos con mayor rotación</h4><div class="chart-canvas-wrap"><canvas id="chartTopRepuestos"></canvas></div></div>
       </div>
     </section>
@@ -1552,30 +1637,7 @@
       <div class="empty" id="creditosEmpty" style="display:none;">Aún no hay créditos registrados.</div>
     </section>
 
-    <!-- GESTOR DE LA WEB -->
-    <section class="view" id="view-web-cms">
-      <div class="view-head">
-        <div><h2>Gestor de la página web</h2><p>Contenido local de demo — conectarlo con entimotors.com de verdad requiere el backend real del sitio.</p></div>
-      </div>
-
-      <div class="card">
-        <h3 class="font-display" style="font-size:0.95rem; margin-bottom:0.6rem;">Portada (hero)</h3>
-        <label>Título principal</label>
-        <input type="text" id="cmsHeroTitulo" placeholder="Ej. Tu moto en las mejores manos">
-        <label>Subtítulo</label>
-        <input type="text" id="cmsHeroSubtitulo" placeholder="Ej. Repuestos, mantenimiento y reparación en Tegucigalpa">
-        <label>Promociones (una por línea)</label>
-        <textarea id="cmsPromos" rows="3" placeholder="Ej. 10% de descuento en cambio de aceite este mes"></textarea>
-        <label>Catálogo de servicios (uno por línea)</label>
-        <textarea id="cmsServicios" rows="3" placeholder="Ej. Diagnóstico general&#10;Cambio de aceite&#10;Frenos"></textarea>
-        <button class="btn primary small" id="btnGuardarCMS">Guardar cambios</button>
-      </div>
-
-      <div class="view-head" style="margin-top:1.4rem;">
-        <div><h3 style="font-family:'Teko',sans-serif; text-transform:uppercase; font-size:1.2rem;">Citas agendadas desde la web</h3></div>
-      </div>
-      <div id="citasWebList"></div>
-    </section>
+    <!-- 3.15 (Bloque 6): el gestor web LOCAL (falso) se retiró; «Gestor Web» abre el panel real del sitio (solo admin). -->
 
     <!-- USUARIOS Y EQUIPO — solo administrador; el servidor lo comprueba aparte -->
     <section class="view" id="view-usuarios">
@@ -1630,9 +1692,41 @@
         </form>
       </section>
 
+      <!-- 3.15 (Bloque 4): PIN del propietario (tarjeta propia). Nunca se muestra ni se guarda en el dispositivo: solo se configura o se reemplaza. -->
+      <section class="card seguridad-card" id="cardPinPropietario" aria-labelledby="tituloPinPropietario" style="display:none; margin-top:1rem;">
+        <h4 class="seguridad-subtitulo" id="tituloPinPropietario">PIN del propietario</h4>
+        <p class="hint" id="pinPropEstado" role="status" aria-live="polite"></p>
+        <p class="hint" style="margin-top:0;">Protege lo destructivo: anular una venta o un crédito, revertir caja o abonos, anular una orden cobrada y eliminar usuarios. El trabajo normal del día no lo pide. Nadie puede verlo: si se olvida, se reemplaza con la contraseña de tu cuenta.</p>
+        <form id="formPinPropietario" class="form-clave" aria-labelledby="tituloPinPropietario" novalidate style="display:none;">
+          <div class="campo-clave" id="filaPinActual">
+            <label for="pinPropActual">PIN actual</label>
+            <input type="password" id="pinPropActual" inputmode="numeric" autocomplete="off" maxlength="6" pattern="[0-9]*">
+          </div>
+          <div class="campo-clave" id="filaPinClaveCuenta">
+            <label for="pinPropClave">Contraseña de tu cuenta</label>
+            <input type="password" id="pinPropClave" autocomplete="current-password" autocapitalize="off" spellcheck="false" maxlength="256">
+          </div>
+          <div class="campo-clave" id="filaPinNuevo">
+            <label for="pinPropNuevo">PIN nuevo (6 dígitos)</label>
+            <input type="password" id="pinPropNuevo" inputmode="numeric" autocomplete="off" maxlength="6" pattern="[0-9]*">
+          </div>
+          <div class="campo-clave" id="filaPinConfirmar">
+            <label for="pinPropConfirmar">Repite el PIN nuevo</label>
+            <input type="password" id="pinPropConfirmar" inputmode="numeric" autocomplete="off" maxlength="6" pattern="[0-9]*">
+          </div>
+          <div style="display:flex; gap:0.5rem; flex-wrap:wrap;">
+            <button type="submit" class="btn primary small" id="btnPinPropGuardar">Guardar PIN</button>
+            <button type="button" class="btn ghost small" id="btnPinPropOlvide">Olvidé el PIN</button>
+            <button type="button" class="btn ghost small" id="btnPinPropCambiar" style="display:none;">Usar mi PIN actual</button>
+          </div>
+          <p class="clave-estado" id="pinPropMsg" role="status" aria-live="polite"></p>
+        </form>
+      </section>
+
       <div class="card">
-        <h3 class="font-display" style="font-size:0.95rem; margin-bottom:0.4rem;">Respaldar datos</h3>
-        <p class="hint" style="margin-top:0;">Guarda un archivo con TODO lo de este dispositivo. Antes de dártelo se vuelve a leer y se comprueba registro por registro, así sabes que el respaldo sirve de verdad.</p>
+        <h3 class="font-display" style="font-size:0.95rem; margin-bottom:0.4rem;" id="respaldoTitulo">Copia de este dispositivo</h3>
+        <p class="hint" style="margin-top:0;" id="respaldoAlcance">Guarda un archivo con lo que este dispositivo tiene guardado. Antes de dártelo se vuelve a leer y se comprueba tabla por tabla.</p>
+        <p class="aviso-fuerte" style="display:none; margin:0 0 0.6rem;" id="respaldoNoEmpresa"></p>
         <div id="respaldoEstado" class="respaldo-estado" style="display:none;"></div>
         <div style="display:flex; gap:0.5rem; flex-wrap:wrap;">
           <button class="btn wa small" id="btnCompartirRespaldo">📲 Compartir copia</button>
@@ -1643,7 +1737,7 @@
       </div>
 
       <div class="card" style="margin-top:1rem; display:none;" id="cardImport313">
-        <h3 class="font-display" style="font-size:0.95rem; margin-bottom:0.4rem;">Pasar los datos de la versión 3.13 a la nube</h3>
+        <h3 class="font-display" style="font-size:0.95rem; margin-bottom:0.4rem;" id="import313Titulo">Pasar los datos de la versión 3.13 a la nube</h3>
         <p class="hint" style="margin-top:0;">Lleva a la nube lo que el taller guardaba en el teléfono. Primero te mostramos qué trae y nada se sube hasta que confirmes. El teléfono y el archivo no se borran.</p>
         <p class="hint" id="import313Estado" style="margin:0 0 0.6rem;"></p>
         <button type="button" class="btn primary small" id="btnAbrirImport313">Revisar e importar</button>
@@ -1651,8 +1745,8 @@
 
       <div class="card" style="margin-top:1rem;" id="cardRestaurar">
         <h3 class="font-display" style="font-size:0.95rem; margin-bottom:0.4rem;">Restaurar desde un respaldo</h3>
-        <p class="hint" style="margin-top:0;">Elige el archivo y te mostramos qué trae antes de tocar nada. Después decides si reemplaza lo que hay o si se suma.</p>
-        <label class="btn small" for="inputRestaurar" style="cursor:pointer; display:inline-block;">Elegir archivo de respaldo</label>
+        <p class="hint" style="margin-top:0;" id="restaurarAlcance">Elige el archivo y te mostramos qué trae antes de tocar nada. Después decides si reemplaza lo que hay o si se suma.</p>
+        <label class="btn small" for="inputRestaurar" style="cursor:pointer; display:inline-block;" id="labelRestaurar">Elegir archivo de respaldo</label>
         <input type="file" id="inputRestaurar" accept="application/json,.json" style="display:none;">
       </div>
 
@@ -1819,25 +1913,29 @@
 <!-- Modal: agregar un renglón a la cotización -->
 <div class="modal-bg" id="modalItemCot">
   <div class="modal">
-    <h3>Agregar a la cotización</h3>
-    <label>Tipo</label>
+    <h3 id="cotItemTitulo">Agregar a la cotización</h3>
+    <label for="cotItemTipo">Tipo de renglón</label>
     <select id="cotItemTipo">
-      <option value="manual">Escribirlo a mano</option>
-      <option value="inventario">Tomarlo del inventario</option>
+      <option value="mano_obra">Taller · mano de obra</option>
+      <option value="repuesto_inventario">Repuesto del negocio (inventario)</option>
+      <option value="repuesto_manual">Repuesto manual (no está en el inventario)</option>
     </select>
     <div id="cotItemManualBox">
-      <label>Descripción</label>
-      <input type="text" id="cotItemNombre" placeholder="Ej. Mano de obra, pastillas delanteras…">
+      <label for="cotItemNombre" id="cotItemNombreLabel">Descripción</label>
+      <input type="text" id="cotItemNombre" placeholder="Ej. Mano de obra de frenos">
     </div>
     <div id="cotItemInvBox" style="display:none;">
-      <label>Repuesto</label>
-      <select id="cotItemInvSelect"></select>
-      <p class="hint" style="margin-top:-0.5rem;">Cotizar no descuenta stock. Se descuenta cuando la cotización se convierta en orden.</p>
+      <label for="cotItemBuscar">Producto</label>
+      <input type="search" id="cotItemBuscar" placeholder="Buscar por nombre…" autocomplete="off">
+      <select id="cotItemInvSelect" size="5" class="renglon-productos" aria-label="Productos del inventario"></select>
+      <p class="hint" id="cotItemInvInfo" style="margin-top:0.3rem;">Cotizar no descuenta stock: se descuenta cuando el cliente la acepta.</p>
     </div>
     <div class="field-row" style="grid-template-columns:1fr 1fr;">
-      <div><label>Cantidad</label><input type="number" id="cotItemCantidad" value="1" min="1"></div>
-      <div><label>Precio unitario (L.)</label><input type="number" id="cotItemPrecio" step="0.01" min="0"></div>
+      <div><label for="cotItemCantidad">Cantidad</label><input type="number" id="cotItemCantidad" value="1" min="0" step="any" inputmode="decimal"></div>
+      <div><label for="cotItemPrecio">Precio unitario (L.)</label><input type="number" id="cotItemPrecio" step="0.01" min="0" inputmode="decimal"></div>
     </div>
+    <p class="hint" id="cotItemPrecioNota" style="margin-top:-0.3rem;"></p>
+    <div class="renglon-subtotal"><span>Subtotal</span><b id="cotItemSubtotal">L 0.00</b></div>
     <div class="modal-actions">
       <button class="btn ghost" id="btnCancelarItemCot">Cancelar</button>
       <button class="btn primary" id="btnGuardarItemCot">Agregar</button>
@@ -2035,19 +2133,29 @@
 <!-- Modal: item de presupuesto -->
 <div class="modal-bg" id="modalItem">
   <div class="modal">
-    <h3>Agregar al presupuesto</h3>
-    <label>Origen</label>
-    <select id="itemOrigen"><option value="manual">Manual</option><option value="inventario">Desde inventario</option></select>
-    <div id="itemManualFields">
-      <label>Nombre</label><input type="text" id="itemNombre">
+    <h3 id="itemTitulo">Agregar al presupuesto</h3>
+    <label for="itemTipo">Tipo de renglón</label>
+    <select id="itemTipo">
+      <option value="mano_obra">Taller · mano de obra</option>
+      <option value="repuesto_inventario">Repuesto del negocio (inventario)</option>
+      <option value="repuesto_manual">Repuesto manual (no está en el inventario)</option>
+    </select>
+    <div id="itemManualBox">
+      <label for="itemNombre" id="itemNombreLabel">Descripción</label>
+      <input type="text" id="itemNombre" placeholder="Ej. Mano de obra de frenos">
     </div>
-    <div id="itemInventarioFields" style="display:none;">
-      <label>Repuesto</label><select id="itemInventarioSelect"></select>
+    <div id="itemInvBox" style="display:none;">
+      <label for="itemBuscar">Producto</label>
+      <input type="search" id="itemBuscar" placeholder="Buscar por nombre…" autocomplete="off">
+      <select id="itemInvSelect" size="5" class="renglon-productos" aria-label="Productos del inventario"></select>
+      <p class="hint" id="itemInvInfo" style="margin-top:0.3rem;">Se descuenta del inventario solo cuando el presupuesto esté aprobado.</p>
     </div>
     <div class="field-row" style="grid-template-columns:1fr 1fr;">
-      <div><label>Cantidad</label><input type="number" id="itemCantidad" value="1" min="1"></div>
-      <div><label>Precio unitario (L.)</label><input type="number" id="itemPrecio" step="0.01" min="0"></div>
+      <div><label for="itemCantidad">Cantidad</label><input type="number" id="itemCantidad" value="1" min="0" step="any" inputmode="decimal"></div>
+      <div><label for="itemPrecio">Precio unitario (L.)</label><input type="number" id="itemPrecio" step="0.01" min="0" inputmode="decimal"></div>
     </div>
+    <p class="hint" id="itemPrecioNota" style="margin-top:-0.3rem;"></p>
+    <div class="renglon-subtotal"><span>Subtotal</span><b id="itemSubtotal">L 0.00</b></div>
     <div class="modal-actions">
       <button class="btn ghost" id="btnCancelarItem">Cancelar</button>
       <button class="btn primary" id="btnGuardarItem">Agregar</button>
@@ -2210,10 +2318,25 @@
 <div class="modal-bg" id="modalConfirm">
   <div class="modal">
     <h3 id="confirmTitulo">Confirmar</h3>
-    <p class="hint" style="margin-top:0;" id="confirmMensaje"></p>
+    <p class="hint" style="margin-top:0; white-space:pre-line;" id="confirmMensaje"></p>
     <div class="modal-actions">
       <button class="btn ghost" id="btnConfirmCancelar">Cancelar</button>
       <button class="btn primary" id="btnConfirmAceptar">Aceptar</button>
+    </div>
+  </div>
+</div>
+
+<!-- 3.15 (Checkpoint 8A) · ¿Es un cliente que ya existe? Coincidencias por teléfono / nombre; la persona elige SIEMPRE (nunca se une
+     ni se crea solo). Botones con su significado literal: «Usar este cliente», «Crear cliente nuevo», «Seguir solo con el nombre», «Cancelar». -->
+<div class="modal-bg" id="modalCoincidencias">
+  <div class="modal">
+    <h3 id="coincTitulo">¿Es un cliente que ya tienes?</h3>
+    <p class="hint" style="margin-top:0; white-space:pre-line;" id="coincMensaje"></p>
+    <div id="coincLista" style="display:flex; flex-direction:column; gap:0.4rem; margin-bottom:0.8rem;"></div>
+    <div class="modal-actions" style="flex-wrap:wrap;">
+      <button class="btn ghost" id="btnCoincCancelar">Cancelar</button>
+      <button class="btn ghost" id="btnCoincSinRegistrar">Seguir solo con el nombre</button>
+      <button class="btn primary" id="btnCoincNuevo">Crear cliente nuevo</button>
     </div>
   </div>
 </div>
@@ -2406,8 +2529,8 @@
     <div class="respaldo-estado" id="versionNuevaEstado"></div>
 
     <div class="aviso-fuerte">
-      Antes de actualizar conviene guardar una copia de toda la información de este
-      dispositivo. Si algo saliera mal, con esa copia se recupera todo.
+      <span id="versionNuevaAvisoCopia">Antes de actualizar conviene guardar una copia de lo que este dispositivo
+      tiene guardado.</span>
     </div>
 
     <div class="modal-actions" style="flex-direction:column; align-items:stretch; gap:0.5rem;">
@@ -2569,43 +2692,44 @@
   <div style="margin-top:1rem; font-size:0.8rem; color:#666;">Resumen de todas las facturas a crédito de este cliente.</div>
 </div>
 
-<!-- config-local.js es opcional (ignorado por Git): sin él, el login local de
-     TEAM y el código de administrador quedan deshabilitados, pero el resto de
-     la app sigue funcionando igual. Ver config-local.example.js. -->
 <!-- Declara si esta copia es el taller o «Mi Trabajo». Va primero: app.js lo
      lee al arrancar. Ver build-target.js. -->
-<script src="build-target.js?v=3.14.1"></script>
+<script src="build-target.js?v=3.15.0"></script>
 <!-- Capa de Supabase. Si supabase-config.js no existe o está sin rellenar, los
      cuatro se cargan igual y no hacen nada: la app sigue funcionando entera con
      IndexedDB, como hasta ahora. -->
-<script src="supabase-config.js?v=3.14.1"></script>
-<script src="supabase-client.js?v=3.14.1"></script>
-<script src="auth.js?v=3.14.1"></script>
-<script src="recovery.js?v=3.14.1"></script>
-<script src="config-local.js?v=3.14.1"></script>
+<script src="supabase-config.js?v=3.15.0"></script>
+<script src="supabase-client.js?v=3.15.0"></script>
+<script src="auth.js?v=3.15.0"></script>
+<script src="recovery.js?v=3.15.0"></script>
+<!-- 3.15 (Bloque 3): día empresarial America/Tegucigalpa (hoy, caja del día, filtros). Antes de app.js. -->
+<script src="fecha-negocio.js?v=3.15.0"></script>
+<script src="finanzas-calc.js?v=3.15.0"></script>
 <!-- Núcleo de sincronización (SYNC-4) + mappers reales (SYNC-5). Apagado por
      defecto (ver sync-engine.js): sin ENTIMOTORS_SYNC.enabled === true, que
      app.js solo pone en true dentro de prepararModoNube() para una sesión de
      Supabase activa, no abren ninguna base ni hacen ninguna petición. -->
-<script src="sync-rest.js?v=3.14.1"></script>
-<script src="sync-db.js?v=3.14.1"></script>
-<script src="sync-engine.js?v=3.14.1"></script>
-<script src="sync-mappers.js?v=3.14.1"></script>
-<script src="sync-fotos.js?v=3.14.1"></script>
+<script src="sync-rest.js?v=3.15.0"></script>
+<script src="sync-db.js?v=3.15.0"></script>
+<script src="sync-engine.js?v=3.15.0"></script>
+<!-- 3.15 (Bloque 3): avisos en tiempo real (Supabase Realtime, Broadcast privado). Sin sesión de nube no abre nada. -->
+<script src="sync-realtime.js?v=3.15.0"></script>
+<script src="sync-mappers.js?v=3.15.0"></script>
+<script src="sync-fotos.js?v=3.15.0"></script>
 <!-- SYNC-7B: dinero y stock por RPC en modo nube (antes de app.js: prepararModoNube la arma) -->
-<script src="sync-finanzas.js?v=3.14.1"></script>
+<script src="sync-finanzas.js?v=3.15.0"></script>
 <!-- Autorización con PIN administrativo (SYNC-7, D-7): habla con el api-server, nunca con Supabase
      directo. Va antes de app.js porque prepararModoNube() la inicializa (PinUI.prepararInstancia). -->
-<script src="pin-ui.js?v=3.14.1"></script>
+<script src="pin-ui.js?v=3.15.0"></script>
 <!-- SYNC-10: importador 3.13 → nube (validación, vista previa, paquete atómico) -->
-<script src="import-313.js?v=3.14.1"></script>
+<script src="import-313.js?v=3.15.0"></script>
 <!-- el ?v= debe cambiar cada vez que se toque app.js (junto con CACHE_NAME en
      sw.js) — es la forma más universal de forzar que CUALQUIER navegador
      pida el archivo de nuevo aunque ya tenga guardada una copia vieja en su
      propio caché HTTP, sin depender de que respete el Service Worker. -->
-<script src="app.js?v=3.14.1"></script>
+<script src="app.js?v=3.15.0"></script>
 <!-- Pantalla «Usuarios y equipo»: habla con el api-server, no con IndexedDB.
      Va después de app.js porque solo se invoca al abrir esa vista. -->
-<script src="usuarios.js?v=3.14.1"></script>
+<script src="usuarios.js?v=3.15.0"></script>
 </body>
 </html>

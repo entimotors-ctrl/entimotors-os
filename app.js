@@ -1,4 +1,4 @@
-// ENTIMOTORS OS — demo local. Todo vive en IndexedDB del navegador: no hay backend.
+// ENTIMOTORS OS — taller. Nube (Supabase) + caché local en IndexedDB para trabajar sin internet; modo local solo en desarrollo.
 // El "sincronizado / sin conexión" de la barra superior es una simulación para
 // mostrar cómo se sentiría el modo híbrido; la versión real empujaría esta
 // misma cola de cambios hacia Supabase cuando vuelva la señal.
@@ -86,6 +86,7 @@ function sesionAdmitida(session) {
 // Deja la app cerrada y devuelve a quien sea al login, sin haber abierto base
 // alguna. No borra nada del dispositivo: solo se va la sesión.
 async function denegarSesion(motivo) {
+  try { detenerRealtime(); } catch (e) { /* aún no definido en el primer arranque */ }
   currentUser = null;
   document.getElementById("shell").classList.remove("active");
   /* Sin esto el login se enseña muerto: arrancarConSesion() solo cablea el
@@ -130,21 +131,22 @@ const VISTAS_SOLO_ADMIN = ["finanzas", "web-cms", "ajustes", "usuarios"];
 // ni al POS ni a créditos, que hasta 4E-1 tenía abiertos de par en par.
 const VISTAS_FUERA_DEL_MECANICO = [
   "dashboard", "citas", "ordenes", "clientes", "cotizaciones",
-  "inventario", "pos", "creditos", "finanzas", "web-cms", "ajustes", "usuarios",
+  "inventario", "pos", "creditos", "finanzas", "web-cms", "ajustes", "usuarios", "mensajes",
 ];
 const VISTAS_OCULTAS_POR_ROL = {
   admin: ["mi-trabajo"],
-  cajero: ["web-cms", "ajustes", "usuarios", "mi-trabajo"],
+  // 3.15 (Bloque 3): «mensajes» (al equipo) es del administrador: el cajero no escribe como administrador
+  cajero: ["web-cms", "ajustes", "usuarios", "mi-trabajo", "mensajes"],
   // Las cuentas locales de la lista TEAM siguen con lo de siempre; a quien
   // entra con cuenta real se le aplica VISTAS_FUERA_DEL_MECANICO (ver
   // vistasOcultasParaSesion). Este valor es el del modo local histórico.
-  mecanico: VISTAS_SOLO_ADMIN.concat("mi-trabajo"),
+  mecanico: VISTAS_SOLO_ADMIN.concat("mi-trabajo", "mensajes"),
   desarrollador: null,   // null = no entra al taller; ver panel-tecnico.html
 };
 
 function vistasOcultasParaSesion() {
   if (esMecanicoCuenta()) return VISTAS_FUERA_DEL_MECANICO;
-  return VISTAS_OCULTAS_POR_ROL[currentUser?.rol] ?? VISTAS_SOLO_ADMIN.concat("mi-trabajo");
+  return VISTAS_OCULTAS_POR_ROL[currentUser?.rol] ?? VISTAS_SOLO_ADMIN.concat("mi-trabajo", "mensajes");
 }
 function vistaInicial() { return esMecanicoCuenta() ? "mi-trabajo" : "dashboard"; }
 /* ── Quién es quién, y qué es suyo ─────────────────────────────────────────
@@ -277,6 +279,20 @@ function fileToDataUrl(file) {
     r.onload = () => resolve(r.result);
     r.readAsDataURL(file);
   });
+}
+/* 3.15 (Bloque 7) · FOTOS NUEVAS del Taller (orden, moto, repuesto). Antes se guardaba el archivo ORIGINAL de la cámara en base64 dentro
+   del registro (3–7 MB por foto): cada lectura de órdenes copiaba todas las fotos y la lista decodificaba la imagen completa para una
+   miniatura de 44 px. Ahora pasan por la MISMA compresión que ya usa Mi Trabajo para la evidencia que sube a la nube (lado mayor 1600 px,
+   JPEG 0.82, orientación EXIF respetada). Solo si la versión comprimida es más pequeña; si no se puede comprimir (formato raro, error),
+   se guarda la ORIGINAL: nunca se pierde una foto. Las fotos ya guardadas NO se tocan. */
+async function fotoLocal(file) {
+  if (window.SyncFotos && file && /^image\/(jpeg|jpg|png|webp|heic|heif)$/i.test(file.type || "")) {
+    try {
+      const { blob } = await SyncFotos.comprimir(file);
+      if (blob && blob.size > 0 && blob.size < file.size) return await fileToDataUrl(blob);
+    } catch (e) { /* se guarda la original */ }
+  }
+  return fileToDataUrl(file);
 }
 function toWaDigits(raw) {
   const digits = (raw || "").replace(/\D/g, "");
@@ -584,10 +600,13 @@ async function guardarSincronizado(store, value) {
   const esAltaInventario = store === "inventario" && (value.id === undefined || value.id === null);
   const cantidadInicial = esAltaInventario ? (Number(value.cantidad) || 0) : null;
   const v = store === "motos" ? await aplicarNoRetrocederKm(value) : value;
+  // 3.15 (Bloque 1A): los renglones se arman ANTES de escribir la cabecera. Un repuesto elegido del inventario viaja con el
+  // uid de nube de ESE producto (nunca se deduce después por el nombre); uno manual, con inventario_id = null. Si un repuesto
+  // no tuviera uid, se corta aquí y no queda una cabecera guardada sin sus renglones.
+  const itemsCot = store === "cotizaciones" ? await renglonesCotizacionNube(v.items || []) : null;
   const r = await syncMotor.escribir(store, v);
   if (store === "cotizaciones" && r && r.uid) {
-    const items = (v.items || []).map((it) => ({ nombre: it.nombre, cantidad: it.cantidad, precio: it.precio, inventario_id: null }));
-    await syncMotor.encolarRpc("sync_guardar_items_cotizacion", { p_cotizacion_id: r.uid, p_items: items }, { entidad: "cotizaciones", uid: r.uid });
+    await syncMotor.encolarRpc("sync_guardar_items_cotizacion", { p_cotizacion_id: r.uid, p_items: itemsCot }, { entidad: "cotizaciones", uid: r.uid });
   }
   /* SYNC-6: el mapper "ordenes" del mecánico manda columnas=[]/aCloud()={} a propósito (ver sync-mappers.js),
      así que syncMotor.escribir() de arriba ya escribió la copia LOCAL pero no empujó nada a la nube. El único
@@ -605,6 +624,27 @@ async function guardarSincronizado(store, value) {
     await syncMotor.encolarRpc("registrar_stock_inicial", { p_inventario_id: r.uid, p_cantidad: cantidadInicial }, { entidad: "inventario", uid: r.uid });
   }
   return r.id;
+}
+
+/* Renglones de cotización → formato de sync_guardar_items_cotizacion. inventarioId (id local elegido en pantalla) manda;
+   si el renglón bajó de la nube con un repuesto que aquí no está en caché, se conserva su inventarioUid tal cual. */
+async function renglonesCotizacionNube(items) {
+  // todas las búsquedas uid ← id local en UNA transacción de lectura (una por renglón costaba ~10 ms cada una)
+  const uids = await syncBd.transaccion(["mapa"], "readonly", async (t) => {
+    const m = [];
+    for (const it of items) m.push(it.inventarioId != null ? ((await t.porIndice("mapa", "by_local", ["inventario", it.inventarioId])) || {}).uid || null : null);
+    return m;
+  });
+  return items.map((it, i) => {
+    let inv = null;
+    if (it.inventarioId != null) {
+      inv = uids[i];
+      if (!inv) throw new Error(`El repuesto «${it.nombre}» todavía no tiene identidad en la nube: vuelve a intentarlo en unos segundos`);
+    } else if (it.inventarioUid) inv = it.inventarioUid;
+    // 3.15 (Bloque 2): el tipo viaja tal cual; un renglón viejo sin tipo sube sin tipo (el servidor lo deja «sin clasificar»
+    // salvo que tenga producto, que es lo único que lo hace repuesto del negocio)
+    return { nombre: it.nombre, cantidad: it.cantidad, precio: it.precio, inventario_id: inv, tipo: it.tipo || null };
+  });
 }
 
 // Solo estos 7 campos: exactamente los que permite el trigger ordenes_mecanico_avance (fase4d) y que
@@ -625,16 +665,65 @@ async function encolarAvanceTecnico(ordenUid, v) {
   await syncMotor.encolarRpc("avanzar_orden_tecnico", { p_orden_id: ordenUid, p_campos: campos }, { entidad: "ordenes", uid: ordenUid });
 }
 
+/* 3.15 (Bloque 3): con sesión de NUBE, una entidad sincronizada sin su base de sync (no abrió, o el navegador la cerró) NO se lee ni
+   se guarda en entimotors_os_demo: eso era guardar trabajo que nunca subiría. Se bloquea a la vista (mostrarFalloAlmacen). */
+function sinAlmacenNube(store) {
+  return currentUser?.origen === "supabase" && ENTIDADES_SYNC.includes(store) && (!!falloAlmacen || !modoNubeActivo(store) || !!syncBd?.cerradaPorNavegador);
+}
+function exigirAlmacen(store) {
+  if (!sinAlmacenNube(store)) return;
+  if (!falloAlmacen) mostrarFalloAlmacen({ tipo: syncBd?.cerradaPorNavegador ? "cerrada" : "no-disponible", error: null });
+  throw new Error("ALMACEN_NO_DISPONIBLE: " + store);
+}
+/* 3.15 (Bloque 7) · LISTAS LARGAS POR TRAMOS. Con volumen (miles de órdenes, clientes, créditos o movimientos) pintar TODAS las filas de
+   golpe costaba de 0,4 a 2 s por pantalla y dejaba >100 000 nodos en la página. Ahora se pintan las primeras 200 (las más recientes, en el
+   mismo orden de siempre) y un botón «Mostrar más» con cuántas quedan. Totales, contadores, filtros y búsqueda siguen usando TODOS los datos:
+   solo cambia cuántas filas se dibujan a la vez. Con el volumen actual del taller (decenas de filas) no cambia nada visible. */
+const TRAMO_LISTA = 200;
+const tramosLista = {};
+function limiteLista(clave) { return tramosLista[clave] || TRAMO_LISTA; }
+/** Botón «Mostrar más» (fila de tabla si `columnas`, bloque si no). Vacío si ya se ve todo. */
+function verMasLista(clave, total, { columnas = 0 } = {}) {
+  const quedan = total - limiteLista(clave);
+  if (quedan <= 0) return "";
+  const boton = `<button type="button" class="btn ghost small" data-ver-mas="${esc(clave)}">Mostrar ${Math.min(TRAMO_LISTA, quedan)} más · quedan ${quedan} de ${total}</button>`;
+  return columnas ? `<tr class="fila-ver-mas"><td colspan="${columnas}" style="text-align:center; padding:0.8rem;">${boton}</td></tr>` : `<div class="fila-ver-mas" style="text-align:center; padding:0.8rem;">${boton}</div>`;
+}
+function conectarVerMas(contenedor, clave, repintar) {
+  contenedor.querySelector(`[data-ver-mas="${CSS.escape(clave)}"]`)?.addEventListener("click", (e) => {
+    e.stopPropagation();
+    tramosLista[clave] = limiteLista(clave) + TRAMO_LISTA;
+    repintar();
+  });
+}
+
+/* 3.15 (Bloque 7) · índice en memoria para cruzar tablas dentro de UN render. Antes cada fila hacía un .find() sobre la otra tabla
+   (O(filas × filas): con 2 500 órdenes y 2 500 motos, millones de comparaciones por pintada). Misma semántica que .find(x => x[campo] === v):
+   si hay claves repetidas gana la PRIMERA en el orden del arreglo, y una clave vacía (null/undefined) no coincide con nada. */
+function indicePor(filas, campo = "id") {
+  const m = new Map();
+  for (const f of filas || []) { const k = f?.[campo]; if (k != null && !m.has(k)) m.set(k, f); }
+  return m;
+}
 const DB = {
   async getAll(store) {
+    exigirAlmacen(store);
     if (modoNubeActivo(store)) return syncBd.datos.todos(store);
     return idbGetAll(store);
   },
   async get(store, id) {
+    exigirAlmacen(store);
     if (modoNubeActivo(store)) return syncBd.datos.get(store, id);
     return idbGet(store, id);
   },
+  /* 3.15 (Bloque 7): cuántos registros hay (lo mismo que getAll(store).length) sin copiarlos todos a memoria. */
+  async count(store) {
+    exigirAlmacen(store);
+    if (modoNubeActivo(store)) return syncBd.datos.contar(store);
+    return new Promise((resolve, reject) => { const req = tx(store).count(); req.onsuccess = () => resolve(req.result); req.onerror = () => reject(req.error); });
+  },
   async save(store, value) {
+    exigirAlmacen(store);
     if (modoNubeActivo(store) && ENTIDADES_FINANCIERAS.includes(store)) throw new Error("FINANCIERO_SOLO_RPC: " + store + " solo se registra por su operación");
     if (modoNubeActivo(store)) {
       // D-4 (SYNC-7A): solo el administrador edita el maestro de inventario/categorías en modo nube.
@@ -647,6 +736,7 @@ const DB = {
     return idbSave(store, value);
   },
   async delete(store, id) {
+    exigirAlmacen(store);
     if (modoNubeActivo(store) && ENTIDADES_FINANCIERAS.includes(store)) throw new Error("FINANCIERO_SOLO_RPC: el dinero no se borra, se revierte");
     if (modoNubeActivo(store)) {
       if (!puedeEscribirEntidadNube(store)) {
@@ -681,21 +771,56 @@ const DB = {
    Nunca lanza: sin Supabase configurado, sin ENTIMOTORS_SYNC.enabled o sin
    red, la app sigue funcionando 100% local como siempre (mismo espíritu que
    supabase-client.js). */
+/* 3.15 (Bloque 7): puesta al día del arranque en segundo plano (ver prepararModoNube). null = no hay ninguna en curso. */
+let descargaArranque = null;
+/** Para quien necesite esperar a que el Taller esté al día con la nube después de abrir (p. ej. las pruebas). */
+function esperarDescargaArranque() { return descargaArranque || Promise.resolve(); }
+/* Acciones que DECIDEN con lo guardado en el dispositivo si algo ya se hizo (¿esta cotización ya es una orden?, ¿esta cita ya tiene
+   su orden?) esperan a que termine la puesta al día del arranque — son segundos y solo justo después de abrir. Mirar la app no espera.
+   Sin esto, reintentar enseguida una aceptación cuya respuesta se perdió diría «creada» en vez de «ya es la orden» (nunca duplica: la
+   operación es idempotente; es para decir la verdad y abrir lo que ya existe). */
+async function alDiaParaDecidir() {
+  if (!descargaArranque) return;
+  toast("Actualizando con la nube… un momento");
+  await esperarDescargaArranque();
+}
+async function alTerminarDescargaArranque() {
+  programarChipNube();
+  if (!currentUser || esMecanicoCuenta()) return;
+  /* Se repinta lo que está a la vista con lo recién bajado, salvo que la persona esté escribiendo en esa pantalla o haya un modal
+     abierto (no se le mueve el formulario debajo de los dedos: lo verá al volver a entrar). */
+  const vista = document.querySelector(".view.active")?.id?.replace(/^view-/, "");
+  const escribiendo = document.activeElement && /INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName);
+  if (!vista || escribiendo || document.querySelector(".modal-bg.active")) return;
+  try { if (renderByView[vista]) await renderByView[vista](); } catch (e) { /* se verá al navegar */ }
+}
+let generacionSesion = 0;   // 3.15 (Bloque 8): cambia con cada sesión; lo que termina en segundo plano de una sesión anterior no toca la actual
 async function prepararModoNube(session) {
+  generacionSesion++;
   syncMotor = null; syncBd = null; syncFin = null; syncRest = null;
+  /* 3.15 (Bloque 8 · R7 de b8-realtime-estres): un fallo del almacén es de la sesión ANTERIOR. Una puesta al día que terminaba durante el
+     cambio de usuario (con syncBd momentáneamente nulo) lo marcaba y la sesión NUEVA arrancaba con «almacén no disponible» (falso). Si
+     la base de la nueva sesión no abre, se vuelve a marcar abajo. */
+  falloAlmacen = null;
   if (!session || session.origen !== "supabase" || session.activo === false) return;
   if (!window.SyncDB || !window.SyncEngine || !window.SyncRest || !window.ENTIMOTORS_SYNC_MAPPERS) return;
   if (!window.SupabaseCliente || !SupabaseCliente.estado().activo) return;
 
   window.ENTIMOTORS_SYNC = { enabled: true };
-  try {
-    syncBd = await SyncDB.abrir({ nombre: SyncDB.nombreParaSesion(session) });
-  } catch (e) { syncBd = null; window.ENTIMOTORS_SYNC = { enabled: false }; return; }
+  /* 3.15 (Bloque 3) · FAIL CLOSED. Hasta 3.14.1, si la base local de sincronización no abría, la app seguía «en modo local»
+     guardando en entimotors_os_demo: datos que nunca subirían a la nube, presentados como si estuvieran protegidos. Ahora:
+     reintento seguro (ocupada/pasajero) y, si sigue sin abrir o sin poder escribir, se BLOQUEA con la explicación. Nunca se
+     borra ni se recrea la base. Sin Internet esto no pasa: IndexedDB abre igual y se trabaja offline como siempre. */
+  const apertura = await SyncDB.abrirSeguro({ nombre: SyncDB.nombreParaSesion(session) });
+  if (!apertura.ok) { syncBd = null; window.ENTIMOTORS_SYNC = { enabled: false }; falloAlmacen = apertura; return "bloqueado"; }
+  syncBd = apertura.bd;
+  document.getElementById("gateAlmacen")?.classList.remove("active");   // la base de ESTA sesión abrió: ningún aviso de una sesión anterior queda a la vista
+  syncBd.alCerrarse(() => mostrarFalloAlmacen({ tipo: "cerrada", error: { nombre: "CerradaPorElNavegador", mensaje: "" } }));
 
   const rest = SyncRest.crear({
     baseUrl: window.ENTIMOTORS_SUPABASE.url, anonKey: window.ENTIMOTORS_SUPABASE.anonKey,
     getToken: () => { const s = SupabaseCliente.sesion(); return s ? s.access_token : null; },
-    refrescar: () => SupabaseCliente.refrescarSesion().then((r) => r.ok),
+    refrescar: renovarSesionNube,
   });
   syncRest = rest;
   syncMotor = SyncEngine.crearMotor({
@@ -733,10 +858,26 @@ async function prepararModoNube(session) {
       toast("Una operación guardada sin conexión fue rechazada: " + (ev.datos.error?.mensaje || "revisa la cola de sincronización"), "off");
     });
   }
-  // Bootstrap (SYNC-5 sección 10): con cursor vacío, pull() pagina desde el
-  // principio. Si no hay red, sigue igual — arrancar() reintentará al volver.
-  try { await syncMotor.pullTodo(); } catch (e) { /* sin red: se reintenta al volver a estar online */ }
-  syncMotor.arrancar();
+  syncMotor.onCambio((ev) => { if (ev.tipo === "rpc-ok" && ev.datos?.rpc === "enviar_mensaje" && ev.datos.resultado?.id) recibirAviso({ e: "mensajes", id: ev.datos.resultado.id }); });
+  /* Bootstrap (SYNC-5 sección 10): con cursor vacío, pull() pagina desde el principio. Si no hay red, sigue igual — arrancar() reintentará.
+     3.15 (Bloque 7) · ARRANQUE EN CALIENTE DEL TALLER: si ESTE dispositivo ya completó la descarga inicial en una sesión anterior, la app se
+     pinta con lo que ya tiene guardado y la puesta al día corre en segundo plano, en el MISMO orden de siempre (descarga → ciclo del motor
+     → avisos en vivo). Antes la pantalla esperaba ~13 descargas seguidas (26 viajes con su preflight): con red lenta, segundos en blanco.
+     Mientras dura, el indicador dice «Actualizando con la nube…» (nunca «sincronizado») y al terminar se repinta la pantalla abierta.
+     Primer arranque del dispositivo (sin descarga completa) y Mi Trabajo (el barrido de lo reasignado va ANTES de mostrar): como antes. */
+  const bootstrapPrevio = session.rol !== "mecanico" && !!(await syncBd.meta.get("bootstrap").catch(() => null))?.completo;
+  const ponerseAlDia = async () => {
+    try { await syncMotor.pullTodo(); } catch (e) { /* sin red: se reintenta al volver a estar online */ }
+    // 3.15 (Bloque 3): al abrir, lo que ya no le corresponde al mecánico (reasignado mientras la app estaba cerrada) sale de su caché
+    if (session.rol === "mecanico") { for (const e of ["ordenes", "citas"]) { try { await syncMotor.barrer(e); } catch (err) { /* sin red */ } } }
+    if (!syncMotor) return;   // la sesión se cerró mientras tanto
+    syncMotor.arrancar({ descargaReciente: true });   // 3.15 (Bloque 7): el primer ciclo no repite la descarga que acaba de terminar
+    // 3.15 (Bloque 3): avisos en tiempo real (Mi Trabajo y mensajes al instante; la descarga periódica queda de red de seguridad)
+    prepararRealtime();
+  };
+  if (bootstrapPrevio) {
+    descargaArranque = ponerseAlDia().finally(() => { descargaArranque = null; alTerminarDescargaArranque(); });
+  } else await ponerseAlDia();
 
   if (session.rol === "mecanico" && session.perfilId) {
     /* SYNC-6 sección 9: cuando el servidor rechaza un avance técnico (orden reasignada o cerrada mientras
@@ -767,7 +908,7 @@ async function flushFotosPendientes() {
       bd: bdFotos, baseUrl: window.ENTIMOTORS_SUPABASE.url, anonKey: window.ENTIMOTORS_SUPABASE.anonKey,
       bucket: "entimotors-taller",
       obtenerToken: () => { const s = SupabaseCliente.sesion(); return s ? s.access_token : null; },
-      refrescar: () => SupabaseCliente.refrescarSesion().then((r) => r.ok),
+      refrescar: renovarSesionNube,
       /* Ligar la foto a su orden: UNA operación solo-agregar por el outbox (dependencias, reintentos, pausa por sesión y
          «⚠ Por revisar» de SYNC-8), con op_id = operation_id de la foto → un reintento o un cierre a mitad nunca la
          duplica. Se llama ANTES de borrar el blob (sync-fotos.js) y la caché local la muestra ya; la nube confirma. */
@@ -791,6 +932,437 @@ async function flushFotosPendientes() {
     if (r && (r.subidas || r.rechazadas)) programarChipNube();
   } catch (e) { /* mejor esfuerzo: se reintenta en el próximo "online" o la próxima foto */ }
 }
+/* ================= 3.15 · BLOQUE 3 · ALMACENAMIENTO LOCAL: FALLO A LA VISTA =================
+   Nunca se confunde con «sin Internet» (eso sigue funcionando offline). Se detiene lo que podría escribir, se explica y se
+   ofrece reintentar/reabrir. Nada se borra, recrea ni limpia. */
+let falloAlmacen = null;
+const TEXTO_FALLO_ALMACEN = {
+  ocupada: "Otra pestaña o ventana de ENTIMOTORS está usando el almacenamiento de este dispositivo. Ciérrala y toca «Reintentar».",
+  llena: "El dispositivo se quedó sin espacio para guardar. Libera espacio y toca «Reintentar».",
+  version: "Este dispositivo tiene datos guardados por una versión MÁS NUEVA de ENTIMOTORS. Actualiza la aplicación antes de seguir.",
+  "no-disponible": "El navegador no deja abrir o escribir el almacenamiento de ENTIMOTORS en este dispositivo (puede estar dañado, desactivado o en modo privado).",
+  cerrada: "El navegador cerró el almacenamiento de ENTIMOTORS mientras trabajabas (por ejemplo, al borrar los datos del sitio o por falta de espacio).",
+};
+function mostrarFalloAlmacen(info) {
+  falloAlmacen = info || { tipo: "no-disponible" };
+  try { syncMotor?.detener(); } catch (e) { /* ya */ }
+  detenerRealtime();
+  document.getElementById("shell")?.classList.remove("active");
+  document.getElementById("gateModo")?.classList.remove("active");
+  const txt = document.getElementById("gateAlmacenTexto");
+  if (txt) txt.textContent = TEXTO_FALLO_ALMACEN[falloAlmacen.tipo] || TEXTO_FALLO_ALMACEN["no-disponible"];
+  const det = document.getElementById("gateAlmacenDetalle");
+  const e = falloAlmacen.error;
+  if (det) det.textContent = e ? `Detalle técnico: ${e.nombre || ""}${e.mensaje ? " — " + e.mensaje : ""}` : "";
+  document.getElementById("gateAlmacen")?.classList.add("active");
+}
+document.getElementById("btnAlmacenReintentar")?.addEventListener("click", async () => {
+  const btn = document.getElementById("btnAlmacenReintentar");
+  btn.disabled = true;
+  try {
+    // se comprueba de verdad (abrir + escribir) antes de volver a entrar; si sigue igual, se dice por qué
+    const r = await SyncDB.abrirSeguro({ nombre: SyncDB.nombreParaSesion(currentUser || {}), esperasMs: [300, 900] });
+    if (!r.ok) { mostrarFalloAlmacen(r); toast("El almacenamiento sigue sin estar disponible. No se borró nada.", "off"); return; }
+    r.bd.cerrar();
+    location.reload();   // arranque limpio: la cola pendiente vive en la base y se retoma tal cual
+  } finally { btn.disabled = false; }
+});
+document.getElementById("btnAlmacenRecargar")?.addEventListener("click", () => location.reload());
+
+/* ================= 3.15 · BLOQUE 3 · AVISOS EN TIEMPO REAL =================
+   Una conexión Realtime por dispositivo (sync-realtime.js). El aviso NO trae datos: se pide solo ese registro (pullUno, bajo RLS)
+   o, para un aviso de tabla del Taller, lo nuevo de esa entidad con su cursor. Con avisos conectados, la descarga periódica pasa a
+   ser una red de seguridad cada 5 min; sin ellos (sin red, bloqueados), vuelve a los 30 s de siempre. */
+let syncRt = null, rtEstado = "apagado";
+const RT_INTERVALO_CONECTADO_MS = 5 * 60000, RT_INTERVALO_SIN_AVISOS_MS = 30000;
+// tabla de la nube → entidad local que la contiene (los renglones viajan dentro de su cabecera)
+const TABLA_A_ENTIDAD = { clientes: "clientes", motos: "motos", citas: "citas", categorias_inv: "categorias_inv", inventario: "inventario",
+  cotizaciones: "cotizaciones", cotizacion_items: "cotizaciones", ordenes: "ordenes", orden_items: "ordenes", ventas: "ventas_rapidas",
+  creditos: "creditos", abonos: "creditos", caja_movimientos: "caja_movimientos", mensajes: "mensajes" };
+function temasRealtime() {
+  if (esMecanicoCuenta()) return ["mt:" + currentUser.perfilId];
+  if (esAdmin()) return ["taller", "admin"];
+  if (esCajero()) return ["taller"];
+  return [];
+}
+function rtOnline() { syncRt?.reintentar(); }
+function rtOffline() { syncRt?.pausar(); }
+function rtVisible() {
+  if (document.visibilityState !== "visible" || !syncRt) return;
+  syncRt.reintentar();
+  comprobarCuentaPropia("volver");   // al volver a la app (el aviso pudo llegar con el teléfono dormido)
+  if (esMecanicoCuenta()) ponerAlDia("reabrir");
+}
+function detenerRealtime() {
+  clearTimeout(window.__rtPuestaAlDia);
+  if (!syncRt) return;
+  syncRt.cerrar(); syncRt = null; rtEstado = "apagado";
+  window.removeEventListener("online", rtOnline); window.removeEventListener("offline", rtOffline);
+  document.removeEventListener("visibilitychange", rtVisible);
+}
+function prepararRealtime() {
+  detenerRealtime();
+  if (!window.SyncRealtime || !syncMotor || !window.ENTIMOTORS_SUPABASE?.url || !("WebSocket" in window)) return;
+  const temas = temasRealtime();
+  if (!temas.length) return;
+  syncRt = SyncRealtime.crear({
+    url: window.ENTIMOTORS_SUPABASE.url, apiKey: window.ENTIMOTORS_SUPABASE.anonKey, temas,
+    getToken: () => { const s = SupabaseCliente.sesion(); return s ? s.access_token : null; },
+    alAviso: recibirAviso,
+    alEstado: (e) => {
+      rtEstado = e;
+      if (e === "sin-acceso") comprobarCuentaPropia("canal-rechazado");   // el canal lo niega RLS: ¿seguimos activos?
+      syncMotor?.ajustarIntervalo(e === "conectado" ? RT_INTERVALO_CONECTADO_MS : RT_INTERVALO_SIN_AVISOS_MS);
+      pintarEstadoVivo();
+    },
+    // al RE-conectar (se cortó la red, el teléfono durmió): lo que pasó mientras tanto se baja una vez y se concilia
+    alConectado: (reconexion) => {
+      if (reconexion) { ponerAlDia("reconexion"); comprobarCuentaPropia("reconexion"); return; }
+      /* 3.15 (Bloque 8 · caso Y) · Realtime activa el «broadcast desde la base» del proyecto con el PRIMER join privado y tarda ~6–10 s en
+         empezar a entregar (medido: b8-realtime-y); lo que se avisa en esa ventana no llega nunca (Realtime no lo reenvía), aunque el
+         canal diga «ok». Por eso, tras la PRIMERA conexión, una puesta al día y una comprobación de la cuenta pasada esa ventana: lo
+         ocurrido mientras tanto aparece en segundos y no al siguiente ciclo periódico. */
+      clearTimeout(window.__rtPuestaAlDia);
+      window.__rtPuestaAlDia = setTimeout(() => { if (!syncMotor) return; ponerAlDia("tras-activar-realtime"); comprobarCuentaPropia("tras-activar-realtime"); }, RT_VENTANA_ACTIVACION_MS);
+    },
+  });
+  window.addEventListener("online", rtOnline); window.addEventListener("offline", rtOffline);
+  document.addEventListener("visibilitychange", rtVisible);
+  syncRt.conectar();
+}
+function pintarEstadoVivo() {
+  const txt = rtEstado === "conectado" ? "● En vivo: lo que te asignen aparece solo."
+    : !isOnline() ? "Sin conexión: trabajas con lo guardado; lo nuevo llega al volver la red."
+    : rtEstado === "sin-sesion" || rtEstado === "sin-acceso" ? "Vuelve a iniciar sesión para recibir avisos al instante."
+    : "Conectando… (mientras tanto se revisa cada 30 s).";
+  ["miTrabajoVivo", "mensajesVivo"].forEach((id) => { const el = document.getElementById(id); if (el) { el.textContent = txt; el.dataset.estado = rtEstado; } });
+}
+let ponerAlDiaEnCurso = null;
+async function ponerAlDia(motivo) {
+  if (!syncMotor || ponerAlDiaEnCurso) return ponerAlDiaEnCurso;
+  const gen = generacionSesion;
+  ponerAlDiaEnCurso = (async () => {
+    try {
+      // al reconectar y tras la ventana de activación de Realtime (caso Y): lo nuevo se BAJA (barrer solo quita lo que ya no corresponde)
+      if (motivo === "reconexion" || motivo === "tras-activar-realtime") await syncMotor.sincronizar();
+      if (esMecanicoCuenta()) for (const e of ["ordenes", "citas"]) await syncMotor.barrer(e);
+    } catch (e) { /* sin red: la red de seguridad lo reintenta */ }
+    if (gen !== generacionSesion || !syncBd) return;   // la sesión cambió mientras tanto: no se pinta nada de la anterior
+    await alCambiosRemotos([{ ent: "*" }]);
+  })().finally(() => { ponerAlDiaEnCurso = null; });
+  return ponerAlDiaEnCurso;
+}
+const avisosCola = new Map();
+let avisosT = null, avisosCorriendo = false;
+/* 3.15 (Bloque 4) · CUENTA ELIMINADA/DESACTIVADA. El aviso solo dice «la cuenta X cambió»: se comprueba el perfil propio con el servidor
+   (nunca se cree al aviso) y, si ya no está activo, se corta todo en ESTE dispositivo: realtime, motor, sesión. Los datos del negocio que
+   hay en el dispositivo no se borran (la cola pendiente queda sin enviar, a la vista del administrador si vuelve a entrar alguien). */
+let comprobandoCuenta = null;
+/* 3.15 (Checkpoint 8A) · Renovar la sesión para la sincronización, las fotos y las autorizaciones, por la PUERTA ÚNICA de auth.js
+   (que decide si se sale: solo con evidencia de Auth). Devuelve lo que entienden sync-rest y sync-fotos:
+   true = renovó · "temporal" = red o servidor (la sesión sigue) · "cuenta-desactivada" = Auth lo confirmó · false = sesión rechazada. */
+function renovarSesionNube() {
+  const p = window.Auth?.renovar ? Auth.renovar() : SupabaseCliente.refrescarSesion();
+  return Promise.resolve(p).then((r) => {
+    if (r?.ok) return true;
+    const clase = r?.clase || SupabaseCliente.clasificarFallo?.(r);
+    if (clase === "cuenta-desactivada") return "cuenta-desactivada";
+    return clase === "transporte" || clase === "servidor-temporal" ? "temporal" : false;
+  }, () => "temporal");
+}
+const RT_VENTANA_ACTIVACION_MS = 12000;   // ver alConectado (caso Y)
+async function comprobarCuentaPropia(motivo) {
+  if (!syncRest || !currentUser?.uid || comprobandoCuenta) return comprobandoCuenta;
+  comprobandoCuenta = (async () => {
+    try {
+      /* 3.15 (Bloque 8): la lectura solo es EVIDENCIA si la hizo la MISMA persona. Si mientras tanto se cambió de usuario (o la sesión
+         activa es de otra cuenta), la RLS oculta el perfil ajeno y eso NO es una baja (antes: falso «cuenta eliminada» en un cambio de
+         usuario; visto en b8-realtime-estres R7). */
+      const uid = currentUser.uid, rest = syncRest;
+      const subDeLaSesion = () => { try { const t = SupabaseCliente.sesion()?.access_token; return t ? JSON.parse(atob(t.split(".")[1].replace(/-/g, "+").replace(/_/g, "/"))).sub || null : null; } catch (e) { return null; } };
+      if (subDeLaSesion() && subDeLaSesion() !== uid) return false;
+      const r = await rest.seleccionar("perfiles", { select: "id,activo", filtros: [["id", "eq", uid]], limite: 1 });
+      if (currentUser?.uid !== uid || syncRest !== rest || (subDeLaSesion() && subDeLaSesion() !== uid)) return false;
+      const p = r.ok && Array.isArray(r.datos) ? r.datos[0] : null;
+      // sin fila (RLS la oculta a un perfil desactivado/eliminado) o inactiva → fuera; error de red → se deja para la próxima
+      if (r.ok && (!p || p.activo === false)) { cerrarPorCuentaEliminada(); return true; }
+      /* 3.15 (Checkpoint 8A): «cuenta eliminada o desactivada» SOLO con evidencia POSITIVA del servidor: el perfil, leído con un token
+         VÁLIDO, no está o está inactivo (arriba), o Auth contestó user_banned al renovar. Un corte de red, un tiempo agotado o un
+         servidor caído NO son una baja (sync-rest los devuelve como «red»). Una sesión rechazada (revocada) la cierra auth.js con
+         su propio aviso («tu sesión terminó»), no con este. */
+      if (!r.ok && r.codigo === "CUENTA_DESACTIVADA") { cerrarPorCuentaEliminada(); return true; }
+    } catch (e) { /* sin red: se vuelve a comprobar al reconectar */ }
+    return false;
+  })().finally(() => { comprobandoCuenta = null; });
+  return comprobandoCuenta;
+}
+function cerrarPorCuentaEliminada() {
+  try { detenerRealtime(); } catch (e) { /* ya */ }
+  try { syncMotor?.detener(); } catch (e) { /* ya */ }
+  window.ENTIMOTORS_SYNC = { enabled: false };
+  denegarSesion("Tu cuenta fue eliminada o desactivada por el administrador: ya no tienes acceso a ENTIMOTORS. Si es un error, habla con el administrador.");
+}
+function recibirAviso(a) {
+  if (a?.e === "cuenta") { if (a.id && currentUser && (a.id === currentUser.uid || a.id === currentUser.perfilId)) comprobarCuentaPropia("aviso"); return; }
+  const ent = TABLA_A_ENTIDAD[a?.e];
+  if (!ent || !window.ENTIMOTORS_SYNC_MAPPERS?.[ent] || !(window.ENTIMOTORS_SYNC_ORDEN || []).includes(ent)) return;
+  if (!avisosCola.has(ent)) avisosCola.set(ent, new Set());
+  avisosCola.get(ent).add(a.todo || !a.id ? "*" : a.id);   // «todo» = aviso de tabla (el id que traiga NO es de un registro)
+  if (!avisosT) avisosT = setTimeout(procesarAvisos, 120);   // junta los avisos de una misma operación
+}
+async function procesarAvisos() {
+  avisosT = null;
+  if (avisosCorriendo) { avisosT = setTimeout(procesarAvisos, 150); return; }
+  if (!syncMotor || !syncBd) { avisosCola.clear(); return; }
+  avisosCorriendo = true;
+  const orden = window.ENTIMOTORS_SYNC_ORDEN || [];
+  const lote = [...avisosCola.entries()].sort((a, b) => orden.indexOf(a[0]) - orden.indexOf(b[0]));
+  avisosCola.clear();
+  const cambios = [];
+  try {
+    for (const [ent, ids] of lote) {
+      const m = window.ENTIMOTORS_SYNC_MAPPERS[ent];
+      if (ids.has("*") || ids.size > 25) { await syncMotor.pull(ent); cambios.push({ ent }); continue; }
+      for (const uid of ids) {
+        const existia = !!(await syncBd.datos.porUid(m.store, uid));
+        const r = await syncMotor.pullUno(ent, uid);
+        if (r && r.ok) cambios.push({ ent, uid, estado: r.estado, nuevo: !existia && r.estado === "actualizado" });
+      }
+    }
+  } catch (e) { /* sin red: la red de seguridad lo reintenta */ }
+  finally { avisosCorriendo = false; }
+  await alCambiosRemotos(cambios);
+}
+/* Qué se ve cuando llega algo: la pantalla que está abierta se repinta (sin tocar lo que la persona está escribiendo). */
+async function alCambiosRemotos(cambios) {
+  // 3.15 (Bloque 8): sin almacén de sesión (cambio de usuario en curso) no se repinta nada: la sesión nueva se pinta sola al arrancar.
+  // Antes, un aviso o una puesta al día que llegaba en ese momento leía sin almacén y dejaba marcado «almacén no disponible» (falso).
+  if (window.ENTIMOTORS_SYNC?.enabled !== false && currentUser?.origen === "supabase" && !syncBd) return;
+  programarChipNube();
+  await pintarBadgeMensajes();
+  if (esMecanicoCuenta()) {
+    if (cambios.some((c) => c.ent === "mensajes" && c.nuevo)) toast("Tienes un mensaje nuevo del administrador");
+    if (cambios.some((c) => c.ent === "ordenes" && c.nuevo)) toast("Te asignaron un trabajo nuevo");
+    if (currentOrderId != null && document.getElementById("view-detalle")?.classList.contains("active")) {
+      const uid = await syncBd.mapa.uidDe("ordenes", currentOrderId);
+      const c = cambios.find((x) => x.ent === "ordenes" && x.uid === uid);
+      if (c && c.estado === "retirado") { toast("Esa orden ya no está asignada a ti", "off"); currentOrderId = null; showView("mi-trabajo"); await renderMiTrabajo(); return; }
+      const escribiendo = document.activeElement && document.getElementById("view-detalle").contains(document.activeElement) && /INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName);
+      if (c && c.estado === "actualizado") { if (!escribiendo) openOrder(currentOrderId); else toast("Esta orden cambió en la nube: se actualizará al terminar"); }
+    }
+    if (document.getElementById("view-mi-trabajo")?.classList.contains("active")) await renderMiTrabajo();
+    return;
+  }
+  if (document.getElementById("view-mensajes")?.classList.contains("active") && cambios.some((c) => c.ent === "mensajes" || c.ent === "*")) await renderMensajes();
+  // 3.15 (Bloque 8): con el detalle de una orden abierto, la evidencia nueva del mecánico aparece sola (solo se repintan las FOTOS:
+  // lo que la persona esté escribiendo en la orden no se toca)
+  if (currentOrderId != null && document.getElementById("view-detalle")?.classList.contains("active") && cambios.some((c) => c.ent === "ordenes" || c.ent === "*")) {
+    const o = await DB.get("ordenes", currentOrderId).catch(() => null);
+    if (o) await renderDetalleFotos(o);
+  }
+}
+
+/* ================= 3.15 · BLOQUE 3 · MENSAJES ADMIN → MECÁNICO =================
+   Comunicación DIRIGIDA, aparte de las notas de la orden (esas siguen siendo parte de la orden). Si el mensaje trata de una orden,
+   se guarda la relación (orden_id), nunca se copia texto entre una y otra. Se envía por el outbox (offline: queda «pendiente de
+   envío», jamás «enviado» hasta que el servidor lo confirma) y se marca leído también por el outbox. */
+const ALMACEN_MENSAJES = window.SyncDB?.ALMACEN_MENSAJES || "auditoria";
+async function mensajesLocales() {
+  if (!syncBd) return [];
+  try { return (await syncBd.datos.todos(ALMACEN_MENSAJES)).sort((a, b) => (b.creadoEn || 0) - (a.creadoEn || 0)); } catch (e) { return []; }
+}
+async function opsDeMensajes() {
+  if (!syncBd) return [];
+  try { return (await syncBd.outbox.todos()).filter((o) => o.entidad === "mensajes"); } catch (e) { return []; }
+}
+function noLeido(m) { return !m.leidoEn && !m.leidoLocal && m.destinatarioId === currentUser?.perfilId; }
+async function pintarBadgeMensajes() {
+  const n = esMecanicoCuenta() ? (await mensajesLocales()).filter(noLeido).length : 0;
+  ["miTrabajoMsgBadge", "navMiTrabajoBadge"].forEach((id) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.textContent = n ? String(n) : ""; el.style.display = n ? "" : "none";
+  });
+}
+async function contextoMensaje(m) {
+  if (m.ordenUid) {
+    const localId = await syncBd.mapa.localDe(m.ordenUid);
+    const o = localId != null ? await syncBd.datos.get("ordenes", localId) : null;
+    if (!o) return { texto: esMecanicoCuenta() ? "Sobre una orden que ya no está asignada a ti" : "Sobre una orden", ordenId: null };
+    const moto = esMecanicoCuenta() ? `${o.motoMarca || ""} ${o.motoModelo || ""}`.trim() : "";
+    const cliente = esMecanicoCuenta() ? o.clienteNombre : (o.clienteId ? (await DB.get("clientes", o.clienteId))?.nombre : "");
+    return { texto: `Sobre la orden #${o.id}${moto ? " — " + moto : ""}${cliente ? " · " + cliente : ""}`, ordenId: o.id };
+  }
+  if (m.citaUid) {
+    const localId = await syncBd.mapa.localDe(m.citaUid);
+    const c = localId != null ? await syncBd.datos.get("citas", localId) : null;
+    return { texto: c ? `Sobre la cita del ${FechaNegocio.dia(c.fecha)} a las ${c.hora || ""}` : "Sobre una cita", ordenId: null };
+  }
+  return null;
+}
+async function renderMensajesMiTrabajo() {
+  const cont = document.getElementById("miTrabajoMensajes");
+  if (!cont) return;
+  if (!esMecanicoCuenta()) { cont.innerHTML = ""; return; }
+  const [msgs, ops] = await Promise.all([mensajesLocales(), opsDeMensajes()]);
+  const mios = msgs.filter((m) => m.destinatarioId === currentUser.perfilId);
+  if (!mios.length) { cont.innerHTML = `<div class="card"><p style="color:var(--text-muted); margin:0;">No tienes mensajes del administrador.</p></div>`; return; }
+  const filas = [];
+  for (const m of mios.slice(0, 50)) {
+    const ctx = await contextoMensaje(m);
+    const confirmando = ops.some((o) => o.rpc === "marcar_mensaje_leido" && o.uid === m.uid && ["pending", "syncing"].includes(o.estado));
+    const estado = m.leidoEn ? `Leído ${esc(FechaNegocio.fechaHora(m.leidoEn))}` : (m.leidoLocal || confirmando) ? "Leído · pendiente de confirmar" : "";
+    filas.push(`<div class="card mensaje-mt${noLeido(m) ? " no-leido" : ""}" data-mensaje="${m.id}" style="margin-bottom:0.6rem;">
+      <div style="display:flex; justify-content:space-between; gap:0.6rem; align-items:baseline;">
+        <b>${esc(m.remitenteNombre || "Administrador")}</b>
+        <span class="meta">${esc(FechaNegocio.fechaHora(m.creadoEn))}</span>
+      </div>
+      <div style="white-space:pre-wrap; margin:0.35rem 0;">${esc(m.texto)}</div>
+      ${ctx ? `<div class="meta">${ctx.ordenId != null ? `<a href="#" data-abrir-orden="${ctx.ordenId}">${esc(ctx.texto)}</a>` : esc(ctx.texto)}</div>` : ""}
+      <div class="meta" style="display:flex; justify-content:space-between; align-items:center; gap:0.5rem; margin-top:0.35rem;">
+        <span>${estado}</span>
+        ${noLeido(m) ? `<button type="button" class="btn small" data-marcar-leido="${m.id}">Marcar como leído</button>` : ""}
+      </div>
+    </div>`);
+  }
+  cont.innerHTML = filas.join("");
+  cont.querySelectorAll("[data-marcar-leido]").forEach((b) => b.addEventListener("click", () => marcarMensajeLeido(Number(b.dataset.marcarLeido))));
+  cont.querySelectorAll("[data-abrir-orden]").forEach((a) => a.addEventListener("click", (e) => { e.preventDefault(); openOrder(Number(a.dataset.abrirOrden)); }));
+}
+async function marcarMensajeLeido(localId) {
+  if (!syncMotor || !esMecanicoCuenta()) return;
+  const m = await syncBd.datos.get(ALMACEN_MENSAJES, localId);
+  if (!m || m.leidoEn || m.leidoLocal || m.destinatarioId !== currentUser.perfilId) return;
+  const ya = (await opsDeMensajes()).some((o) => o.rpc === "marcar_mensaje_leido" && o.uid === m.uid && ["pending", "syncing"].includes(o.estado));
+  if (!ya) await syncMotor.encolarRpc("marcar_mensaje_leido", { p_mensaje_id: m.uid, p_device: await syncBd.deviceId() }, { entidad: "mensajes", uid: m.uid });
+  // marca local provisional (se ve «leído · pendiente de confirmar»); la fecha real la pone el servidor al confirmar
+  await syncBd.transaccion([ALMACEN_MENSAJES], "readwrite", async (t) => {
+    const x = await t.get(ALMACEN_MENSAJES, localId);
+    if (x && !x.leidoEn) { x.leidoLocal = Date.now(); await t.put(ALMACEN_MENSAJES, x); }
+  });
+  await renderMensajesMiTrabajo(); await pintarBadgeMensajes();
+}
+
+/* Administrador: redactar y ver el estado básico (pendiente de envío / enviado / leído / no se envió). */
+let mensajeDestinoPrefijado = null;   // {destinatario, ordenUid} al abrir desde el detalle de una orden
+async function renderMensajes() {
+  const lista = document.getElementById("mensajesLista");
+  const form = document.getElementById("mensajesForm");
+  if (!lista || !form) return;
+  pintarEstadoVivo();
+  if (!esAdmin() || !syncMotor) {
+    form.style.display = "none";
+    lista.innerHTML = `<div class="card"><p style="color:var(--text-muted); margin:0;">Los mensajes al equipo necesitan la sesión del administrador en la nube.</p></div>`;
+    return;
+  }
+  form.style.display = "";
+  const sel = document.getElementById("msgDestinatario");
+  const reales = await mecanicosParaMensajes();
+  const activos = reales.filter((p) => p.activo !== false);
+  const previo = mensajeDestinoPrefijado?.destinatario || sel.value;
+  sel.innerHTML = `<option value="">Elige un mecánico…</option>` + activos.map((p) => `<option value="${esc(p.id)}">${esc(p.nombre)}</option>`).join("");
+  if (previo && activos.some((p) => p.id === previo)) sel.value = previo;
+  await poblarOrdenesMensaje(mensajeDestinoPrefijado?.ordenUid || null);
+  mensajeDestinoPrefijado = null;
+
+  const nombres = {}; reales.forEach((p) => { nombres[p.id] = p.nombre; });
+  const [msgs, ops] = await Promise.all([mensajesLocales(), opsDeMensajes()]);
+  if (!msgs.length) { lista.innerHTML = `<div class="card"><p style="color:var(--text-muted); margin:0;">Todavía no has enviado mensajes.</p></div>`; return; }
+  const filas = [];
+  for (const m of msgs.slice(0, 100)) {
+    const op = ops.find((o) => o.rpc === "enviar_mensaje" && o.uid === m.uid);
+    let estado, clase = "";
+    if (op && op.estado === "rejected") { estado = `No se envió: ${esc(op.error?.mensaje || "rechazado")}`; clase = "due"; }
+    else if (op || !m.enviado) { estado = "Pendiente de envío"; clase = "soon"; }
+    else if (m.leidoEn) { estado = `Leído ${esc(FechaNegocio.fechaHora(m.leidoEn))}`; clase = "ok"; }
+    else estado = "Enviado · sin leer";
+    const ctx = await contextoMensaje(m);
+    filas.push(`<div class="card" style="margin-bottom:0.6rem;" data-mensaje-admin="${m.id}">
+      <div style="display:flex; justify-content:space-between; gap:0.6rem; align-items:baseline;">
+        <b>Para ${esc(nombres[m.destinatarioId] || "un mecánico")}</b>
+        <span class="meta">${esc(FechaNegocio.fechaHora(m.creadoEn))}</span>
+      </div>
+      <div style="white-space:pre-wrap; margin:0.35rem 0;">${esc(m.texto)}</div>
+      ${ctx ? `<div class="meta">${esc(ctx.texto)}</div>` : ""}
+      <div class="meta" style="margin-top:0.35rem; display:flex; justify-content:space-between; gap:0.5rem; align-items:center;">
+        <span class="mant-badge ${clase}" data-estado-mensaje>${estado}</span>
+        ${op && op.estado === "rejected" ? `<button type="button" class="btn small ghost" data-quitar-mensaje="${m.id}" data-seq="${op.seq}">Quitar</button>` : ""}
+      </div>
+    </div>`);
+  }
+  lista.innerHTML = filas.join("");
+  lista.querySelectorAll("[data-quitar-mensaje]").forEach((b) => b.addEventListener("click", async () => {
+    await syncMotor.descartarRechazada(Number(b.dataset.seq));
+    await syncBd.transaccion([ALMACEN_MENSAJES], "readwrite", (t) => t.borrar(ALMACEN_MENSAJES, Number(b.dataset.quitarMensaje)));
+    renderMensajes(); programarChipNube();
+  }));
+}
+/* Mecánicos a los que se puede escribir: por el MISMO cliente REST del motor (token y refresco de la sesión de nube) y, sin red, la
+   última lista conocida de este dispositivo (así se puede dejar un mensaje pendiente sin conexión). El servidor revalida al enviar. */
+let mecanicosMensajesEn = 0;
+async function mecanicosParaMensajes() {
+  const clave = "mecanicos_mensajes";
+  // la vista se repinta con cada aviso de mensajes: la lista se pide como mucho una vez por minuto
+  if (Date.now() - mecanicosMensajesEn < 60000) { const g = await syncBd?.meta.get(clave); if (g) return g; }
+  if (syncRest && isOnline()) {
+    try {
+      const r = await syncRest.seleccionar("perfiles", { select: "id,nombre,activo", filtros: [["rol", "eq", "mecanico"]], orden: "nombre.asc" });
+      if (r.ok && Array.isArray(r.datos)) { await syncBd.meta.set(clave, r.datos); mecanicosMensajesEn = Date.now(); return r.datos; }
+    } catch (e) { /* sin red: la lista guardada */ }
+  }
+  try { return (await syncBd?.meta.get(clave)) || (await mecanicosRealesDisponibles()) || []; } catch (e) { return []; }
+}
+async function poblarOrdenesMensaje(ordenUidElegida) {
+  const selO = document.getElementById("msgOrden");
+  const dest = document.getElementById("msgDestinatario").value;
+  const ordenes = dest ? (await DB.getAll("ordenes")).filter((o) => o.mecanicoId === dest && o.estado !== "entregado" && !o.anulada && o.uid) : [];
+  const motos = ordenes.length ? await DB.getAll("motos") : [];
+  const previo = ordenUidElegida || selO.value;
+  const motoPorId = indicePor(motos);
+  selO.innerHTML = `<option value="">Sin orden relacionada</option>` + ordenes.map((o) => {
+    const mt = motoPorId.get(o.motoId);
+    return `<option value="${esc(o.uid)}">#${o.id}${mt ? " — " + esc(`${mt.marca || ""} ${mt.modelo || ""}`.trim()) : ""}</option>`;
+  }).join("");
+  if (previo && ordenes.some((o) => o.uid === previo)) selO.value = previo;
+}
+document.getElementById("msgDestinatario")?.addEventListener("change", () => poblarOrdenesMensaje(null));
+document.getElementById("btnMsgEnviar")?.addEventListener("click", async () => {
+  if (!esAdmin() || !syncMotor) { bloquear("Solo el administrador envía mensajes"); return; }
+  const dest = document.getElementById("msgDestinatario").value;
+  const campo = document.getElementById("msgTexto");
+  const texto = campo.value.trim();
+  const ordenUid = document.getElementById("msgOrden").value || null;
+  if (!dest) { toast("Elige a qué mecánico va el mensaje", "off"); return; }
+  if (!texto) { toast("Escribe el mensaje", "off"); return; }
+  if (texto.length > 2000) { toast("El mensaje es demasiado largo (máximo 2000 caracteres)", "off"); return; }
+  const btn = document.getElementById("btnMsgEnviar");
+  btn.disabled = true;
+  try {
+    const uid = SyncDB.uuid(), deviceId = await syncBd.deviceId();
+    // copia provisional con el MISMO uid: la versión del servidor la reemplaza al confirmar (nunca se duplica)
+    await syncBd.transaccion([ALMACEN_MENSAJES, "mapa"], "readwrite", async (t) => {
+      const id = await t.put(ALMACEN_MENSAJES, { uid, remitenteId: currentUser.uid, remitenteNombre: currentUser.nombre || "Administrador", destinatarioId: dest, texto,
+        ordenUid, citaUid: null, creadoEn: Date.now(), leidoEn: null, enviado: false, _rev: 0, _base: null, _pend: true });
+      await t.put("mapa", { uid, entidad: "mensajes", local_id: id });
+    });
+    await syncMotor.encolarRpc("enviar_mensaje", { p_mensaje_id: uid, p_destinatario: dest, p_texto: texto, p_orden_id: ordenUid, p_cita_id: null, p_device: deviceId },
+      { entidad: "mensajes", uid, crea: true });
+    campo.value = "";
+    toast(isOnline() ? "Mensaje en camino" : "Sin conexión: el mensaje queda pendiente y se envía solo al volver la red");
+  } catch (e) { toast("No se pudo guardar el mensaje: " + (e.message || e), "off"); }
+  finally { btn.disabled = false; }
+  await renderMensajes();
+});
+/* Desde el detalle de una orden: abrir el mensaje ya dirigido a su mecánico y relacionado con ESA orden. */
+async function mensajeDesdeOrden() {
+  const o = currentOrderCache?.o;
+  if (!o || !o.mecanicoId || !esAdmin()) return;
+  mensajeDestinoPrefijado = { destinatario: o.mecanicoId, ordenUid: o.uid || null };
+  if (showView("mensajes")) await renderMensajes();
+  document.getElementById("msgTexto")?.focus();
+}
+document.getElementById("btnMensajeOrden")?.addEventListener("click", mensajeDesdeOrden);
+
 /* ================= SYNC-7B · DINERO Y STOCK EN MODO NUBE =================
    Toda afectación de dinero o stock va por una RPC transaccional e idempotente (sync-3-rpc.sql) armada por
    sync-finanzas.js. Aquí solo se traduce la UI de siempre (ids locales) a identidades de nube (uid) y se
@@ -854,7 +1426,8 @@ async function registrarCreditoNube({ clienteId, clienteNombre, clienteTelefono,
     ocurrioEn: new Date().toISOString(), offline: !isOnline(), deviceId: await syncBd.deviceId(),
   });
   const r = await ejecutarFinanciera(op, "registrar el crédito");
-  if (r.estado === "ok") await bajarNube(["inventario", "creditos", "caja_movimientos"]);
+  // 3.15 (Bloque 8): el servidor YA confirmó el crédito; lo demás (inventario, créditos, caja) se pone al día en segundo plano
+  if (r.estado === "ok") { estadoRegistro("registrado"); actualizarTrasConfirmar(["inventario", "creditos", "caja_movimientos"], "El crédito"); }
   const total = op.params.p_items.reduce((s, x) => s + x.cantidad * x.precio, 0);
   const ab = op.params.p_abono_inicial;
   const credito = {
@@ -869,6 +1442,24 @@ async function registrarCreditoNube({ clienteId, clienteNombre, clienteTelefono,
   return { id, credito: (await syncBd.datos.get("creditos", id)) || credito, faltantes: [], estado: r.estado };
 }
 
+/* 3.15 (Bloque 8 · decisión del propietario) · Después de un registro CONFIRMADO por el servidor, las descargas que no hacen falta para
+   confirmarlo (antes, ~31 s con 2,5 s por petición) corren en SEGUNDO PLANO. Estado visible en body[data-registro-estado]:
+   registrando → registrado → actualizando → listo | actualizacion-pendiente. Si la actualización falla, lo registrado SIGUE registrado:
+   solo se avisa de que faltan datos por traer (el ciclo normal los trae al volver la red). */
+function estadoRegistro(e) { document.body.dataset.registroEstado = e; (window.__estadosRegistro = window.__estadosRegistro || []).push(e); }
+function actualizarTrasConfirmar(entidades, que) {
+  estadoRegistro("actualizando");
+  (async () => {
+    let falto = false;
+    for (const e of entidades) {
+      try { const r = await syncMotor?.pull(e); if (r && r.ok === false) falto = true; } catch (err) { falto = true; }
+    }
+    if (falto) { estadoRegistro("actualizacion-pendiente"); toast(`${que} quedó registrado. Faltan datos por actualizar en este dispositivo: se completarán solos al volver la conexión.`, "off"); }
+    else estadoRegistro("listo");
+    const activa = document.querySelector(".view.active")?.id;
+    if (activa === "view-creditos") renderCreditos(); else if (activa === "view-finanzas") renderFinanzas(); else if (activa === "view-dashboard") renderDashboard();
+  })();
+}
 async function registrarAbonoNube(creditoId, monto, metodoPago) {
   const cred = await syncBd.datos.get("creditos", creditoId);
   if (!cred) throw new Error("Crédito no encontrado");
@@ -887,39 +1478,77 @@ async function registrarMovimientoCajaNube(mov) {
 }
 
 /* Ítem de orden: SIEMPRE por agregar_item_orden (la nube calcula el total de la orden con orden_items al
-   finalizar). Si trae repuesto, la RPC mueve el ledger; nunca DB.save de cantidad. */
-async function agregarItemOrdenNube(ord, { nombre, cantidad, precio, inventarioId, costoUnitario }) {
+   finalizar). 3.15 (Bloque 2): el renglón lleva su tipo y el stock lo decide el servidor según el presupuesto
+   (pendiente/rechazado no descuenta; aprobado descuenta la diferencia una sola vez); nunca DB.save de cantidad. */
+async function agregarItemOrdenNube(ord, { tipo, nombre, cantidad, precio, inventarioId, costoUnitario }) {
   const op = syncFin.construir.itemOrden({
-    ordenUid: ord.uid, inventarioId: inventarioId || null, inventarioUid: await uidDe("inventario", inventarioId), nombre, cantidad, precio,
+    ordenUid: ord.uid, tipo: tipo ?? null, inventarioId: inventarioId ?? null, inventarioUid: await uidDe("inventario", inventarioId), nombre, cantidad, precio,
     offline: !isOnline(), ocurrioEn: new Date().toISOString(), deviceId: await syncBd.deviceId(),
   });
   const r = await ejecutarFinanciera(op, "agregar el ítem");
-  return { estado: r.estado, item: { uid: op.params.p_item_id, nombre, cantidad, precio, origenInventarioId: inventarioId || null, costoUnitario: costoUnitario || 0, costoEstimado: false } };
+  return { estado: r.estado, resultado: r.resultado, item: { uid: op.params.p_item_id, tipo: op.params.p_tipo, nombre, cantidad, precio: op.params.p_precio, origenInventarioId: inventarioId ?? null,
+    inventarioUid: op.params.p_inventario_id, costoUnitario: costoUnitario || 0, costoEstimado: false, cantidadAplicada: 0, aplicadaLegado: 0 } };
+}
+/* Editar un renglón (cantidad, precio de ESTA operación, descripción o producto): el servidor ajusta SOLO la diferencia
+   de stock (2→3 saca 1, 3→1 devuelve 2, A→B devuelve A y saca B, cambiar solo el precio no mueve nada). */
+async function actualizarItemOrdenNube(ord, item, { tipo, nombre, cantidad, precio, inventarioId }) {
+  const op = syncFin.construir.actualizarItemOrden({
+    itemUid: item.uid, ordenUid: ord.uid, tipo: tipo ?? null, inventarioId: inventarioId ?? null, inventarioUid: await uidDe("inventario", inventarioId),
+    nombre, cantidad, precio, deviceId: await syncBd.deviceId(),
+  });
+  return ejecutarFinanciera(op, "editar el ítem");
 }
 async function quitarItemOrdenNube(ord, item) {
   if (!item.uid) return { estado: "local" };   // renglón viejo que nunca llegó a la nube: no movió stock allá
   const op = syncFin.construir.quitarItemOrden({ itemUid: item.uid, ordenUid: ord.uid, deviceId: await syncBd.deviceId() });
   return ejecutarFinanciera(op, "quitar el ítem");
 }
-
-/* Finalizar/cobrar: UNA sola RPC (finalizar_orden) crea caja o crédito(+entrada) y cierra la orden, todo o nada.
-   Antes se suben los renglones viejos que nunca llegaron a la nube, para que el total del servidor sea el real. */
-async function finalizarOrdenNube(o, total) {
-  let ord = await DB.get("ordenes", o.id);
+/* Los renglones viejos que nunca llegaron a la nube suben ANTES de aprobar o cobrar (van por la cola, en orden). */
+async function subirRenglonesPendientes(ordenId) {
+  const ord = await DB.get("ordenes", ordenId);
   const items = [];
   for (const it of (ord.items || [])) {
     if (it.uid) { items.push(it); continue; }
-    const r = await agregarItemOrdenNube(ord, { nombre: it.nombre, cantidad: it.cantidad, precio: it.precio, inventarioId: it.origenInventarioId, costoUnitario: it.costoUnitario });
-    items.push({ ...it, uid: r.item.uid });
+    const r = await agregarItemOrdenNube(ord, { tipo: it.tipo ?? null, nombre: it.nombre, cantidad: it.cantidad, precio: it.precio, inventarioId: it.origenInventarioId, costoUnitario: it.costoUnitario });
+    items.push({ ...it, uid: r.item.uid, tipo: r.item.tipo });
   }
   if (items.some((it, i) => it !== (ord.items || [])[i])) { ord.items = items; await DB.save("ordenes", ord); }
+  return ord;
+}
+/* Aprobar / rechazar / reabrir el presupuesto por la cola. En línea espera el veredicto del servidor; sin red queda
+   PENDIENTE DE CONFIRMACIÓN (nunca se pinta como aprobado: presupuestoEstado solo baja del servidor). */
+async function decidirPresupuestoNube(ordenId, decision, via) {
+  const ord = await subirRenglonesPendientes(ordenId);
+  const op = syncFin.construir.decidirPresupuesto({ ordenUid: ord.uid, decision, via, deviceId: await syncBd.deviceId() });
+  const r = await ejecutarFinanciera(op, decision === "aprobar" ? "aprobar el presupuesto" : decision === "rechazar" ? "rechazar el presupuesto" : "reabrir el presupuesto");
+  if (r.estado === "ok") await bajarNube(["ordenes", "inventario"]);
+  return r;
+}
+/* La última decisión de presupuesto de esta orden que sigue en la cola (sin enviar, enviándose o rechazada por la nube). */
+async function decisionPresupuestoEnCola(ordenUid) {
+  if (!ordenUid || !finanzasNube()) return null;
+  const ops = (await syncBd.outbox.todos()).filter((x) => x.rpc === "decidir_presupuesto_orden" && x.params && x.params.p_orden_id === ordenUid);
+  return ops.length ? ops[ops.length - 1] : null;
+}
+/* Mensaje del servidor en palabras del taller (SIN_EXISTENCIA nombra el producto y lo que falta). */
+function mensajeStock(msg) {
+  const m = String(msg || "");
+  return /SIN_EXISTENCIA/.test(m) ? m.replace(/^.*SIN_EXISTENCIA:\s*/, "").replace(/^no hay/, "No hay") + ". No se aplicó nada: el inventario quedó igual." : m;
+}
+
+/* Finalizar/cobrar: UNA sola RPC (finalizar_orden) crea caja o crédito(+entrada) y cierra la orden, todo o nada.
+   Antes se suben los renglones viejos que nunca llegaron a la nube, para que el total del servidor sea el real.
+   3.15 (Bloque 2): cobrar una orden con el presupuesto aún pendiente lo aprueba ahí mismo (vía «entrega») y descuenta
+   lo que falte, todo en la misma transacción; si falta existencia no se cobra nada. */
+async function finalizarOrdenNube(o, total) {
+  const ord = await subirRenglonesPendientes(o.id);
   const op = syncFin.construir.finalizarOrden({
     ordenUid: ord.uid, tipoCobro: o.tipoCobro === "credito" ? "credito" : "contado", metodoPago: o.metodoPago || "efectivo",
     abono: Math.min(Number(o.abonoInicial) || 0, total), abonoMetodo: o.abonoMetodo || "efectivo",
     ocurrioEn: new Date().toISOString(), deviceId: await syncBd.deviceId(),
   });
   const r = await ejecutarFinanciera(op, "finalizar la orden");
-  if (r.estado === "ok") await bajarNube(["ordenes", "creditos", "caja_movimientos"]);
+  if (r.estado === "ok") await bajarNube(["ordenes", "creditos", "caja_movimientos", "inventario"]);
   const creditoUid = op.params.p_credito_id;
   const creditoId = creditoUid ? await syncBd.mapa.localDe(creditoUid) : null;
   return { estado: r.estado, total: r.resultado?.total ?? total, margen: r.resultado?.margen, creditoUid, creditoId };
@@ -928,14 +1557,14 @@ async function finalizarOrdenNube(o, total) {
 /* Acciones con autorización (reversos, anular, ajuste de stock): SIEMPRE en línea, nunca en la cola.
    Cajero → modal PIN (autorización de un solo uso ligada a esta acción/registro/dispositivo/monto); admin → directo;
    mecánico → negado. Devuelve true si se aplicó. */
-async function accionAutorizada(construirFn, datos, entidadesABajar, textoOk) {
+async function accionAutorizada(construirFn, datos, entidadesABajar, textoOk, opciones) {
   if (!finanzasNube()) return false;
   if (esMecanicoCuenta()) { bloquear("Un mecánico no puede hacer esta operación"); return false; }
   if (!isOnline()) { toast(SyncFinanzas.SIN_CONEXION_PIN, "off"); return false; }
   let accion;
   try { accion = construirFn({ ...datos, deviceId: await syncBd.deviceId() }); }
   catch (e) { toast(e.message, "off"); return false; }
-  const r = await syncFin.conAutorizacion(accion, currentUser?.rol);
+  const r = await syncFin.conAutorizacion(accion, currentUser?.rol, opciones);
   if (!r.ok) {
     // PinUI ya avisó sus propios errores (PIN incorrecto, bloqueos…); aquí solo los de la operación en sí
     if (r.op_id || r.motivo === "sin-conexion" || r.motivo === "sin-permiso") toast(r.mensaje, "off");
@@ -1276,6 +1905,10 @@ async function eliminarCredito(id) {
    cliente que ya exista con ese mismo nombre y solo creamos uno nuevo si de
    verdad no está — así cobrar al crédito desde el TPV no llena la lista de
    clientes repetidos. */
+/* 3.15 (Checkpoint 8A): crédito desde la Venta rápida con un nombre escrito. Antes se tomaba el primer cliente con el MISMO nombre
+   (homónimos = cliente equivocado) o se creaba uno en silencio. Ahora decide la persona: usar un cliente existente, registrar uno
+   nuevo, o seguir solo con el nombre (el servidor lo admite: el crédito guarda el nombre tal cual). Devuelve null si cancela
+   (el formulario y el carrito quedan intactos). */
 async function resolverClienteCredito(clienteId, nombreLibre) {
   if (clienteId) {
     const c = await DB.get("clientes", clienteId);
@@ -1283,9 +1916,11 @@ async function resolverClienteCredito(clienteId, nombreLibre) {
   }
   const nombre = (nombreLibre || "").trim();
   if (!nombre) return null;
-  const clientes = await DB.getAll("clientes");
-  const existente = clientes.find(c => (c.nombre || "").trim().toLowerCase() === nombre.toLowerCase());
-  if (existente) return { clienteId: existente.id, clienteNombre: existente.nombre, clienteTelefono: existente.telefono || "" };
+  const d = await decidirCliente({ nombre, permitirSinRegistrar: true, preguntarSiNoHay: true,
+    contexto: "Para un crédito conviene registrarlo (así queda su historial y su teléfono para cobrar), pero puedes seguir solo con el nombre." });
+  if (d.accion === "cancelar") return null;
+  if (d.accion === "existente") return { clienteId: d.cliente.id, clienteNombre: d.cliente.nombre, clienteTelefono: d.cliente.telefono || "" };
+  if (d.accion === "sin-registrar") return { clienteId: null, clienteNombre: nombre, clienteTelefono: "" };
   const nuevoId = await DB.save("clientes", { nombre, telefono: "" });
   markDirty();
   return { clienteId: nuevoId, clienteNombre: nombre, clienteTelefono: "" };
@@ -1403,6 +2038,7 @@ async function renderSyncChipNube() {
   if (e.pausa === "cuenta-inactiva") texto = "Cuenta inactiva · no se sincroniza";
   else if (e.pausa === "auth") texto = "Sesión caducada · inicia sesión para sincronizar";
   else if (!isOnline()) texto = pendientes ? `Sin conexión · ${pendientes} cambio${pendientes === 1 ? "" : "s"} sin subir` : "Sin conexión · guardado en este dispositivo";
+  else if (descargaArranque) texto = "Actualizando con la nube…";   // 3.15 (Bloque 7): puesta al día del arranque en curso
   else if (!e.bootstrapCompleto) texto = "Descarga inicial incompleta · reintentando";
   else if (pendientes) texto = `Subiendo ${pendientes}…`;
   else { texto = "En línea · sincronizado"; ok = true; }
@@ -1411,7 +2047,7 @@ async function renderSyncChipNube() {
   label.textContent = texto;
   if (btn) { btn.style.display = porRevisar ? "" : "none"; btn.textContent = `⚠ ${porRevisar} por revisar`; }
 }
-function fechaCorta(ms) { return ms ? new Date(ms).toLocaleString() : ""; }
+function fechaCorta(ms) { return ms ? FechaNegocio.fechaHora(ms) : ""; }
 async function abrirRevisionSync() {
   if (!syncMotor) return;
   const r = await syncMotor.revision();
@@ -1422,7 +2058,9 @@ async function abrirRevisionSync() {
     const que = x.tipo === "dependencia" ? "No se envió: depende de un registro que la nube rechazó" : "La nube no lo aceptó";
     filas.push(`<div class="card" style="margin:6px 0;padding:8px;"><strong>${esc(ENTIDAD_LEGIBLE[x.entidad] || x.entidad)}</strong> · ${esc(que)}<br>
       <small>${esc(x.mensaje || x.codigo || "")}${x.creadoEn ? " · " + esc(fechaCorta(x.creadoEn)) : ""}</small><br>
-      <button type="button" class="btn small ghost" data-rev-descartar="${Number(x.seq)}">Entendido, quitar de la lista</button></div>`);
+      ${x.protegida ? `<small data-rev-protegida="${Number(x.seq)}">Esta información solo existe en este dispositivo. Se conservará aquí hasta que soporte pueda respaldarla.</small></div>`
+        : `${x.retieneLocal ? `<small>Este cambio solo existe en este dispositivo: se conserva aquí mientras siga en esta lista.</small><br>` : ""}
+      <button type="button" class="btn small ghost" data-rev-descartar="${Number(x.seq)}"${x.retieneLocal ? ' data-rev-retiene="1"' : ""}>Entendido, quitar de la lista</button></div>`}`);
   }
   for (const c of r.conflictos) {
     const que = c.motivo === "borrado_remoto" ? "Se borró en otro dispositivo mientras lo editabas" : "Otro dispositivo cambió el mismo dato";
@@ -1444,6 +2082,9 @@ async function abrirRevisionSync() {
   document.getElementById("revisionSyncResumen").textContent = filas.length ? "Nada de esto se resolvió solo: decide qué hacer con cada uno." : "No hay nada pendiente de revisión.";
   lista.innerHTML = filas.join("");
   lista.querySelectorAll("[data-rev-descartar]").forEach((b) => b.addEventListener("click", async () => {
+    // 3.15 (F-1): esta rechazada es lo único que respalda un dato local → nunca se pierde sin que la persona lo confirme
+    if (b.dataset.revRetiene === "1" && !(await showConfirm("La nube no aceptó este cambio y solo existe en este dispositivo. Si lo quitas de la lista, la próxima vez que este dispositivo se ponga al día se borrará de aquí y quedará lo que tiene la nube.",
+      { titulo: "¿Quitar y descartar el cambio local?", textoOk: "Sí, descartarlo" }))) return;
     await syncMotor.descartarRechazada(Number(b.dataset.revDescartar)); abrirRevisionSync(); renderSyncChip();
   }));
   lista.querySelectorAll("[data-rev-foto]").forEach((b) => b.addEventListener("click", async () => {
@@ -2109,8 +2750,7 @@ function entrarConSesion(session) {
   // lo rechaza el portero como a cualquier otro rol que no sea mecánico.
   if (!ES_APP_MECANICOS && session.rol === "desarrollador") {
     const errEl = document.getElementById("loginError");
-    errEl.innerHTML = 'Cuenta técnica: no abre el taller. Usa el ' +
-                      '<a href="panel-tecnico.html" style="text-decoration:underline;">panel técnico</a>.';
+    errEl.innerHTML = mensajeCuentaTecnica();
     if (window.Auth) Auth.cerrarSesion();
     return;
   }
@@ -2126,6 +2766,7 @@ document.getElementById("btnLogout").addEventListener("click", async () => {
   // Cerrar sesión NO borra nada del taller: ni clientes, ni inventario, ni
   // órdenes, ni la configuración. Solo se va la sesión.
   limpiarFormClave();   // SECURITY-1E: nada escrito en Ajustes → Seguridad sobrevive al cierre de sesión
+  detenerRealtime();    // 3.15: el canal de esta persona se cierra antes de que entre otra
   if (window.Auth && Auth.estado().conSesion) { try { await Auth.cerrarSesion(); } catch (e) {} }
   localStorage.removeItem("enti_session");
   location.reload();
@@ -2181,6 +2822,7 @@ function showView(name) {
   }
   // SECURITY-1E: al salir de Ajustes no queda ninguna contraseña escrita ni a la vista
   if (name !== "ajustes") limpiarFormClave();
+  if (name !== "ajustes") limpiarFormPinProp();   // 3.15 (Bloque 4): tampoco queda un PIN escrito
   document.querySelectorAll(".view").forEach(v => v.classList.remove("active"));
   document.getElementById(`view-${name}`).classList.add("active");
   document.querySelectorAll(".nav-item[data-view]").forEach(b => b.classList.toggle("active", b.dataset.view === name));
@@ -2243,24 +2885,25 @@ document.getElementById("buscarGlobalInput").addEventListener("input", async (e)
     DB.getAll("clientes"), DB.getAll("motos"), DB.getAll("ordenes"), DB.getAll("inventario"), DB.getAll("cotizaciones"),
   ]);
   const resultados = [];
+  const clientePorId = indicePor(clientes), primeraMotoDe = indicePor(motos, "clienteId");
 
   clientes.filter(c => c.nombre.toLowerCase().includes(q) || (c.telefono || "").includes(q)).forEach(c => {
-    const moto = motos.find(m => m.clienteId === c.id);
+    const moto = primeraMotoDe.get(c.id);
     resultados.push({
       ic: "persona", tipo: "Cliente", titulo: c.nombre,
       sub: moto ? `${moto.marca} ${moto.modelo} · ${moto.placa || "sin placa"}` : "sin moto registrada",
       onClick: () => { cerrarBuscadorGlobal(); showView("clientes"); renderClientes(); openClienteDetalle(c.id); },
     });
   });
-  motos.filter(m => (m.placa || "").toLowerCase().includes(q) && !(m.clienteId && clientes.find(c => c.id === m.clienteId && c.nombre.toLowerCase().includes(q)))).forEach(m => {
-    const cliente = clientes.find(c => c.id === m.clienteId);
+  motos.filter(m => (m.placa || "").toLowerCase().includes(q) && !(m.clienteId && clientePorId.get(m.clienteId)?.nombre.toLowerCase().includes(q))).forEach(m => {
+    const cliente = clientePorId.get(m.clienteId);
     resultados.push({
       ic: "moto", tipo: "Moto", titulo: `${m.marca} ${m.modelo} — ${m.placa || "sin placa"}`, sub: cliente?.nombre || "sin cliente asociado",
       onClick: () => { cerrarBuscadorGlobal(); showView("clientes"); renderClientes(); if (cliente) openClienteDetalle(cliente.id); },
     });
   });
   ordenes.filter(o => (o.falla || "").toLowerCase().includes(q)).forEach(o => {
-    const cliente = clientes.find(c => c.id === o.clienteId);
+    const cliente = clientePorId.get(o.clienteId);
     resultados.push({
       ic: "orden", tipo: "Orden", titulo: `Orden #${o.id} — ${STAGES.find(s => s.key === o.estado)?.label || o.estado}`, sub: cliente?.nombre || "",
       onClick: () => { cerrarBuscadorGlobal(); showView("ordenes"); openOrder(o.id); },
@@ -2353,6 +2996,7 @@ document.addEventListener("click", (e) => {
 });
 const renderByView = {
   "mi-trabajo": () => renderMiTrabajo(),
+  mensajes: () => renderMensajes(),
   dashboard: () => renderDashboard(),
   ordenes: () => renderOrdersList(),
   cotizaciones: () => renderCotizaciones(),
@@ -2362,13 +3006,13 @@ const renderByView = {
   pos: () => renderPOS(),
   finanzas: () => renderFinanzas(),
   creditos: () => renderCreditos(),
-  "web-cms": () => renderWebCMS(),
   ajustes: () => renderAjustes(),
   // vive en usuarios.js: habla con el api-server, no con IndexedDB
   usuarios: () => window.PantallaUsuarios?.render(),
 };
 document.querySelectorAll(".nav-item[data-view]").forEach(btn => {
   btn.addEventListener("click", () => {
+    if (btn.dataset.view === "web-cms") { abrirGestorWeb(); closeMobileSidebar(); return; }   // 3.15 (Bloque 6): panel real, otra pestaña
     if (showView(btn.dataset.view)) renderByView[btn.dataset.view]?.();
   });
 });
@@ -2378,12 +3022,14 @@ document.querySelectorAll(".nav-item[data-view]").forEach(btn => {
 // aplicarPermisosPorRol (puedeVerVista), igual que en el menú.
 document.querySelectorAll(".qa-btn[data-view]").forEach(btn => {
   btn.addEventListener("click", () => {
+    if (btn.dataset.view === "web-cms") { abrirGestorWeb(); closeMobileSidebar(); return; }   // 3.15 (Bloque 6): panel real, otra pestaña
     if (showView(btn.dataset.view)) renderByView[btn.dataset.view]?.();
   });
 });
 
 /* ================= widgets compartidos (mini-tarjetas clicables) ================= */
-function sameMonth(a, b) { return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth(); }
+// 3.15 (Bloque 3): mes EMPRESARIAL (America/Tegucigalpa), no el del reloj del dispositivo ni el UTC
+function sameMonth(a, b) { return FechaNegocio.mismoMes(a, b); }
 function countMantenimientos(motos) { return motos.filter(m => ["due", "soon"].includes(mantStatus(m).cls)).length; }
 
 // items: { ic, val, lbl, active?, goto? (navega a otra vista) | onClick? (ej. aplicar un filtro en la misma vista) }
@@ -2420,12 +3066,17 @@ async function renderMiTrabajo() {
   const [citas, ordenes, clientes, motos] = await Promise.all([
     DB.getAll("citas"), DB.getAll("ordenes"), DB.getAll("clientes"), DB.getAll("motos"),
   ]);
-  const nombreCliente = (id) => clientes.find(c => c.id === id)?.nombre || "Cliente";
-  const telCliente = (id) => clientes.find(c => c.id === id)?.telefono || "";
-  const motoDe = (id) => motos.find(m => m.id === id);
+  const clientePorId = indicePor(clientes), motoPorId = indicePor(motos);
+  const nombreCliente = (id) => clientePorId.get(id)?.nombre || "Cliente";
+  const telCliente = (id) => clientePorId.get(id)?.telefono || "";
+  const motoDe = (id) => motoPorId.get(id);
 
   document.getElementById("miTrabajoSub").textContent =
     `${currentUser?.nombre || ""} · acceso para mecánicos.`;
+  // 3.15 (Bloque 3): mensajes del administrador y estado de los avisos en vivo
+  pintarEstadoVivo();
+  await renderMensajesMiTrabajo();
+  await pintarBadgeMensajes();
 
   const mias = citas.filter(esTrabajoPropio).filter(c => !citaCerrada(c))
     .sort((a, b) => `${a.fecha}${a.hora}`.localeCompare(`${b.fecha}${b.hora}`));
@@ -2491,13 +3142,14 @@ const AVANCE_MECANICO = {
 };
 
 async function renderDashboard() {
-  const [ordenes, motos, clientes, inventario, citas, cotizaciones] = await Promise.all([
-    DB.getAll("ordenes"), DB.getAll("motos"), DB.getAll("clientes"), DB.getAll("inventario"), DB.getAll("citas"),
+  // 3.15 (Bloque 7): de los clientes el tablero solo muestra CUÁNTOS hay: se cuentan sin leerlos todos
+  const [ordenes, motos, totalClientes, inventario, citas, cotizaciones] = await Promise.all([
+    DB.getAll("ordenes"), DB.getAll("motos"), DB.count("clientes"), DB.getAll("inventario"), DB.getAll("citas"),
     DB.getAll("cotizaciones"),
   ]);
 
   const activas = ordenes.filter(o => o.estado !== "entregado").length;
-  const hoyStr = new Date().toISOString().slice(0, 10);
+  const hoyStr = FechaNegocio.hoy();   // 3.15: día de Honduras (antes UTC: después de las 18:00 contaba las de mañana)
   const citasHoy = citas.filter(c => c.fecha === hoyStr && !citaCerrada(c)).length;
   const mantenimientos = countMantenimientos(motos);
   const repuestosBajos = inventario.filter(r => r.cantidad <= 3).length;
@@ -2505,9 +3157,18 @@ async function renderDashboard() {
   const cotizacionesVivas = cotizaciones.filter(c => estadoCotizacion(c) === "pendiente");
 
   const now = new Date();
-  const ingresosMes = ordenes
-    .filter(o => o.estado === "entregado" && o.entregadoEn && sameMonth(new Date(o.entregadoEn), now))
-    .reduce((s, o) => s + (o.items || []).reduce((ss, it) => ss + it.cantidad * it.precio, 0), 0);
+  /* 3.15 (Bloque 5): dinero de VERDAD. Antes «Ingresos del mes» sumaba las órdenes ENTREGADAS (cobradas o no, las de crédito por su
+     total y sin quitar las anuladas) y dejaba fuera abonos y TPV: mezclaba lo facturado con lo cobrado. Ahora: lo que entró en caja
+     (FinanzasCalc, misma regla que finanzas_resumen del servidor), lo que se debe y el trabajo entregado que todavía no es ni una cosa
+     ni la otra. El mecánico no ve dinero. */
+  let fin = null;
+  if (currentUser?.rol !== "mecanico" && window.FinanzasCalc) {
+    try {
+      const [movs, creditos] = await Promise.all([DB.getAll("caja_movimientos"), DB.getAll("creditos")]);
+      fin = FinanzasCalc.resumenLocal({ movs, creditos, ordenes, F: FechaNegocio });
+    } catch (e) { fin = null; }
+  }
+  const plural = (n, uno, varios) => `${n} ${n === 1 ? uno : varios}`;
 
   renderWidgetRow("widgetRow", [
     { ic: "orden", val: activas, lbl: "Órdenes activas", goto: "ordenes" },
@@ -2515,19 +3176,29 @@ async function renderDashboard() {
     { ic: "cita", val: citasHoy, lbl: "Citas hoy", goto: "citas" },
     { ic: "mantenimiento", val: mantenimientos, lbl: "Mantenimientos", goto: "clientes" },
     { ic: "stock-bajo", val: repuestosBajos, lbl: "Stock bajo", goto: "inventario" },
-    { ic: "usuarios", val: clientes.length, lbl: "Clientes", goto: "clientes" },
+    { ic: "usuarios", val: totalClientes, lbl: "Clientes", goto: "clientes" },
   ]);
 
   const stageColor = { recibido: "var(--text-faint)", diagnostico: "var(--amber)", presupuesto: "var(--amber)", reparacion: "var(--red)", calidad: "var(--red)", entregado: "var(--green)" };
   const porEtapa = STAGES.map(s => ({ ...s, count: ordenes.filter(o => o.estado === s.key).length }));
   const totalOrdenes = ordenes.length || 1;
 
-  document.getElementById("widgetGrid").innerHTML = `
-    <div class="widget-card tint-green">
-      <span class="eyebrow">Ingresos del mes</span>
-      <span class="big">${money(ingresosMes)}</span>
-      <span class="sub">De órdenes entregadas en ${esc(now.toLocaleDateString("es-HN", { month: "long" }))}</span>
+  document.getElementById("widgetGrid").innerHTML = `${fin ? `
+    <div class="widget-card tint-green" id="cardCobradoMes">
+      <span class="eyebrow">Cobrado este mes</span>
+      <span class="big">${money(fin.cobradoMes)}</span>
+      <span class="sub">Dinero que entró en caja en ${esc(FechaNegocio.fecha(now, { month: "long" }))} · hoy ${money(fin.cobradoHoy)}</span>
     </div>
+    <button type="button" class="widget-card ${fin.porCobrar > 0 ? "tint-amber" : ""}" id="cardPorCobrarDash" style="text-align:left; font-family:inherit; cursor:pointer;">
+      <span class="eyebrow">Por cobrar</span>
+      <span class="big">${money(fin.porCobrar)}</span>
+      <span class="sub">${plural(fin.creditosConSaldo, "crédito con saldo", "créditos con saldo")} · todavía no es dinero</span>
+    </button>
+    <div class="widget-card ${fin.entregadoSinCobrar > 0 ? "tint-amber" : ""}" id="cardEntregadoSinCobrar">
+      <span class="eyebrow">Entregado sin cobrar</span>
+      <span class="big">${money(fin.entregadoSinCobrar)}</span>
+      <span class="sub">${plural(fin.ordenesEntregadasSinCobrar, "orden entregada", "órdenes entregadas")} sin cobro ni crédito</span>
+    </div>` : ""}
     <button type="button" class="widget-card" id="cardCotizaciones" style="text-align:left; font-family:inherit; cursor:pointer;">
       <span class="eyebrow">Cotizado sin cerrar</span>
       <span class="big">${money(cotizacionesVivas.reduce((s, c) => s + totalCotizacion(c), 0))}</span>
@@ -2544,6 +3215,11 @@ async function renderDashboard() {
       <div class="seg-legend">${porEtapa.map(s => `<span><span class="dot" style="background:${stageColor[s.key]}"></span>${esc(s.label)} <b>${s.count}</b></span>`).join("")}</div>
     </div>
   `;
+  document.getElementById("cardPorCobrarDash")?.addEventListener("click", () => {
+    showView("creditos");
+    document.querySelectorAll(".nav-item[data-view]").forEach(b => b.classList.toggle("active", b.dataset.view === "creditos"));
+    renderCreditos();
+  });
   document.getElementById("cardCotizaciones").addEventListener("click", () => {
     showView("cotizaciones");
     document.querySelectorAll(".nav-item[data-view]").forEach(b => b.classList.toggle("active", b.dataset.view === "cotizaciones"));
@@ -2554,41 +3230,27 @@ async function renderDashboard() {
     document.querySelectorAll(".nav-item[data-view]").forEach(b => b.classList.toggle("active", b.dataset.view === "clientes"));
   });
 
-  // Estadísticas del sitio web: no hay analítica real conectada todavía
-  // (ni Google Analytics ni una tabla de visitas en el backend), así que
-  // esto son números de ejemplo fijos, solo para mostrar cómo se vería.
-  const webStats = { hoy: 47, mes: 1284, top: "Catálogo", topPct: 38, semana: [12, 18, 15, 22, 19, 25, 31] };
-  const maxV = Math.max(...webStats.semana);
-  document.getElementById("webWidgetGrid").innerHTML = `
-    <div class="widget-card">
-      <span class="eyebrow" style="color:var(--text-faint);">Visitas hoy</span>
-      <span class="big">${webStats.hoy}</span>
-      <span class="sub">Dato de ejemplo</span>
-    </div>
-    <div class="widget-card">
-      <span class="eyebrow" style="color:var(--text-faint);">Visitas este mes</span>
-      <span class="big">${webStats.mes.toLocaleString("es-HN")}</span>
-      <span class="sub">Página más vista: ${esc(webStats.top)} (${webStats.topPct}%)</span>
-    </div>
-    <div class="widget-card span-2">
-      <span class="eyebrow" style="color:var(--text-faint);">Últimos 7 días</span>
-      <div class="sparkline">${webStats.semana.map((v, i) => `<span class="bar ${i === webStats.semana.length - 1 ? "now" : ""}" style="height:${Math.max((v / maxV) * 100, 6)}%" title="Día ${i + 1}: ${v} visitas"></span>`).join("")}</div>
-      <span class="sub">Hoy: ${webStats.semana[webStats.semana.length - 1]} visitas (ejemplo)</span>
-    </div>
-  `;
+  // 3.15 (Bloque 6): ya no se pintan visitas web INVENTADAS; sin analítica real conectada, el dashboard no muestra esa sección.
 }
 
 /* ---------------- gráficos del dashboard (Chart.js) ---------------- */
+/* 3.15 (Bloque 7): Chart.js carga en paralelo (async, index.html). Si llega cuando Finanzas ya está a la vista, se dibujan sus gráficos. */
+document.getElementById("libChart")?.addEventListener("load", () => {
+  if (document.getElementById("view-finanzas")?.classList.contains("active")) renderFinanzasCharts().catch(() => { /* se verán al volver a entrar */ });
+});
 let chartInstances = {};
 function chartColors() {
   const dark = !document.documentElement.classList.contains("light") && window.matchMedia("(prefers-color-scheme: dark)").matches;
   return { grid: dark ? "rgba(255,255,255,0.08)" : "rgba(0,0,0,0.08)", text: dark ? "#a8a8a8" : "#555" };
 }
 
-async function renderFinanzasCharts() {
+async function renderFinanzasCharts(datos) {
   if (typeof Chart === "undefined") return; // sin internet la primera vez, la librería no llegó a cargar
 
-  const [movs, ventasTodas, ordenes, inv, creditosTodos] = await Promise.all([DB.getAll("caja_movimientos"), DB.getAll("ventas_rapidas"), DB.getAll("ordenes"), DB.getAll("inventario"), DB.getAll("creditos")]);
+  // 3.15 (Bloque 7): con `datos` (renderFinanzas) se usa la misma lectura de la pantalla; sin él, se lee como siempre
+  const [movs, ventasTodas, ordenes, inv, creditosTodos] = datos
+    ? [datos.movs, datos.ventasTodas, datos.ordenesTodas, datos.inventario, datos.creditosTodos]
+    : await Promise.all([DB.getAll("caja_movimientos"), DB.getAll("ventas_rapidas"), DB.getAll("ordenes"), DB.getAll("inventario"), DB.getAll("creditos")]);
   // SYNC-7B: lo anulado se conserva (reverso) pero no cuenta como venta ni como deuda
   const ventas = ventasTodas.filter(v => !v.anulada), creditos = creditosTodos.filter(c => !c.anulado);
   const { grid, text } = chartColors();
@@ -2598,17 +3260,22 @@ async function renderFinanzasCharts() {
   document.getElementById("finanzasChartsFlag").style.display = (movs.length || ventas.length) ? "none" : "block";
 
   // 1) Ingresos vs Gastos, últimos 7 días
-  const dias = Array.from({ length: 7 }, (_, i) => { const d = new Date(); d.setDate(d.getDate() - (6 - i)); return d.toISOString().slice(0, 10); });
-  const ingresosPorDia = dias.map(d => movs.filter(m => m.tipo === "ingreso" && m.fechaISO.slice(0, 10) === d).reduce((s, m) => s + m.monto, 0));
-  const gastosPorDia = dias.map(d => movs.filter(m => m.tipo === "egreso" && m.fechaISO.slice(0, 10) === d).reduce((s, m) => s + m.monto, 0));
+  // 3.15: los 7 días empresariales (Honduras) y cada movimiento en SU día empresarial
+  const hoyNeg = FechaNegocio.hoy();
+  const dias = Array.from({ length: 7 }, (_, i) => FechaNegocio.sumarDias(hoyNeg, -(6 - i)));
+  // 3.15 (Bloque 5): cada día, lo COBRADO y los GASTOS con la misma regla que las tarjetas (FinanzasCalc): sin fondo de caja, las
+  // devoluciones y reversos restan de lo cobrado (antes un reverso se dibujaba como un «gasto» y la venta anulada seguía como ingreso)
+  const porDia = dias.map(d => FinanzasCalc.caja({ movs, desde: d, hasta: d, F: FechaNegocio }));
+  const ingresosPorDia = porDia.map(x => x.cobrado);
+  const gastosPorDia = porDia.map(x => x.gastos);
 
   chartInstances.ingresosGastos?.destroy();
   chartInstances.ingresosGastos = new Chart(document.getElementById("chartIngresosGastos"), {
     type: "line",
     data: {
-      labels: dias.map(d => new Date(d + "T00:00").toLocaleDateString("es-HN", { day: "2-digit", month: "2-digit" })),
+      labels: dias.map(d => FechaNegocio.dia(d, { day: "2-digit", month: "2-digit" })),
       datasets: [
-        { label: "Ingresos", data: ingresosPorDia, borderColor: "#34d399", backgroundColor: "rgba(52,211,153,0.15)", tension: 0.3, fill: true },
+        { label: "Cobrado", data: ingresosPorDia, borderColor: "#34d399", backgroundColor: "rgba(52,211,153,0.15)", tension: 0.3, fill: true },
         { label: "Gastos", data: gastosPorDia, borderColor: "#ef4444", backgroundColor: "rgba(239,68,68,0.15)", tension: 0.3, fill: true },
       ],
     },
@@ -2619,8 +3286,10 @@ async function renderFinanzasCharts() {
   // repuestos vs trabajo rápido — se calcula directo de las órdenes/ventas/créditos
   // (no de caja_movimientos) para poder separar cada ítem por su origen, algo que
   // el registro de caja ya no distingue una vez que el dinero entra como un solo monto.
+  // 3.15 (Bloque 5): FACTURADO (no «ganancias»): órdenes CERRADAS (contado o crédito) y no anuladas. Antes contaba toda orden
+  // entregada, aunque no se hubiera cobrado ni quedado a crédito, y también las anuladas.
   const totalTaller = ordenes
-    .filter(o => o.estado === "entregado")
+    .filter(o => o.finalizada && !o.anulada)
     .reduce((s, o) => s + (o.items || []).reduce((ss, it) => ss + it.cantidad * it.precio, 0), 0);
   let totalRepuestos = 0, totalTrabajoRapido = 0;
   // los créditos que nacen de una orden de taller ya están contados arriba en
@@ -2648,8 +3317,9 @@ async function renderFinanzasCharts() {
     if (!it.inventarioId) return;
     rotacion[it.inventarioId] = (rotacion[it.inventarioId] || 0) + it.cantidad;
   }));
+  const invPorId = indicePor(inv);
   const top5 = Object.entries(rotacion)
-    .map(([id, cant]) => ({ nombre: inv.find(r => r.id === Number(id))?.nombre || `#${id}`, cant }))
+    .map(([id, cant]) => ({ nombre: invPorId.get(Number(id))?.nombre || `#${id}`, cant }))
     .sort((a, b) => b.cant - a.cant).slice(0, 5);
 
   chartInstances.topRepuestos?.destroy();
@@ -2665,7 +3335,7 @@ let ordenesFiltro = null; // null (todas) | "activas" | "entregadas"
 
 /* SYNC-7B · borrar una orden en modo nube: sin dinero → borrado suave SOLO admin, y la RPC devuelve al inventario
    los repuestos que salieron (anular_orden); cobrada → NO se borra, se anula (caja/crédito compensados), con PIN
-   para el cajero. Nunca DB.delete de una orden con dinero. */
+   (3.15 B4: también para el admin). Nunca DB.delete de una orden con dinero. */
 async function anularOrdenNube(id) {
   const o = await DB.get("ordenes", id);
   if (!o) return;
@@ -2677,7 +3347,8 @@ async function anularOrdenNube(id) {
     ? await showConfirm("¿Los repuestos de esta orden vuelven al inventario?", { titulo: "Anular orden", textoOk: "Sí, devolver al inventario" })
     : true;
   const ok = await accionAutorizada((d) => syncFin.construir.anularOrden(d), { ordenUid: o.uid, motivo, devolverStock },
-    ["ordenes", "inventario", "creditos", "caja_movimientos"], conDinero ? "Orden anulada (queda en el historial)" : "Orden eliminada");
+    ["ordenes", "inventario", "creditos", "caja_movimientos"], conDinero ? "Orden anulada (queda en el historial)" : "Orden eliminada",
+    { sinPinAdmin: !conDinero });   // 3.15 B4: sin dinero = admin con su sesión (sin PIN); cobrada = destructiva (PIN también al admin)
   if (!ok) return;
   renderOrdersList();
   renderDashboard();
@@ -2709,14 +3380,17 @@ async function renderOrdersList() {
     return;
   }
   ordenes = [...ordenes].sort((a, b) => b.id - a.id);
+  const motoPorId = indicePor(motos), clientePorId = indicePor(clientes);
+  const totalOrdenes = ordenes.length;
+  ordenes = ordenes.slice(0, limiteLista("ordenes"));   // 3.15 (Bloque 7): por tramos (ver verMasLista)
   list.innerHTML = ordenes.map(o => {
-    const moto = motos.find(m => m.id === o.motoId);
-    const cliente = clientes.find(c => c.id === o.clienteId);
+    const moto = motoPorId.get(o.motoId);
+    const cliente = clientePorId.get(o.clienteId);
     const total = (o.items || []).reduce((s, it) => s + it.cantidad * it.precio, 0);
     const foto = (o.fotos || [])[0];
     return `
       <div class="order-row" data-id="${o.id}">
-        ${foto ? `<img class="order-thumb" src="${foto}">` : `<div class="order-thumb">🏍️</div>`}
+        ${foto ? `<img class="order-thumb" src="${foto}" loading="lazy" decoding="async" alt="">` : `<div class="order-thumb">🏍️</div>`}
         <span class="pill ${o.estado}">${STAGES.find(s => s.key === o.estado)?.label ?? o.estado}${o.finalizada ? " ✓" : ""}</span>
         <div class="order-info">
           <div class="moto">${esc(moto ? `${moto.marca} ${moto.modelo}` : "Moto")} <span class="cliente">— ${esc(cliente?.nombre ?? "cliente")}</span></div>
@@ -2726,7 +3400,8 @@ async function renderOrdersList() {
         <span class="meta mech">${esc(o.mecanico || "Sin asignar")}</span>
         <button type="button" class="btn ghost small danger" data-del="${o.id}" title="Eliminar orden" aria-label="Eliminar orden">🗑</button>
       </div>`;
-  }).join("");
+  }).join("") + verMasLista("ordenes", totalOrdenes);
+  conectarVerMas(list, "ordenes", renderOrdersList);
   list.querySelectorAll(".order-row").forEach(row => {
     row.addEventListener("click", (e) => {
       if (e.target.closest("[data-del]")) return;
@@ -2772,11 +3447,14 @@ async function openOrder(id) {
 
   document.getElementById("detalleTitulo").textContent = `Orden #${o.id} — ${moto.marca} ${moto.modelo}`;
   const desdeCita = o.citaId
-    ? ` · <span class="mant-badge soon">📅 Desde cita${o.citaFechaISO ? " del " + new Date(o.citaFechaISO).toLocaleDateString("es-HN") : ""}</span>`
+    ? ` · <span class="mant-badge soon">📅 Desde cita${o.citaFechaISO ? " del " + FechaNegocio.dia(String(o.citaFechaISO).slice(0, 10)) : ""}</span>`
     : "";
   document.getElementById("detalleSub").innerHTML =
     `${esc(cliente.nombre)} · ${esc(cliente.telefono || "sin teléfono")} · placa ${esc(moto.placa || "s/p")}${desdeCita}`;
   await renderDetalleMecanico(o);
+  // 3.15 (Bloque 3): mensaje dirigido al mecánico de ESTA orden (solo admin con nube; la orden queda como relación, no se copia texto)
+  const btnMsg = document.getElementById("btnMensajeOrden");
+  if (btnMsg) btnMsg.style.display = esAdmin() && syncMotor && o.mecanicoId && o.uid ? "" : "none";
   document.getElementById("detalleFalla").textContent = o.falla || "(sin descripción)";
   // lo legacy se sigue viendo: si la orden no trae km propio, se muestra el de
   // la moto, igual que antes
@@ -2800,12 +3478,21 @@ async function openOrder(id) {
 async function renderDetalleFotos(o) {
   const cont = document.getElementById("detalleFotos");
   if (!esMecanicoCuenta()) {
-    cont.innerHTML = (o.fotos || []).map(src => `<img src="${src}">`).join("");
+    // fotos tomadas en ESTE Taller (en el dispositivo) + 3.15 (Bloque 8) la evidencia que subieron los mecánicos (Storage, URL firmada)
+    const propias = (o.fotos || []).map(src => `<img src="${src}" decoding="async" alt="Foto de la orden">`).join("");
+    const nube = (o.fotosNube || []).filter(esRutaFoto);
+    if (!nube.length) { cont.innerHTML = propias; return; }
+    cont.innerHTML = propias + `<p class="meta" style="margin:0;" data-fotos-nube="cargando">Cargando fotos del mecánico…</p>`;
+    const ordenAhora = o.id;
+    const urls = await Promise.all(nube.map(obtenerUrlFotoFirmada));
+    if (currentOrderId !== ordenAhora) return;   // la persona ya abrió otra orden
+    cont.innerHTML = propias + (urls.filter(Boolean).map(u => `<img src="${esc(u)}" decoding="async" alt="Foto del mecánico" data-foto-nube="1">`).join("")
+      || `<p class="meta" style="margin:0;">No se pudieron cargar las ${nube.length} foto${nube.length === 1 ? "" : "s"} del mecánico (sin conexión o sin permiso).</p>`);
     return;
   }
   cont.innerHTML = `<p class="meta" style="margin:0;">Cargando fotos…</p>`;
   const urls = await Promise.all((o.fotos || []).map(obtenerUrlFotoFirmada));
-  cont.innerHTML = urls.filter(Boolean).map(u => `<img src="${esc(u)}">`).join("")
+  cont.innerHTML = urls.filter(Boolean).map(u => `<img src="${esc(u)}" decoding="async" alt="Foto de la orden">`).join("")   // sin lazy: en el detalle la foto ES lo que se vino a ver
     || `<p class="meta" style="margin:0;">${(o.fotos || []).length ? "No se pudieron cargar las fotos." : "Sin fotos todavía."}</p>`;
 }
 async function obtenerUrlFotoFirmada(path) {
@@ -2815,7 +3502,7 @@ async function obtenerUrlFotoFirmada(path) {
       baseUrl: window.ENTIMOTORS_SUPABASE.url, anonKey: window.ENTIMOTORS_SUPABASE.anonKey,
       bucket: "entimotors-taller", path,
       obtenerToken: () => { const s = SupabaseCliente.sesion(); return s ? s.access_token : null; },
-      refrescar: () => SupabaseCliente.refrescarSesion().then(r2 => r2.ok),
+      refrescar: renovarSesionNube,
     });
     return r.ok ? r.url : null;
   } catch (e) { return null; }
@@ -2931,7 +3618,7 @@ function updateActionBar(o) {
     btnAvanzar.style.display = "none";
     btnRetroceder.style.display = "none";
     badge.style.display = "inline-flex";
-    badge.textContent = `✓ Trabajo finalizado el ${new Date(o.finalizadoEn).toLocaleDateString()}`;
+    badge.textContent = `✓ Trabajo finalizado el ${FechaNegocio.fecha(o.finalizadoEn)}`;
   } else {
     badge.style.display = "none";
     btnRetroceder.style.display = "inline-flex";
@@ -2995,6 +3682,8 @@ async function renderStageContent(o) {
         <textarea id="repNotas" rows="3" placeholder="Qué se ha hecho, qué falta...">${esc(o.reparacionNotas || "")}</textarea>
       </div>`;
     document.getElementById("repNotas").addEventListener("change", (e) => updateOrder(o.id, ord => { ord.reparacionNotas = e.target.value; }));
+    // 3.15 (Bloque 2): durante la reparación el taller sigue ajustando repuestos y mano de obra (solo la diferencia mueve stock)
+    if (!esMecanicoCuenta()) await renderPresupuestoStage(o, { anexar: true });
 
   } else if (o.estado === "calidad") {
     const chk = o.calidadChecklist || {};
@@ -3032,7 +3721,7 @@ async function renderStageContent(o) {
     const garantiaDias = o.garantiaDias ?? 30;
     const venceEn = o.entregadoEn ? o.entregadoEn + garantiaDias * 86400000 : null;
     const vigente = !venceEn || Date.now() <= venceEn;
-    const fechaVence = venceEn ? new Date(venceEn).toLocaleDateString("es-HN") : "—";
+    const fechaVence = venceEn ? FechaNegocio.fecha(venceEn) : "—";
     el.innerHTML = `
       <div class="card">
         <h4 class="font-display" style="font-size:0.95rem; margin-bottom:0.4rem;">Entregada</h4>
@@ -3116,53 +3805,83 @@ async function renderStageContent(o) {
   }
 }
 
-async function renderPresupuestoStage(o) {
-  const inv = await DB.getAll("inventario");
+/* ---- 3.15 · Bloque 2 · presupuesto de la orden ----
+   · Renglones separados por tipo: taller/mano de obra, repuestos del negocio, repuestos manuales y los viejos sin clasificar.
+   · Pendiente / rechazado: los repuestos del negocio NO tocan el inventario (no hay reservas).
+   · Aprobar: el servidor verifica TODO el stock y descuenta cada repuesto exactamente una vez (garantía de la base); si falta
+     algo no aprueba nada y nombra el producto. Sin red la aprobación queda PENDIENTE DE CONFIRMACIÓN en la cola y la decide el
+     servidor al volver: nunca se pinta como aprobada antes (presupuestoEstado solo baja del servidor).
+   · Después de aprobar, editar o quitar un renglón ajusta solo la diferencia (lo calcula el servidor, con movimientos
+     compensatorios; nunca se borra historia). */
+function estadoPresupuesto(o) {
+  if (o.presupuestoEstado) return o.presupuestoEstado;
+  // modo local (o una orden que todavía no bajó con el campo): la aprobación local de siempre cuenta como aprobada
+  return o.aprobacion?.via === "local" ? "aprobado" : "pendiente";
+}
+function etiquetaStockRenglon(it) {
+  if (!finanzasNube() || tipoRenglon(it) !== "repuesto_inventario") return "";
+  if (!it.uid) return `<span class="renglon-tag espera">sin enviar</span>`;
+  const apl = Number(it.cantidadAplicada) || 0;
+  if (apl >= it.cantidad) return `<span class="renglon-tag ok">descontado</span>`;
+  if (apl > 0) return `<span class="renglon-tag espera">descontado ${apl} de ${it.cantidad}</span>`;
+  return `<span class="renglon-tag">se descuenta al aprobar</span>`;
+}
+
+async function renderPresupuestoStage(o, { anexar = false } = {}) {
   const items = o.items || [];
   const el = document.getElementById("stageContent");
-  el.innerHTML = `
-    <div class="card">
-      <h4 class="font-display" style="font-size:0.95rem; margin-bottom:0.6rem;">Presupuesto</h4>
-      <table id="tablaItems">
-        <thead><tr><th>Ítem</th><th class="num">Cant.</th><th class="num">Precio</th><th class="num">Subtotal</th><th></th></tr></thead>
-        <tbody id="itemsBody"></tbody>
-      </table>
+  const html = `
+    <div class="card" id="presupuestoCard"${anexar ? ` style="margin-top:0.8rem;"` : ""}>
+      <h4 class="font-display" style="font-size:0.95rem; margin-bottom:0.6rem;">${anexar ? "Repuestos y mano de obra" : "Presupuesto"}</h4>
+      <div class="presupuesto-estado" id="presupuestoEstado"></div>
+      <div class="table-scroll">
+        <table id="tablaItems" class="tabla-renglones">
+          <thead><tr><th>Ítem</th><th class="num">Cant.</th><th class="num">Precio</th><th class="num">Subtotal</th><th></th></tr></thead>
+          <tbody id="itemsBody"></tbody>
+        </table>
+      </div>
       <div style="display:flex; justify-content:space-between; margin-top:0.6rem; font-weight:600;">
         <span>Total</span><span id="itemsTotal" style="font-variant-numeric:tabular-nums;">${money(items.reduce((s, it) => s + it.cantidad * it.precio, 0))}</span>
       </div>
-      <button class="btn small" id="btnAgregarItem" style="margin-top:0.7rem;">+ Agregar repuesto / mano de obra</button>
-
-      <div id="aprobacionBox" style="margin-top:1rem; padding-top:1rem; border-top:1px solid var(--line);">
-        <p class="hint" style="margin-top:0;">El cliente puede aprobar por WhatsApp (se le escribe a su número), o directo aquí si está en el local.</p>
-        <div style="display:flex; gap:0.5rem; flex-wrap:wrap;">
-          <button class="btn wa" id="btnEnviarWA">Enviar presupuesto por WhatsApp</button>
-          <button class="btn primary" id="btnAprobarLocal">Aprobar en el local</button>
-        </div>
-        <p id="aprobacionEstado" style="margin-top:0.6rem; font-size:0.85rem;"></p>
-      </div>
+      <button class="btn small" id="btnAgregarItem" style="margin-top:0.7rem;">+ Agregar mano de obra o repuesto</button>
+      <div id="aprobacionBox" style="margin-top:1rem; padding-top:1rem; border-top:1px solid var(--line);"></div>
     </div>`;
+  if (anexar) el.insertAdjacentHTML("beforeend", html); else el.innerHTML = html;
 
-  document.getElementById("itemsBody").innerHTML = items.length ? items.map((it, i) => `
+  document.getElementById("itemsBody").innerHTML = items.length ? filasTablaRenglones(items, ({ it, i }) => `
     <tr>
-      <td>${esc(it.nombre)}</td><td class="num">${it.cantidad}</td><td class="num">${money(it.precio)}</td><td class="num">${money(it.cantidad * it.precio)}</td>
-      <td class="num"><button type="button" class="btn ghost small danger" data-quitar="${i}" title="Quitar ítem" aria-label="Quitar ítem">🗑</button></td>
-    </tr>
-  `).join("") : `<tr><td colspan="5" style="color:var(--text-faint);">Sin ítems todavía</td></tr>`;
+      <td>${esc(it.nombre)}${etiquetaStockRenglon(it)}</td><td class="num">${it.cantidad}</td><td class="num">${money(it.precio)}</td><td class="num">${money(it.cantidad * it.precio)}</td>
+      <td class="num"><span class="acciones"><button type="button" class="btn ghost small" data-editar="${i}" title="Editar renglón" aria-label="Editar ${esc(it.nombre)}">✎</button><button type="button" class="btn ghost small danger" data-quitar="${i}" title="Quitar ítem" aria-label="Quitar ítem">🗑</button></span></td>
+    </tr>`, { cols: 5, colSub: 3 }) : `<tr><td colspan="5" style="color:var(--text-faint);">Sin ítems todavía</td></tr>`;
+
+  document.getElementById("itemsBody").querySelectorAll("[data-editar]").forEach(btn => {
+    btn.addEventListener("click", async () => {
+      const idx = Number(btn.dataset.editar);
+      const it = ((await DB.get("ordenes", o.id)).items || [])[idx];
+      if (!it) return;
+      editorRenglonOrden.abrir({ tipo: it.tipo ?? null, nombre: it.nombre, cantidad: it.cantidad, precio: it.precio, inventarioId: it.origenInventarioId ?? null,
+        idx, uid: it.uid || null, ordenId: o.id });
+    });
+  });
 
   document.getElementById("itemsBody").querySelectorAll("[data-quitar]").forEach(btn => {
     btn.addEventListener("click", async () => {
       const idx = Number(btn.dataset.quitar);
       const ord = await DB.get("ordenes", o.id);
       if (finanzasNube()) {
-        // SYNC-7B: quitar_item_orden devuelve el stock con un movimiento compensatorio (idempotente por op_id)
+        // quitar_item_orden devuelve EXACTAMENTE lo aplicado de ese renglón (0 si el presupuesto no estaba aprobado),
+        // con un movimiento compensatorio idempotente por op_id
         const it = (ord.items || [])[idx];
         if (!it) return;
-        try { await quitarItemOrdenNube(ord, it); } catch (err) { toast("No se pudo quitar: " + err.message, "off"); return; }
+        let r;
+        try { r = await quitarItemOrdenNube(ord, it); } catch (err) { toast("No se pudo quitar: " + mensajeStock(err.message), "off"); return; }
         ord.items.splice(idx, 1);
         await DB.save("ordenes", ord);
-        await bajarNube(["inventario"]);
-        toast(it.origenInventarioId ? "Ítem quitado y stock devuelto al inventario" : "Ítem quitado");
-        renderPresupuestoStage(ord);
+        if (r.estado === "ok") await bajarNube(["ordenes", "inventario"]);
+        const dev = Number(r.resultado?.devuelto) || 0;
+        toast(r.estado === "pendiente" ? "Ítem quitado sin conexión: se enviará al volver la red" : dev > 0 ? `Ítem quitado · ${dev} devuelto(s) al inventario` : "Ítem quitado",
+          r.estado === "pendiente" ? "off" : undefined);
+        openOrder(o.id);
         return;
       }
       const [removido] = (ord.items || []).splice(idx, 1);
@@ -3173,24 +3892,53 @@ async function renderPresupuestoStage(o) {
       await DB.save("ordenes", ord);
       markDirty();
       toast(removido?.origenInventarioId ? "Ítem quitado y stock devuelto al inventario" : "Ítem quitado");
-      renderPresupuestoStage(ord);
+      openOrder(o.id);
     });
   });
 
-  renderAprobacionEstado(o);
+  document.getElementById("btnAgregarItem").addEventListener("click", () => editorRenglonOrden.abrir(null, { ordenId: o.id }));
+  await pintarAprobacion(o);
+}
 
-  document.getElementById("btnAgregarItem").addEventListener("click", async () => {
-    const invNow = await DB.getAll("inventario");
-    document.getElementById("itemInventarioSelect").innerHTML = invNow.map(r => `<option value="${r.id}">${esc(r.nombre)} (quedan ${r.cantidad})</option>`).join("") || `<option value="">Inventario vacío</option>`;
-    document.getElementById("itemNombre").value = "";
-    document.getElementById("itemCantidad").value = 1;
-    document.getElementById("itemPrecio").value = "";
-    document.getElementById("itemOrigen").value = "manual";
-    toggleItemOrigen();
-    document.getElementById("modalItem").classList.add("active");
+async function pintarAprobacion(o) {
+  const box = document.getElementById("aprobacionBox"), est = document.getElementById("presupuestoEstado");
+  if (!box || !est) return;
+  const estado = estadoPresupuesto(o);
+  const enCola = await decisionPresupuestoEnCola(o.uid);
+  const esperando = enCola && ["pending", "syncing"].includes(enCola.estado) ? enCola : null;
+  const rechazo = enCola && enCola.estado === "rejected" ? enCola : null;
+  const fecha = (ms) => (ms ? FechaNegocio.fechaHora(ms) : "");
+  const [clase, texto] = { aprobado: ["entregado", "Aprobado"], rechazado: ["reparacion", "No aprobado"] }[estado] || ["presupuesto", "Pendiente de aprobación"];
+  const detalle = estado === "aprobado" ? [fecha(o.aprobadoEn || o.aprobacion?.en), o.aprobacionVia ? `vía ${o.aprobacionVia}` : ""].filter(Boolean).join(" · ")
+    : estado === "rechazado" ? fecha(o.rechazadoEn) : "";
+  const nombreDecision = { aprobar: "aprobación", rechazar: "decisión de no aprobar", reabrir: "reapertura" };
+  est.innerHTML = `<span class="pill ${clase}" id="presupuestoEstadoPill" data-estado="${estado}">${texto}</span>${detalle ? `<span class="hint" style="margin:0;">${esc(detalle)}</span>` : ""}`
+    + (esperando ? `<div class="presupuesto-aviso" id="presupuestoPendienteConfirmacion">La ${nombreDecision[esperando.params.p_decision] || "decisión"} se guardó sin conexión y está
+        <b>pendiente de confirmación</b>. Todavía no se descontó nada: el servidor la confirma (o la rechaza) al volver la red.</div>` : "")
+    + (rechazo ? `<div class="presupuesto-aviso error" id="presupuestoConflicto">No se pudo confirmar la ${nombreDecision[rechazo.params.p_decision] || "decisión"}:
+        ${esc(mensajeStock(rechazo.error?.mensaje || "el servidor la rechazó"))} El presupuesto sigue «${esc(texto.toLowerCase())}» y tus renglones siguen aquí.
+        <button type="button" class="btn ghost small" id="btnDescartarConflicto">Entendido</button></div>` : "");
+
+  const wa = o.aprobacion?.via === "whatsapp" && estado === "pendiente"
+    // el sistema abrió WhatsApp; que el mensaje saliera depende de la persona
+    ? `<p class="hint" id="aprobacionEstado" style="margin:0.5rem 0 0;">WhatsApp abierto el ${fecha(o.aprobacion.en)} — pendiente de respuesta del cliente.</p>` : "";
+  if (esperando) box.innerHTML = `<p class="hint" style="margin:0;">Esperando la confirmación del servidor.</p>`;
+  else if (estado === "pendiente") box.innerHTML = `
+    <p class="hint" style="margin-top:0;">El cliente puede aprobar por WhatsApp (se le escribe a su número), o directo aquí si está en el local. Al aprobar salen del inventario los repuestos del negocio.</p>
+    <div style="display:flex; gap:0.5rem; flex-wrap:wrap;">
+      <button class="btn wa" id="btnEnviarWA">Enviar presupuesto por WhatsApp</button>
+      <button class="btn primary" id="btnAprobarLocal">Aprobar en el local</button>
+      <button class="btn ghost" id="btnRechazarPresupuesto">No aprobó</button>
+    </div>${wa}`;
+  else if (estado === "aprobado") box.innerHTML = `<p class="hint" style="margin:0;">Los repuestos del negocio ya salieron del inventario. Si cambias cantidades o productos, se ajusta solo la diferencia.</p>`;
+  else box.innerHTML = `<p class="hint" style="margin-top:0;">No aprobado: no se descontó nada (lo que se hubiera descontado volvió al inventario).</p>
+    <button class="btn" id="btnReabrirPresupuesto">Reabrir presupuesto</button>`;
+
+  document.getElementById("btnDescartarConflicto")?.addEventListener("click", async () => {
+    await syncFin.descartarRechazo(rechazo.seq);
+    pintarAprobacion(await DB.get("ordenes", o.id));
   });
-
-  document.getElementById("btnEnviarWA").addEventListener("click", async () => {
+  document.getElementById("btnEnviarWA")?.addEventListener("click", async () => {
     const ventanaWA = abrirVentanaWA();
     const ord = await DB.get("ordenes", o.id);
     const moto = await DB.get("motos", ord.motoId);
@@ -3201,28 +3949,45 @@ async function renderPresupuestoStage(o) {
     const sent = navegarWA(ventanaWA, cliente.telefono, texto);
     if (!sent) return;
     await updateOrder(o.id, x => { x.aprobacion = { via: "whatsapp", en: Date.now() }; });
-    renderAprobacionEstado(await DB.get("ordenes", o.id));
+    pintarAprobacion(await DB.get("ordenes", o.id));
     toast(`WhatsApp abierto con el presupuesto para ${cliente.nombre} — falta pulsar enviar`);
   });
-
-  document.getElementById("btnAprobarLocal").addEventListener("click", async () => {
-    const ord = await updateOrder(o.id, x => { x.aprobacion = { via: "local", en: Date.now() }; });
-    renderAprobacionEstado(ord);
-    toast("Aprobado en el local");
-  });
-}
-
-function renderAprobacionEstado(o) {
-  const el = document.getElementById("aprobacionEstado");
-  if (!el) return;
-  if (o.aprobacion) {
-    el.textContent = o.aprobacion.via === "whatsapp"
-      // el sistema abrió WhatsApp; que el mensaje saliera depende de la persona
-      ? `WhatsApp abierto el ${new Date(o.aprobacion.en).toLocaleString()} — pendiente de confirmación del cliente.`
-      : `Aprobado en el local el ${new Date(o.aprobacion.en).toLocaleString()}.`;
-  } else {
-    el.textContent = "Sin enviar todavía.";
-  }
+  const decidir = (decision) => async (ev) => {
+    const btn = ev.currentTarget;
+    if (decision === "rechazar" && !(await showConfirm("El presupuesto queda como no aprobado. No se descuenta nada y lo que se hubiera descontado vuelve al inventario.",
+      { titulo: "¿El cliente no aprobó?", textoOk: "Sí, no aprobó" }))) return;
+    btn.disabled = true;
+    try {
+      if (finanzasNube()) {
+        if (!o.uid) { toast("La orden todavía no llegó a la nube: espera unos segundos y vuelve a intentarlo.", "off"); return; }
+        let r;
+        try { r = await decidirPresupuestoNube(o.id, decision, "local"); }
+        catch (err) {
+          const msg = mensajeStock(err.message);
+          toast(msg, "off");
+          est.insertAdjacentHTML("beforeend", `<div class="presupuesto-aviso error" id="presupuestoError">${esc(msg)}</div>`);
+          return;
+        }
+        if (r.estado === "pendiente") toast("Sin conexión: queda pendiente de confirmación. No se descontó nada todavía.", "off");
+        else {
+          const mov = Number(r.resultado?.stock_movido) || 0;
+          toast(decision === "aprobar" ? (mov ? `Presupuesto aprobado · ${mov} unidad(es) salieron del inventario` : "Presupuesto aprobado")
+            : decision === "rechazar" ? (mov ? `Marcado como no aprobado · ${mov} unidad(es) volvieron al inventario` : "Marcado como no aprobado") : "Presupuesto reabierto");
+        }
+      } else {
+        await updateOrder(o.id, x => {
+          x.presupuestoEstado = decision === "aprobar" ? "aprobado" : decision === "rechazar" ? "rechazado" : "pendiente";
+          x.aprobacion = decision === "aprobar" ? { via: "local", en: Date.now() } : null;
+          x.rechazadoEn = decision === "rechazar" ? Date.now() : null;
+        });
+        toast(decision === "aprobar" ? "Aprobado en el local" : decision === "rechazar" ? "Marcado como no aprobado" : "Presupuesto reabierto");
+      }
+      openOrder(o.id);
+    } finally { btn.disabled = false; }
+  };
+  document.getElementById("btnAprobarLocal")?.addEventListener("click", decidir("aprobar"));
+  document.getElementById("btnRechazarPresupuesto")?.addEventListener("click", decidir("rechazar"));
+  document.getElementById("btnReabrirPresupuesto")?.addEventListener("click", decidir("reabrir"));
 }
 
 /* ---- autocompletado genérico: buscar cliente por nombre o placa ---- */
@@ -3417,7 +4182,7 @@ async function abrirOrdenDesdeCita(citaId) {
 
   document.getElementById("ordenDesdeCitaAviso").style.display = "block";
   document.getElementById("ordenDesdeCitaTexto").textContent =
-    `Viene de la cita del ${citaWhenInfo(cita).dt.toLocaleDateString("es-HN")} a las ${citaWhenInfo(cita).dt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}${cita.mecanico ? ` con ${cita.mecanico}` : ""}.`;
+    `Viene de la cita del ${FechaNegocio.dia(cita.fecha)} a las ${FechaNegocio.hora(citaWhenInfo(cita).dt)}${cita.mecanico ? ` con ${cita.mecanico}` : ""}.`;
   document.getElementById("modalOrden").classList.add("active");
 }
 
@@ -3478,7 +4243,7 @@ alHacerClicUnaVez(document.getElementById("btnCrearOrden"), async () => {
   }
 
   const fotoFile = document.getElementById("ordenFoto").files[0];
-  const fotos = fotoFile ? [await fileToDataUrl(fotoFile)] : [];
+  const fotos = fotoFile ? [await fotoLocal(fotoFile)] : [];
 
   const cita = citaPendienteDeConvertir;
   const id = await DB.save("ordenes", {
@@ -3677,81 +4442,236 @@ document.getElementById("inputFotos").addEventListener("change", async (e) => {
     openOrder(currentOrderId);
     return;
   }
-  const urls = await Promise.all(files.map(fileToDataUrl));
+  const urls = await Promise.all(files.map(fotoLocal));
   const o = await updateOrder(currentOrderId, ord => { ord.fotos = (ord.fotos || []).concat(urls); });
   e.target.value = "";
   openOrder(o.id);
 });
 
-/* ---- ítems de presupuesto (modal) ---- */
-document.getElementById("btnCancelarItem").addEventListener("click", () => document.getElementById("modalItem").classList.remove("active"));
-document.getElementById("itemOrigen").addEventListener("change", toggleItemOrigen);
-function toggleItemOrigen() {
-  const fromInv = document.getElementById("itemOrigen").value === "inventario";
-  document.getElementById("itemManualFields").style.display = fromInv ? "none" : "block";
-  document.getElementById("itemInventarioFields").style.display = fromInv ? "block" : "none";
+/* ==== 3.15 · Bloque 2 · renglones de presupuesto (cotización y orden): tipo, precio y secciones ====
+   · Tipos: mano_obra (taller) · repuesto_inventario (producto real del negocio: su precio de lista entra solo y se puede cambiar
+     SOLO para esta operación, sin PIN y sin tocar el precio maestro) · repuesto_manual (comprado fuera / no está en el inventario).
+   · Un renglón viejo sin tipo se respeta como «sin clasificar»: jamás se adivina por el nombre; solo el vínculo real con un
+     producto lo cuenta como repuesto del negocio.
+   · El precio es obligatorio: un campo vacío NO es L 0.00; un repuesto del negocio a L 0.00 pide confirmación. */
+const TIPOS_RENGLON = { mano_obra: "Mano de obra", repuesto_inventario: "Repuesto del negocio", repuesto_manual: "Repuesto manual" };
+const SECCIONES_RENGLON = [
+  { tipo: "mano_obra", titulo: "Taller · mano de obra" },
+  { tipo: "repuesto_inventario", titulo: "Repuestos del negocio" },
+  { tipo: "repuesto_manual", titulo: "Repuestos manuales (fuera del inventario)" },
+  { tipo: null, titulo: "Sin clasificar (anteriores a 3.15)" },
+];
+function tipoRenglon(it) {
+  if (it.tipo && TIPOS_RENGLON[it.tipo]) return it.tipo;
+  return (it.inventarioId != null || it.origenInventarioId != null || it.inventarioUid) ? "repuesto_inventario" : null;
+}
+function seccionesRenglones(items) {
+  return SECCIONES_RENGLON.map(sec => {
+    const filas = (items || []).map((it, i) => ({ it, i })).filter(f => tipoRenglon(f.it) === sec.tipo);
+    return { ...sec, filas, subtotal: filas.reduce((s, f) => s + f.it.cantidad * f.it.precio, 0) };
+  }).filter(sec => sec.filas.length);
+}
+/* Filas de tabla agrupadas por sección: la cabecera de cada sección lleva su subtotal en la columna colSub. */
+function filasTablaRenglones(items, fila, { cols = 4, colSub = 3 } = {}) {
+  return seccionesRenglones(items).map(sec =>
+    `<tr class="renglon-seccion" data-seccion="${sec.tipo || "sin_clasificar"}"><td colspan="${colSub}">${esc(sec.titulo)}</td><td class="num">${money(sec.subtotal)}</td>${"<td></td>".repeat(Math.max(0, cols - colSub - 1))}</tr>`
+    + sec.filas.map(fila).join("")).join("");
 }
 
-alHacerClicUnaVez(document.getElementById("btnGuardarItem"), async () => {
-  const cantidad = Number(document.getElementById("itemCantidad").value) || 1;
-  const precio = Number(document.getElementById("itemPrecio").value) || 0;
-  const fromInv = document.getElementById("itemOrigen").value === "inventario";
-  let nombre;
-  let origenInventarioId = null;
-  let costoUnitario = 0;
+/* Editor de un renglón (el mismo para la cotización y la orden). p = prefijo de los ids del modal ("cotItem" | "item"). */
+function crearEditorRenglon(p, cfg) {
+  const $ = (s) => document.getElementById(p + s);
+  const modal = document.getElementById(cfg.modal);
+  let catalogo = [], editando = null, contexto = null;
+  const producto = () => catalogo.find(r => String(r.id) === $("InvSelect").value) || null;
+  const esInv = () => $("Tipo").value === "repuesto_inventario";
 
-  // una cantidad negativa aquí, si venía de inventario, terminaba SUMANDO
-  // stock en vez de restarlo (rep.cantidad -= cantidad con cantidad negativo).
-  if (cantidad <= 0) { toast("La cantidad debe ser mayor a cero", "off"); return; }
-  if (precio < 0) { toast("El precio no puede ser negativo", "off"); return; }
-
-  if (finanzasNube()) {
-    // SYNC-7B: agregar_item_orden — el servidor decide la existencia (online bloquea sin stock; offline acepta y marca revisión)
-    let invId = null, nom, costo = 0;
-    if (fromInv) {
-      invId = Number(document.getElementById("itemInventarioSelect").value);
-      const rep = await DB.get("inventario", invId);
-      if (!rep) { toast("Elige un repuesto", "off"); return; }
-      nom = rep.nombre; costo = rep.costoCompra || 0;
-    } else {
-      nom = document.getElementById("itemNombre").value.trim();
-      if (!nom) { toast("Falta el nombre del ítem", "off"); return; }
-    }
-    const ord = await DB.get("ordenes", currentOrderId);
-    let r;
-    try { r = await agregarItemOrdenNube(ord, { nombre: nom, cantidad, precio, inventarioId: invId, costoUnitario: costo }); }
-    catch (err) { toast("No se agregó: " + err.message, "off"); return; }
-    const o2 = await updateOrder(currentOrderId, x => { x.items = (x.items || []).concat([r.item]); });
-    if (r.estado === "ok") await bajarNube(["inventario"]); else toast("Ítem guardado sin conexión: se enviará al volver la red", "off");
-    registrarAuditoria("agregar-item", "ordenes", currentOrderId, `${nom} x${cantidad} a ${money(precio)}`);
-    document.getElementById("modalItem").classList.remove("active");
-    openOrder(o2.id);
-    return;
+  function pintarInfo() {
+    const c = Number($("Cantidad").value), pr = $("Precio").value.trim();
+    $("Subtotal").textContent = c > 0 && pr !== "" && Number(pr) >= 0 ? money(c * Number(pr)) : "—";
+    const r = esInv() ? producto() : null;
+    if (!esInv()) { $("PrecioNota").textContent = ""; return; }
+    if (!r) { $("InvInfo").textContent = catalogo.length ? "Elige un producto de la lista." : "No hay productos en el inventario."; $("PrecioNota").textContent = ""; return; }
+    $("InvInfo").textContent = `Precio de lista ${money(r.precioVenta || 0)} · ${r.cantidad} en stock`
+      + (c > r.cantidad ? ` · no alcanza para ${c}: así no se podrá aprobar` : "") + `. ${cfg.hintInv}`;
+    $("PrecioNota").textContent = pr !== "" && Number(pr) !== Number(r.precioVenta || 0)
+      ? `Precio especial solo para esta operación (lista ${money(r.precioVenta || 0)}). El precio del inventario no cambia.`
+      : "Precio de lista del inventario: puedes cambiarlo solo para esta operación.";
   }
-
-  if (fromInv) {
-    const repId = Number(document.getElementById("itemInventarioSelect").value);
-    const rep = await DB.get("inventario", repId);
-    if (!rep) { toast("Elige un repuesto", "off"); return; }
-    if (rep.cantidad < cantidad) { toast(`Solo quedan ${rep.cantidad} en inventario`, "off"); return; }
-    nombre = rep.nombre;
-    origenInventarioId = repId;
-    costoUnitario = rep.costoCompra || 0; // sellado ahora: el costo de hoy es el de esta orden
-    rep.cantidad -= cantidad;
-    await DB.save("inventario", rep);
-    markDirty();
-  } else {
-    nombre = document.getElementById("itemNombre").value.trim();
-    if (!nombre) { toast("Falta el nombre del ítem", "off"); return; }
+  function pintarLista() {
+    const q = $("Buscar").value.trim().toLowerCase(), actual = $("InvSelect").value;
+    const lista = q ? catalogo.filter(r => r.nombre.toLowerCase().includes(q)) : catalogo;
+    $("InvSelect").innerHTML = lista.length
+      ? lista.slice(0, 300).map(r => `<option value="${r.id}">${esc(r.nombre)} — ${money(r.precioVenta || 0)} (${r.cantidad} en stock)</option>`).join("")
+      : `<option value="" disabled>${catalogo.length ? "Ningún producto coincide" : "No hay productos en el inventario"}</option>`;
+    if (actual && lista.some(r => String(r.id) === actual)) $("InvSelect").value = actual;
   }
-
-  const o = await updateOrder(currentOrderId, ord => {
-    ord.items = (ord.items || []).concat([{ nombre, cantidad, precio, origenInventarioId, costoUnitario, costoEstimado: false }]);
+  function alElegir() {
+    const r = producto();
+    if (!r) return;
+    // precio automático desde el inventario; si se está editando un renglón del MISMO producto se conserva su precio (histórico)
+    if (!(editando && String(editando.inventarioId) === String(r.id))) $("Precio").value = String(r.precioVenta || 0);
+    pintarInfo();
+  }
+  function aplicarTipo() {
+    const t = $("Tipo").value;
+    $("ManualBox").style.display = esInv() ? "none" : "block";
+    $("InvBox").style.display = esInv() ? "block" : "none";
+    $("NombreLabel").textContent = t === "mano_obra" ? "Trabajo del taller" : t === "repuesto_manual" ? "Repuesto (no está en el inventario)" : "Descripción";
+    $("Nombre").placeholder = t === "mano_obra" ? "Ej. Mano de obra de frenos" : "Ej. Pastillas delanteras compradas fuera";
+    if (esInv() && producto() && $("Precio").value === "") alElegir();
+    pintarInfo();
+  }
+  $("Tipo").addEventListener("change", aplicarTipo);
+  $("Buscar").addEventListener("input", () => {
+    pintarLista();
+    const sel = $("InvSelect");
+    if (!producto() && sel.options.length === 1 && sel.options[0].value) { sel.selectedIndex = 0; alElegir(); }
   });
-  registrarAuditoria("agregar-item", "ordenes", currentOrderId, `${nombre} x${cantidad} a ${money(precio)}`);
-  document.getElementById("modalItem").classList.remove("active");
-  openOrder(o.id);
+  $("InvSelect").addEventListener("change", alElegir);
+  $("Cantidad").addEventListener("input", pintarInfo);
+  $("Precio").addEventListener("input", pintarInfo);
+  const cerrar = () => { modal.classList.remove("active"); editando = null; contexto = null; };
+  document.getElementById(cfg.cancelar).addEventListener("click", cerrar);
+
+  async function abrir(renglon, ctx) {
+    catalogo = (await DB.getAll("inventario")).filter(r => !r.deleted).sort((a, b) => a.nombre.localeCompare(b.nombre));
+    editando = renglon ? { ...renglon } : null;
+    contexto = ctx || renglon || null;
+    const sel = $("Tipo");
+    sel.querySelector('option[value=""]')?.remove();
+    let tipo = renglon ? tipoRenglon(renglon) : (catalogo.length ? "repuesto_inventario" : "mano_obra");
+    if (renglon && tipo === null) { sel.insertAdjacentHTML("beforeend", `<option value="">Sin clasificar (anterior a 3.15)</option>`); tipo = ""; }
+    // un producto que ya no está en el inventario local se muestra igual para poder editar cantidad/precio del renglón
+    if (renglon?.inventarioId != null && !catalogo.some(r => String(r.id) === String(renglon.inventarioId))) {
+      catalogo.unshift({ id: renglon.inventarioId, nombre: renglon.nombre, precioVenta: renglon.precio, cantidad: 0 });
+    }
+    sel.value = tipo;
+    $("Buscar").value = "";
+    pintarLista();
+    $("InvSelect").value = renglon?.inventarioId != null ? String(renglon.inventarioId) : "";
+    $("Nombre").value = renglon && tipo !== "repuesto_inventario" ? renglon.nombre : "";
+    $("Cantidad").value = renglon ? String(renglon.cantidad) : "1";
+    $("Precio").value = renglon ? String(renglon.precio) : "";
+    $("Titulo").textContent = renglon ? cfg.tituloEditar : cfg.tituloNuevo;
+    document.getElementById(cfg.guardar).textContent = renglon ? "Guardar cambios" : "Agregar";
+    aplicarTipo();
+    modal.classList.add("active");
+    (esInv() ? $("Buscar") : $("Nombre")).focus?.();
+  }
+
+  /* Lee y valida el formulario. null = no seguir (ya se avisó). */
+  async function leer() {
+    const falla = (m) => { toast(m, "off"); return null; };
+    const tipo = $("Tipo").value || null;
+    const cantidad = Number($("Cantidad").value);
+    if (!(cantidad > 0)) return falla("La cantidad debe ser mayor a cero");
+    const precioTxt = $("Precio").value.trim();
+    if (precioTxt === "") return falla("Escribe el precio: un precio vacío no es L 0.00");
+    const precio = SyncFinanzas.r2(Number(precioTxt));
+    if (!(precio >= 0)) return falla("El precio no puede ser negativo");
+    let nombre, inventarioId = null;
+    if (tipo === "repuesto_inventario") {
+      const r = producto();
+      if (!r) return falla("Elige el producto del inventario");
+      inventarioId = r.id; nombre = r.nombre;
+      if (precio === 0 && !(await showConfirm(`«${r.nombre}» quedaría a L 0.00 en esta operación. ¿Va sin costo para el cliente?`,
+        { titulo: "Repuesto sin precio", textoOk: "Sí, va sin costo" }))) return null;
+    } else {
+      nombre = $("Nombre").value.trim();
+      if (!nombre) return falla(tipo === "mano_obra" ? "Describe el trabajo del taller" : "Falta la descripción del renglón");
+    }
+    return { tipo, nombre, cantidad, precio, inventarioId };
+  }
+  alHacerClicUnaVez(document.getElementById(cfg.guardar), async () => {
+    const r = await leer();
+    if (!r) return;
+    if (await cfg.alGuardar(r, editando, contexto) !== false) cerrar();
+  });
+  return { abrir, cerrar };
+}
+
+/* La orden: agregar / editar por las RPC del servidor (modo nube) o como siempre en modo local. */
+const editorRenglonOrden = crearEditorRenglon("item", {
+  modal: "modalItem", cancelar: "btnCancelarItem", guardar: "btnGuardarItem",
+  tituloNuevo: "Agregar al presupuesto", tituloEditar: "Editar renglón del presupuesto",
+  hintInv: "Sale del inventario solo cuando el presupuesto esté aprobado.",
+  alGuardar: guardarRenglonOrden,
 });
+async function guardarRenglonOrden(r, editando, ctx) {
+  const ordenId = ctx?.ordenId ?? currentOrderId;
+  const ord = await DB.get("ordenes", ordenId);
+  if (!ord) return false;
+  const texto = `${r.nombre} x${r.cantidad} a ${money(r.precio)}`;
+  if (finanzasNube()) {
+    const rep = r.inventarioId != null ? await DB.get("inventario", r.inventarioId) : null;
+    if (editando && editando.uid) {
+      let res;
+      try { res = await actualizarItemOrdenNube(ord, { uid: editando.uid }, r); }
+      catch (err) { toast("No se guardó: " + mensajeStock(err.message), "off"); return false; }
+      await updateOrder(ordenId, x => {
+        const it = (x.items || []).find(i => i.uid === editando.uid);
+        if (!it) return;
+        const cambiaProducto = String(it.origenInventarioId ?? "") !== String(r.inventarioId ?? "");
+        Object.assign(it, { tipo: r.tipo, nombre: r.nombre, cantidad: r.cantidad, precio: r.precio, origenInventarioId: r.inventarioId });
+        if (cambiaProducto) it.costoUnitario = rep?.costoCompra || 0;
+      });
+      // solo si el servidor movió stock (presupuesto aprobado) hace falta bajar existencias y lo aplicado; pendiente → nada que bajar
+      if (res.estado === "ok") { if (Number(res.resultado?.stock_movido) > 0) await bajarNube(["ordenes", "inventario"]); }
+      else toast("Cambio guardado sin conexión: se enviará al volver la red", "off");
+      registrarAuditoria("editar-item", "ordenes", ordenId, texto);
+    } else if (editando) {
+      // renglón viejo que nunca llegó a la nube: se corrige aquí y sube con su tipo antes de aprobar o cobrar
+      await updateOrder(ordenId, x => { const it = (x.items || [])[editando.idx]; if (it && !it.uid) Object.assign(it, { tipo: r.tipo, nombre: r.nombre, cantidad: r.cantidad, precio: r.precio, origenInventarioId: r.inventarioId }); });
+    } else {
+      let res;
+      try { res = await agregarItemOrdenNube(ord, { ...r, costoUnitario: rep?.costoCompra || 0 }); }
+      catch (err) { toast("No se agregó: " + mensajeStock(err.message), "off"); return false; }
+      await updateOrder(ordenId, x => { x.items = (x.items || []).concat([res.item]); });
+      // solo si el servidor movió stock (presupuesto aprobado) hace falta bajar existencias y lo aplicado; pendiente → nada que bajar
+      if (res.estado === "ok") { if (Number(res.resultado?.stock_movido) > 0) await bajarNube(["ordenes", "inventario"]); }
+      else toast("Ítem guardado sin conexión: se enviará al volver la red", "off");
+      registrarAuditoria("agregar-item", "ordenes", ordenId, texto);
+    }
+    openOrder(ordenId);
+    return true;
+  }
+
+  // modo local (sin nube): como siempre, el repuesto sale del inventario al agregarlo; al editar se ajusta la diferencia
+  const antes = editando ? (ord.items || [])[editando.idx] : null;
+  const devolver = antes?.origenInventarioId != null ? { id: antes.origenInventarioId, cant: antes.cantidad } : null;
+  const sacar = r.inventarioId != null ? { id: r.inventarioId, cant: r.cantidad } : null;
+  const neto = new Map();
+  if (devolver) neto.set(devolver.id, (neto.get(devolver.id) || 0) + devolver.cant);
+  if (sacar) neto.set(sacar.id, (neto.get(sacar.id) || 0) - sacar.cant);
+  for (const [id, delta] of neto) {
+    const repu = await DB.get("inventario", id);
+    if (!repu) { toast("El repuesto ya no existe en el inventario", "off"); return false; }
+    if (repu.cantidad + delta < 0) { toast(`Solo quedan ${repu.cantidad} de «${repu.nombre}» en inventario`, "off"); return false; }
+  }
+  for (const [id, delta] of neto) {
+    if (!delta) continue;
+    const repu = await DB.get("inventario", id);
+    repu.cantidad += delta;
+    await DB.save("inventario", repu);
+  }
+  const repNuevo = r.inventarioId != null ? await DB.get("inventario", r.inventarioId) : null;
+  const o = await updateOrder(ordenId, x => {
+    const nuevo = { tipo: r.tipo, nombre: r.nombre, cantidad: r.cantidad, precio: r.precio, origenInventarioId: r.inventarioId };
+    if (antes) {
+      const it = (x.items || [])[editando.idx];
+      const cambia = String(it.origenInventarioId ?? "") !== String(r.inventarioId ?? "");
+      Object.assign(it, nuevo, cambia ? { costoUnitario: repNuevo?.costoCompra || 0, costoEstimado: false } : {});
+    } else {
+      // el costo se sella ahora: el de hoy es el de esta orden
+      x.items = (x.items || []).concat([{ ...nuevo, costoUnitario: repNuevo?.costoCompra || 0, costoEstimado: false }]);
+    }
+  });
+  markDirty();
+  registrarAuditoria(antes ? "editar-item" : "agregar-item", "ordenes", ordenId, texto);
+  openOrder(o.id);
+  return true;
+}
 
 /* ---- enviar progreso de la reparación por WhatsApp ---- */
 document.getElementById("btnEnviarProgresoWA").addEventListener("click", () => {
@@ -3776,7 +4696,7 @@ function llenarFacturaOrden() {
   const motoDesc = `${moto.marca} ${moto.modelo}`.trim();
 
   document.getElementById("facOrdenId").textContent = o.id;
-  document.getElementById("facFecha").textContent = new Date().toLocaleDateString();
+  document.getElementById("facFecha").textContent = FechaNegocio.fecha(Date.now());
   document.getElementById("facCliente").textContent = cliente.nombre;
   document.getElementById("facTelefono").textContent = cliente.telefono || "—";
   document.getElementById("facMoto").textContent = `${motoDesc} · placa ${moto.placa || "s/p"} · ${moto.km || 0} km`;
@@ -3837,18 +4757,16 @@ function totalCotizacion(cot) {
 }
 
 function fechaVencimiento(fechaISO, dias) {
-  const d = new Date(fechaISO);
-  d.setDate(d.getDate() + Number(dias || VALIDEZ_POR_DEFECTO));
-  d.setHours(23, 59, 59, 999); // vale todo el último día, no hasta la hora exacta
-  return d.toISOString();
+  // vale todo el último día EMPRESARIAL (hasta las 23:59:59.999 de Honduras), no hasta la hora exacta
+  const ultimo = FechaNegocio.sumarDias(FechaNegocio.diaDe(fechaISO), Number(dias || VALIDEZ_POR_DEFECTO));
+  return new Date(FechaNegocio.finDia(ultimo)).toISOString();
 }
 
 /* Se comparan días de calendario, no horas: si no, una cotización hecha a las
    11 de la noche con 15 días de vigencia decía "16 días más" por culpa de la
    hora suelta que sobraba en la resta. */
 function diasParaVencer(cot) {
-  const aMedianoche = (fecha) => { const d = new Date(fecha); d.setHours(0, 0, 0, 0); return d.getTime(); };
-  return Math.round((aMedianoche(cot.venceISO) - aMedianoche(Date.now())) / 86400000);
+  return FechaNegocio.diferenciaDias(FechaNegocio.hoy(), FechaNegocio.diaDe(cot.venceISO));
 }
 
 /* El estado que se muestra: los guardados mandan, salvo "pendiente", que se
@@ -3860,7 +4778,7 @@ function estadoCotizacion(cot) {
 
 function textoVigencia(cot) {
   const estado = estadoCotizacion(cot);
-  const fecha = new Date(cot.venceISO).toLocaleDateString("es-HN");
+  const fecha = FechaNegocio.fecha(cot.venceISO);
   if (estado === "aceptada") return { clase: "", texto: "Aceptada — pasó a la orden de servicio", fecha: cot.ordenId ? `#${cot.ordenId}` : "" };
   if (estado === "rechazada") return { clase: "fuera", texto: "El cliente no la aceptó", fecha: "" };
   if (estado === "vencida") return { clase: "fuera", texto: "Venció el", fecha };
@@ -3971,14 +4889,18 @@ document.getElementById("cotBuscarCliente").addEventListener("input", () => { co
 
 function renderCotItemsEdit() {
   const cont = document.getElementById("cotItemsEdit");
+  // 3.15 (Bloque 2): agrupados por tipo; cada renglón se puede editar (tipo, producto, cantidad, precio) o quitar
   cont.innerHTML = cotItems.length
-    ? cotItems.map((it, i) => `
+    ? seccionesRenglones(cotItems).map(sec => `
+      <div class="renglon-seccion" data-seccion="${sec.tipo || "sin_clasificar"}"><span>${esc(sec.titulo)}</span><span>${money(sec.subtotal)}</span></div>
+      ${sec.filas.map(({ it, i }) => `
       <div class="cot-item-fila">
-        <span class="nom">${esc(it.nombre)}<small>${it.cantidad} × ${money(it.precio)}${it.inventarioId ? " · del inventario" : ""}</small></span>
+        <span class="nom">${esc(it.nombre)}<small>${it.cantidad} × ${money(it.precio)}</small></span>
         <span class="sub">${money(it.cantidad * it.precio)}</span>
+        <button type="button" data-editar="${i}" title="Editar" aria-label="Editar ${esc(it.nombre)}">✎</button>
         <button type="button" data-quitar="${i}" title="Quitar" aria-label="Quitar ${esc(it.nombre)}">🗑</button>
-      </div>`).join("")
-    : `<div class="cot-vacia">Sin renglones todavía — agrega los repuestos y la mano de obra.</div>`;
+      </div>`).join("")}`).join("")
+    : `<div class="cot-vacia">Sin renglones todavía — agrega la mano de obra y los repuestos.</div>`;
 
   cont.querySelectorAll("[data-quitar]").forEach(btn => {
     btn.addEventListener("click", () => {
@@ -3986,12 +4908,21 @@ function renderCotItemsEdit() {
       renderCotItemsEdit();
     });
   });
+  cont.querySelectorAll("[data-editar]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const idx = Number(btn.dataset.editar);
+      editorRenglonCot.abrir({ ...cotItems[idx], idx });
+    });
+  });
 
-  const total = cotItems.reduce((s, it) => s + it.cantidad * it.precio, 0);
-  const repuestos = cotItems.filter(it => it.inventarioId).reduce((s, it) => s + it.cantidad * it.precio, 0);
-  document.getElementById("cotTotalesEdit").innerHTML = `
-    ${repuestos ? `<div><span>Repuestos</span><span>${money(repuestos)}</span></div>
-    <div><span>Otros y mano de obra</span><span>${money(total - repuestos)}</span></div>` : ""}
+  document.getElementById("cotTotalesEdit").innerHTML = totalesPorTipoHtml(cotItems);
+}
+
+/* Totales de una cotización: uno por tipo presente y el total estimado. */
+function totalesPorTipoHtml(items) {
+  const secciones = seccionesRenglones(items);
+  const total = (items || []).reduce((s, it) => s + it.cantidad * it.precio, 0);
+  return `${secciones.length > 1 ? secciones.map(sec => `<div><span>${esc(sec.titulo)}</span><span>${money(sec.subtotal)}</span></div>`).join("") : ""}
     <div class="grande"><span>Total estimado</span><span>${money(total)}</span></div>`;
 }
 
@@ -3999,7 +4930,7 @@ function actualizarAvisoVigencia() {
   const dias = Number(document.getElementById("cotValidez").value) || VALIDEZ_POR_DEFECTO;
   const hasta = new Date(fechaVencimiento(new Date().toISOString(), dias));
   document.getElementById("cotVenceAviso").textContent =
-    `Se respeta hasta el ${hasta.toLocaleDateString("es-HN")}. Después de esa fecha hay que rehacerla porque los repuestos cambian de precio.`;
+    `Se respeta hasta el ${FechaNegocio.fecha(hasta)}. Después de esa fecha hay que rehacerla porque los repuestos cambian de precio.`;
 }
 document.getElementById("cotValidez").addEventListener("change", actualizarAvisoVigencia);
 
@@ -4032,65 +4963,19 @@ document.getElementById("btnCancelarCotizacion").addEventListener("click", () =>
   cotEditandoId = null;
 });
 
-/* ---- el modal de agregar un renglón ---- */
-document.getElementById("btnAgregarItemCot").addEventListener("click", async () => {
-  document.getElementById("cotItemTipo").value = "manual";
-  document.getElementById("cotItemNombre").value = "";
-  document.getElementById("cotItemCantidad").value = "1";
-  document.getElementById("cotItemPrecio").value = "";
-  aplicarTipoItemCot();
-
-  const inv = (await DB.getAll("inventario")).sort((a, b) => a.nombre.localeCompare(b.nombre));
-  document.getElementById("cotItemInvSelect").innerHTML = inv.length
-    ? inv.map(r => `<option value="${r.id}" data-precio="${r.precioVenta || 0}">${esc(r.nombre)} — ${money(r.precioVenta || 0)} (${r.cantidad} en stock)</option>`).join("")
-    : `<option value="">No hay repuestos en el inventario</option>`;
-
-  document.getElementById("modalItemCot").classList.add("active");
+/* ---- el modal de un renglón (3.15 · Bloque 2: mismo editor que la orden; cotizar nunca toca stock) ---- */
+const editorRenglonCot = crearEditorRenglon("cotItem", {
+  modal: "modalItemCot", cancelar: "btnCancelarItemCot", guardar: "btnGuardarItemCot",
+  tituloNuevo: "Agregar a la cotización", tituloEditar: "Editar renglón de la cotización",
+  hintInv: "Cotizar no descuenta stock: sale del inventario cuando el cliente la acepta.",
+  alGuardar: (r, editando) => {
+    // inventarioUid se limpia: el producto elegido aquí (inventarioId local) es el que manda al subir
+    const renglon = { tipo: r.tipo, nombre: r.nombre, cantidad: r.cantidad, precio: r.precio, inventarioId: r.inventarioId, inventarioUid: null };
+    if (editando) cotItems[editando.idx] = renglon; else cotItems.push(renglon);
+    renderCotItemsEdit();
+  },
 });
-
-function aplicarTipoItemCot() {
-  const desdeInv = document.getElementById("cotItemTipo").value === "inventario";
-  document.getElementById("cotItemManualBox").style.display = desdeInv ? "none" : "block";
-  document.getElementById("cotItemInvBox").style.display = desdeInv ? "block" : "none";
-  if (desdeInv) copiarPrecioDelInventarioCot();
-}
-document.getElementById("cotItemTipo").addEventListener("change", aplicarTipoItemCot);
-
-// al elegir un repuesto se copia su precio de venta, que es justo lo que se
-// quiere cotizar — pero queda editable por si se le hace un descuento
-function copiarPrecioDelInventarioCot() {
-  const sel = document.getElementById("cotItemInvSelect");
-  const opt = sel.options[sel.selectedIndex];
-  if (opt?.dataset.precio) document.getElementById("cotItemPrecio").value = opt.dataset.precio;
-}
-document.getElementById("cotItemInvSelect").addEventListener("change", copiarPrecioDelInventarioCot);
-
-document.getElementById("btnCancelarItemCot").addEventListener("click", () => {
-  document.getElementById("modalItemCot").classList.remove("active");
-});
-
-document.getElementById("btnGuardarItemCot").addEventListener("click", () => {
-  const cantidad = Number(document.getElementById("cotItemCantidad").value) || 0;
-  const precio = Number(document.getElementById("cotItemPrecio").value) || 0;
-  if (cantidad <= 0) { toast("La cantidad debe ser mayor a cero", "off"); return; }
-  if (precio < 0) { toast("El precio no puede ser negativo", "off"); return; }
-
-  const desdeInv = document.getElementById("cotItemTipo").value === "inventario";
-  let nombre, inventarioId = null;
-  if (desdeInv) {
-    const sel = document.getElementById("cotItemInvSelect");
-    if (!sel.value) { toast("Elige un repuesto del inventario", "off"); return; }
-    inventarioId = Number(sel.value);
-    nombre = sel.options[sel.selectedIndex].textContent.split(" — ")[0];
-  } else {
-    nombre = document.getElementById("cotItemNombre").value.trim();
-    if (!nombre) { toast("Falta la descripción del renglón", "off"); return; }
-  }
-
-  cotItems.push({ nombre, cantidad, precio, inventarioId });
-  renderCotItemsEdit();
-  document.getElementById("modalItemCot").classList.remove("active");
-});
+document.getElementById("btnAgregarItemCot").addEventListener("click", () => editorRenglonCot.abrir(null));
 
 /* ---- guardar ---- */
 alHacerClicUnaVez(document.getElementById("btnGuardarCotizacion"), async () => {
@@ -4131,7 +5016,9 @@ alHacerClicUnaVez(document.getElementById("btnGuardarCotizacion"), async () => {
   };
   if (cotEditandoId) registro.id = cotEditandoId;
 
-  const id = await DB.save("cotizaciones", registro);
+  let id;
+  try { id = await DB.save("cotizaciones", registro); }
+  catch (err) { toast("No se guardó la cotización: " + (err?.message || err), "off"); return; }
   markDirty();
   document.getElementById("modalCotizacion").classList.remove("active");
   toast(cotEditandoId ? "Cotización actualizada" : `Cotización #${id} creada`);
@@ -4153,7 +5040,7 @@ async function abrirCotizacionDetalle(id) {
 
   document.getElementById("cotDetTitulo").textContent = `Cotización #${cot.id}`;
   document.getElementById("cotDetSub").innerHTML =
-    `${esc(cot.clienteNombre)}${cot.clienteTelefono ? " · " + esc(cot.clienteTelefono) : ""} · ${esc(cot.motoDesc || "sin moto")} · hecha el ${new Date(cot.fechaISO).toLocaleDateString("es-HN")} · <span class="pill ${estado}">${COT_ESTADO_LABEL[estado]}</span>`;
+    `${esc(cot.clienteNombre)}${cot.clienteTelefono ? " · " + esc(cot.clienteTelefono) : ""} · ${esc(cot.motoDesc || "sin moto")} · hecha el ${FechaNegocio.fecha(cot.fechaISO)} · <span class="pill ${estado}">${COT_ESTADO_LABEL[estado]}</span>`;
 
   const vig = textoVigencia(cot);
   const caja = document.getElementById("cotDetVigencia");
@@ -4165,15 +5052,10 @@ async function abrirCotizacionDetalle(id) {
   diagWrap.style.display = cot.diagnostico ? "block" : "none";
   document.getElementById("cotDetDiagnostico").textContent = cot.diagnostico || "";
 
-  document.getElementById("cotDetItems").innerHTML = (cot.items || []).map(it => `
-    <tr><td>${esc(it.nombre)}</td><td class="num">${it.cantidad}</td><td class="num">${money(it.precio)}</td><td class="num">${money(it.cantidad * it.precio)}</td></tr>
-  `).join("");
+  document.getElementById("cotDetItems").innerHTML = filasTablaRenglones(cot.items || [], ({ it }) => `
+    <tr><td>${esc(it.nombre)}</td><td class="num">${it.cantidad}</td><td class="num">${money(it.precio)}</td><td class="num">${money(it.cantidad * it.precio)}</td></tr>`);
 
-  const repuestos = (cot.items || []).filter(it => it.inventarioId).reduce((s, it) => s + it.cantidad * it.precio, 0);
-  document.getElementById("cotDetTotales").innerHTML = `
-    ${repuestos ? `<div><span>Repuestos</span><span>${money(repuestos)}</span></div>
-    <div><span>Otros y mano de obra</span><span>${money(total - repuestos)}</span></div>` : ""}
-    <div class="grande"><span>Total estimado</span><span>${money(total)}</span></div>`;
+  document.getElementById("cotDetTotales").innerHTML = totalesPorTipoHtml(cot.items || []);
 
   const notas = document.getElementById("cotDetNotas");
   notas.style.display = cot.notas ? "block" : "none";
@@ -4224,7 +5106,7 @@ document.getElementById("btnCotRenovar").addEventListener("click", async () => {
   cot.estado = "pendiente";
   await DB.save("cotizaciones", cot);
   markDirty();
-  toast(`Vigente otra vez hasta el ${new Date(cot.venceISO).toLocaleDateString("es-HN")}`);
+  toast(`Vigente otra vez hasta el ${FechaNegocio.fecha(cot.venceISO)}`);
   await renderCotizaciones();
   abrirCotizacionDetalle(cot.id);
 });
@@ -4258,27 +5140,95 @@ document.getElementById("btnCotEliminar").addEventListener("click", () => {
   });
 });
 
+/* ---- 3.15 · Bloque 1A · aceptar en MODO NUBE = convertir_cotizacion ----
+   · Una sola RPC transaccional e idempotente: la orden, sus renglones (con su repuesto de origen y el precio de la
+     cotización) y la cotización aceptada entran juntos o no entra nada. Aceptar ES aprobar (Bloque 2): la orden nace con el
+     presupuesto aprobado y los repuestos del negocio salen del inventario exactamente una vez en esa misma transacción; si
+     falta existencia de cualquier producto no se crea nada y el mensaje nombra el producto.
+   · El operation_id y el uuid de la orden se guardan en la base local ANTES de enviar: un doble clic, un corte de red con
+     respuesta desconocida, un cierre de la app o una recarga repiten EXACTAMENTE la misma operación → el servidor devuelve
+     el mismo resultado y nunca crea una segunda orden. Otro dispositivo que acepte a la vez recibe COTIZACION_YA_ACEPTADA.
+   · Solo en línea: sin respuesta del servidor no se crea nada local (ni orden «provisional»). */
+const MSJ_ACEPTAR_SIN_RED = "Aceptar una cotización necesita conexión: así se garantiza que salga una sola orden. No se hizo ningún cambio.";
+async function aceptarCotizacionNube(cot) {
+  if (!puedeGestionarTaller()) { bloquear("Las cotizaciones las acepta el administrador o el cajero"); return; }
+  if (!isOnline()) { toast(MSJ_ACEPTAR_SIN_RED, "off"); return; }
+  if (!cot.uid) { toast("Esta cotización todavía no llegó a la nube: espera unos segundos y vuelve a intentarlo.", "off"); return; }
+  // lo pendiente de ESTA cotización (y de su cliente/moto) tiene que llegar antes a la nube
+  await syncMotor.flush();
+  const relacionados = [cot.uid, await uidDe("clientes", cot.clienteId), await uidDe("motos", cot.motoId)].filter(Boolean);
+  const pendiente = (await syncBd.outbox.todos()).some((o) => ["pending", "syncing"].includes(o.estado) && relacionados.includes(o.uid));
+  if (pendiente) { toast("La cotización todavía se está enviando a la nube. Vuelve a intentarlo en unos segundos.", "off"); return; }
+
+  const clave = "aceptar_cot:" + cot.uid;
+  let intento = await syncBd.meta.get(clave);
+  if (!intento) { intento = { op: SyncDB.uuid(), orden: SyncDB.uuid(), en: Date.now() }; await syncBd.meta.set(clave, intento); }
+  const params = { p_cotizacion_id: cot.uid, p_orden_id: intento.orden, p_mecanico_id: null, p_device: await syncBd.deviceId() };
+  let r = await syncMotor.rpcInmediato("convertir_cotizacion", params, { op_id: intento.op });
+  if (!r.ok && ["red", "servidor"].includes(r.clase)) r = await syncMotor.rpcInmediato("convertir_cotizacion", params, { op_id: intento.op });
+
+  let ordenUid = null, yaEstaba = false;
+  if (r.ok) ordenUid = r.datos?.orden_id || intento.orden;
+  else if (/COTIZACION_YA_ACEPTADA/.test(r.mensaje || "")) { yaEstaba = true; ordenUid = r.detalle || null; }
+  else if (["red", "servidor", "limite", "auth"].includes(r.clase)) {
+    // respuesta desconocida: se conserva el intento para repetir la MISMA operación (no puede duplicar)
+    toast("No se pudo confirmar con la nube. Vuelve a pulsar «Aceptó»: se repite la misma operación y no se duplica la orden.", "off");
+    return;
+  } else {
+    // rechazo definitivo (p. ej. SIN_EXISTENCIA: nombra el producto): no se creó nada; la cotización queda intacta para corregirla
+    await syncBd.meta.set(clave, null);
+    toast("No se pudo aceptar: " + mensajeStock(r.mensaje || "error del servidor"), "off");
+    return;
+  }
+  await syncBd.meta.set(clave, null);
+  await bajarNube(["clientes", "motos", "cotizaciones", "ordenes", "inventario"]);
+  const localId = ordenUid ? await syncBd.mapa.localDe(ordenUid) : null;
+  markDirty();
+  cerrarCotDetalle();
+  toast(yaEstaba ? `Esta cotización ya se había convertido${localId ? ` en la orden #${localId}` : ""}: no se creó otra` : `Orden${localId ? ` #${localId}` : ""} creada desde la cotización`, yaEstaba ? "off" : undefined);
+  await renderCotizaciones();
+  await renderOrdersList();
+  renderDashboard();
+  if (localId != null) openOrder(localId);
+}
+
 /* ---- el cliente aceptó: se vuelve orden de servicio ----
    Los repuestos que salieron del inventario se descuentan AQUÍ, no al cotizar:
-   cotizar no aparta nada, así que hasta este momento el stock nunca se tocó. Si
-   de algo ya no hay existencias, el renglón igual pasa a la orden pero como ítem
-   manual, y se le avisa al taller — es preferible eso a dejar el inventario en
-   negativo o a bloquear una orden que el cliente ya aprobó. */
+   cotizar no aparta nada, así que hasta este momento el stock nunca se tocó.
+   · Modo nube (3.15 · Bloque 2): el servidor aprueba y descuenta todo o nada; sin existencia suficiente NO se crea la
+     orden y se dice de qué producto falta (nunca stock negativo).
+   · Modo local (heredado): si de algo ya no hay existencias, el renglón pasa a la orden como repuesto manual y se avisa. */
 alHacerClicUnaVez(document.getElementById("btnCotAceptar"), async () => {
+  await alDiaParaDecidir();   // 3.15 (Bloque 7): decide con lo guardado (¿ya es una orden?) → primero al día
   const cot = await DB.get("cotizaciones", cotizacionDetalleId);
   if (!cot) return;
-  if (cot.ordenId) { toast(`Esta cotización ya es la orden #${cot.ordenId}`, "off"); return; }
+  if (cot.ordenId) {
+    // ya convertida (p. ej. en otro dispositivo, o antes de un corte): se muestra esa orden y se olvida cualquier intento guardado
+    if (finanzasNube() && cot.uid) await syncBd.meta.set("aceptar_cot:" + cot.uid, null);
+    toast(`Esta cotización ya es la orden #${cot.ordenId}: no se crea otra`, "off");
+    cerrarCotDetalle();
+    openOrder(cot.ordenId);
+    return;
+  }
 
   // aceptar una cotización vencida es válido, pero el taller tiene que confirmar
   // a mano que los precios no se movieron desde que la hizo
   if (estadoCotizacion(cot) === "vencida") {
     const seguir = await showConfirm(
-      `Esta cotización venció el ${new Date(cot.venceISO).toLocaleDateString("es-HN")}. Revisa que los precios de los repuestos sigan igual antes de crear la orden.`,
+      `Esta cotización venció el ${FechaNegocio.fecha(cot.venceISO)}. Revisa que los precios de los repuestos sigan igual antes de crear la orden.`,
       { titulo: "La cotización está vencida", textoOk: "Los precios siguen igual" }
     );
     if (!seguir) return;
     cot.fechaISO = new Date().toISOString();
     cot.venceISO = fechaVencimiento(cot.fechaISO, cot.validezDias);
+  }
+
+  // 3.15 (Bloque 1A): en modo nube la conversión es UNA operación del servidor (convertir_cotizacion). Aquí no se crea nada
+  // local: ni cliente, ni moto, ni orden; todo baja de la nube cuando el servidor confirma.
+  if (finanzasNube()) {
+    if (!cot.clienteId && !(await checkDuplicateBeforeCreate(cot.clienteNombre, cot.clienteTelefono))) return;
+    await aceptarCotizacionNube(cot);
+    return;
   }
 
   let clienteId = cot.clienteId;
@@ -4305,42 +5255,6 @@ alHacerClicUnaVez(document.getElementById("btnCotAceptar"), async () => {
   const sinStock = [];
   let descontados = 0;
 
-  if (finanzasNube()) {
-    // SYNC-7B: la orden nace vacía y cada renglón entra por agregar_item_orden (el ledger descuenta el stock).
-    // Mismo criterio que siempre: si ya no hay existencia, el renglón pasa como ítem manual y se avisa.
-    const ordenIdN = await DB.save("ordenes", {
-      clienteId, motoId, estado: "recibido", falla: cot.diagnostico || `Trabajo cotizado en la cotización #${cot.id}`,
-      items: [], fotos: [], aprobacion: null, diagnostico: null, reparacionNotas: "", calidadChecklist: null,
-      mecanico: currentUser?.nombre || "—", citaId: null, citaFechaISO: null, cotizacionId: cot.id, creadoEn: Date.now(),
-    });
-    const ordN = await DB.get("ordenes", ordenIdN);
-    for (const it of (cot.items || [])) {
-      const rep = it.inventarioId ? inventario.find(r => r.id === it.inventarioId) : null;
-      let r = null;
-      if (rep) {
-        try { r = await agregarItemOrdenNube(ordN, { nombre: it.nombre, cantidad: it.cantidad, precio: it.precio, inventarioId: rep.id, costoUnitario: rep.costoCompra || 0 }); }
-        catch (err) { sinStock.push(it.nombre); r = null; }
-      }
-      if (!r) {
-        try { r = await agregarItemOrdenNube(ordN, { nombre: it.nombre, cantidad: it.cantidad, precio: it.precio, inventarioId: null }); }
-        catch (err) { toast("No se pudo pasar «" + it.nombre + "» a la orden: " + err.message, "off"); continue; }
-      }
-      items.push(r.item);
-    }
-    await updateOrder(ordenIdN, x => { x.items = items; });
-    await bajarNube(["inventario"]);
-    cot.estado = "aceptada"; cot.ordenId = ordenIdN; cot.aceptadaEn = Date.now();
-    await DB.save("cotizaciones", cot);
-    markDirty();
-    cerrarCotDetalle();
-    toast(sinStock.length ? `Orden #${ordenIdN} creada · sin stock de: ${sinStock.join(", ")}` : `Orden #${ordenIdN} creada desde la cotización`, sinStock.length ? "off" : undefined);
-    await renderCotizaciones();
-    await renderOrdersList();
-    renderDashboard();
-    openOrder(ordenIdN);
-    return;
-  }
-
   for (const it of (cot.items || [])) {
     const rep = it.inventarioId ? inventario.find(r => r.id === it.inventarioId) : null;
     if (rep && rep.cantidad >= it.cantidad) {
@@ -4349,10 +5263,10 @@ alHacerClicUnaVez(document.getElementById("btnCotAceptar"), async () => {
       descontados++;
       // el costo se sella al convertir, no al cotizar: entre una cosa y otra
       // pudo cambiar, y lo que cuenta para la ganancia es el de ahora
-      items.push({ nombre: it.nombre, cantidad: it.cantidad, precio: it.precio, origenInventarioId: rep.id, costoUnitario: rep.costoCompra || 0, costoEstimado: false });
+      items.push({ tipo: "repuesto_inventario", nombre: it.nombre, cantidad: it.cantidad, precio: it.precio, origenInventarioId: rep.id, costoUnitario: rep.costoCompra || 0, costoEstimado: false });
     } else {
       if (rep) sinStock.push(it.nombre);
-      items.push({ nombre: it.nombre, cantidad: it.cantidad, precio: it.precio, origenInventarioId: null, costoUnitario: 0, costoEstimado: false });
+      items.push({ tipo: rep || it.tipo === "repuesto_inventario" ? "repuesto_manual" : (it.tipo || null), nombre: it.nombre, cantidad: it.cantidad, precio: it.precio, origenInventarioId: null, costoUnitario: 0, costoEstimado: false });
     }
   }
   if (descontados) markDirty();
@@ -4360,7 +5274,8 @@ alHacerClicUnaVez(document.getElementById("btnCotAceptar"), async () => {
   const ordenId = await DB.save("ordenes", {
     clienteId, motoId, estado: "recibido",
     falla: cot.diagnostico || `Trabajo cotizado en la cotización #${cot.id}`,
-    items, fotos: [], aprobacion: null,
+    // aceptar la cotización ES aprobar el presupuesto (igual que en la nube)
+    items, fotos: [], aprobacion: { via: "cotizacion", en: Date.now() }, presupuestoEstado: "aprobado",
     diagnostico: null, reparacionNotas: "", calidadChecklist: null,
     mecanico: currentUser?.nombre || "—",
     citaId: null, citaFechaISO: null,
@@ -4392,18 +5307,17 @@ function llenarCotizacionPrint(cot) {
   const vence = new Date(cot.venceISO);
 
   document.getElementById("cotPrintId").textContent = cot.id;
-  document.getElementById("cotPrintFecha").textContent = new Date(cot.fechaISO).toLocaleDateString("es-HN");
+  document.getElementById("cotPrintFecha").textContent = FechaNegocio.fecha(cot.fechaISO);
   document.getElementById("cotPrintCliente").textContent = cot.clienteNombre || "Cliente";
   document.getElementById("cotPrintTelefono").textContent = cot.clienteTelefono ? ` — ${cot.clienteTelefono}` : "";
   document.getElementById("cotPrintMotoBlock").style.display = cot.motoDesc ? "block" : "none";
   document.getElementById("cotPrintMoto").textContent = cot.motoDesc || "";
   document.getElementById("cotPrintDiagBlock").style.display = cot.diagnostico ? "block" : "none";
   document.getElementById("cotPrintDiagnostico").textContent = cot.diagnostico || "";
-  document.getElementById("cotPrintItems").innerHTML = (cot.items || []).map(it => `
-    <tr><td>${esc(it.nombre)}</td><td class="num">${it.cantidad}</td><td class="num">${money(it.precio)}</td><td class="num">${money(it.cantidad * it.precio)}</td></tr>
-  `).join("");
+  document.getElementById("cotPrintItems").innerHTML = filasTablaRenglones(cot.items || [], ({ it }) => `
+    <tr><td>${esc(it.nombre)}</td><td class="num">${it.cantidad}</td><td class="num">${money(it.precio)}</td><td class="num">${money(it.cantidad * it.precio)}</td></tr>`);
   document.getElementById("cotPrintTotal").textContent = money(total);
-  document.getElementById("cotPrintVence").textContent = vence.toLocaleDateString("es-HN");
+  document.getElementById("cotPrintVence").textContent = FechaNegocio.fecha(vence);
   document.getElementById("cotPrintValidezDias").textContent = `(${cot.validezDias} días desde que se hizo)`;
   const notas = document.getElementById("cotPrintNotas");
   notas.style.display = cot.notas ? "block" : "none";
@@ -4413,7 +5327,7 @@ function llenarCotizacionPrint(cot) {
     idPlantilla: "cotizacionPrint",
     nombreBase: `Cotizacion-${cot.id}-${nombreArchivoLimpio(cot.clienteNombre)}`,
     titulo: `Cotización #${cot.id}`,
-    texto: `Hola ${cot.clienteNombre}, aquí está la cotización de ENTIMOTORS por ${money(total)}. Este precio se respeta hasta el ${vence.toLocaleDateString("es-HN")}.`,
+    texto: `Hola ${cot.clienteNombre}, aquí está la cotización de ENTIMOTORS por ${money(total)}. Este precio se respeta hasta el ${FechaNegocio.fecha(vence)}.`,
   };
 }
 
@@ -4519,7 +5433,7 @@ async function abrirModalMoverCita(citaId) {
   const { dt } = citaWhenInfo(cita);
 
   document.getElementById("moverCitaActualTexto").textContent =
-    `${nombre} — ahora está para el ${dt.toLocaleDateString("es-HN")} a las ${cita.hora} con ${cita.mecanico}.`;
+    `${nombre} — ahora está para el ${FechaNegocio.dia(cita.fecha)} a las ${cita.hora} con ${cita.mecanico}.`;
   document.getElementById("moverAvisoSinTel").style.display = telefono ? "none" : "block";
 
   await poblarSelectMecanico("moverMecanico", cita.mecanico, cita.mecanicoId);
@@ -4586,9 +5500,7 @@ alHacerClicUnaVez(document.getElementById("btnConfirmarMover"), async () => {
   });
   markDirty();
 
-  const dtAntes = new Date(`${antes.fecha}T${antes.hora}`);
-  const dtNueva = new Date(`${fecha}T${hora}`);
-  const texto = `Hola ${nombre}, tu cita en ENTIMOTORS del ${dtAntes.toLocaleDateString("es-HN")} a las ${antes.hora} fue movida para el ${dtNueva.toLocaleDateString("es-HN")} a las ${hora}.${MOTIVO_MOVER_TEXTO[motivo] || ""} ¡Te esperamos!`;
+  const texto = `Hola ${nombre}, tu cita en ENTIMOTORS del ${FechaNegocio.dia(antes.fecha)} a las ${antes.hora} fue movida para el ${FechaNegocio.dia(fecha)} a las ${hora}.${MOTIVO_MOVER_TEXTO[motivo] || ""} ¡Te esperamos!`;
   if (telefono) navegarWA(ventanaWA, telefono, texto);
 
   citaAMover = null;
@@ -4598,17 +5510,17 @@ alHacerClicUnaVez(document.getElementById("btnConfirmarMover"), async () => {
   renderDashboard();
 });
 
+/* 3.15 (Bloque 3): cita.fecha/cita.hora son fecha y hora LOCALES del taller. «Hoy/Mañana» se decide con el día empresarial de
+   Honduras (antes: el del reloj del dispositivo), y dt es el instante real de la cita (para mostrar la hora en la zona del negocio). */
 function citaWhenInfo(cita) {
-  const now = new Date();
-  const dt = new Date(`${cita.fecha}T${cita.hora || "00:00"}`);
-  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-  const citaDay = new Date(dt.getFullYear(), dt.getMonth(), dt.getDate());
-  const diffDays = Math.round((citaDay - today) / 86400000);
+  const valida = FechaNegocio.esDia(cita.fecha);
+  const dt = new Date(valida ? FechaNegocio.instante(cita.fecha, cita.hora || "00:00") : NaN);
+  const diffDays = valida ? FechaNegocio.diferenciaDias(FechaNegocio.hoy(), cita.fecha) : NaN;
   let label;
   if (diffDays < 0) label = "Pasada";
   else if (diffDays === 0) label = "Hoy";
   else if (diffDays === 1) label = "Mañana";
-  else label = dt.toLocaleDateString();
+  else label = valida ? FechaNegocio.dia(cita.fecha) : "Sin fecha";
   return { diffDays, label, dt };
 }
 
@@ -4623,13 +5535,16 @@ function citaCerrada(c) { return c.estado === "atendida" || c.estado === "ausent
 async function renderCitasList() {
   const [citasAll, clientes] = await Promise.all([DB.getAll("citas"), DB.getAll("clientes")]);
 
+  // 3.15 (Bloque 7): la fecha/etiqueta de cada cita se calcula UNA vez por pintada (antes ~6 veces: cada filtro y cada fila recalculaba «hoy»)
+  const infoCita = new Map(citasAll.map(c => [c, citaWhenInfo(c)]));
+  const info = (c) => infoCita.get(c) || citaWhenInfo(c);
   const abiertas = citasAll.filter(c => !citaCerrada(c));
   const cerradas = citasAll.filter(citaCerrada);
-  const hoy = abiertas.filter(c => citaWhenInfo(c).diffDays === 0);
-  const semana = abiertas.filter(c => { const d = citaWhenInfo(c).diffDays; return d >= 0 && d <= 6; });
-  const sinRecordatorio = abiertas.filter(c => !c.recordatorioEnviado && citaWhenInfo(c).diffDays >= 0);
+  const hoy = abiertas.filter(c => info(c).diffDays === 0);
+  const semana = abiertas.filter(c => { const d = info(c).diffDays; return d >= 0 && d <= 6; });
+  const sinRecordatorio = abiertas.filter(c => !c.recordatorioEnviado && info(c).diffDays >= 0);
   // citas cuya hora ya pasó y que nadie marcó: hay que cerrarlas
-  const porCerrar = abiertas.filter(c => citaWhenInfo(c).diffDays < 0);
+  const porCerrar = abiertas.filter(c => info(c).diffDays < 0);
 
   renderWidgetRow("citasWidgetRow", [
     { ic: "cita", val: hoy.length, lbl: "Hoy", active: citasFiltro === "hoy", onClick: () => { citasFiltro = citasFiltro === "hoy" ? null : "hoy"; renderCitasList(); } },
@@ -4658,12 +5573,13 @@ async function renderCitasList() {
     return;
   }
   citas = [...citas].sort((a, b) => `${a.fecha}${a.hora}`.localeCompare(`${b.fecha}${b.hora}`));
+  const clientePorId = indicePor(clientes);
   list.innerHTML = citas.map(c => {
-    const cliente = clientes.find(cl => cl.id === c.clienteId);
+    const cliente = clientePorId.get(c.clienteId);
     const nombre = c.nombreTmp || cliente?.nombre || "Cliente";
     const telefono = c.telefonoTmp || cliente?.telefono || "";
-    const { label, dt } = citaWhenInfo(c);
-    const { diffDays } = citaWhenInfo(c);
+    const { label, dt } = info(c);
+    const { diffDays } = info(c);
     // los botones cambian según en qué momento está la cita: no tiene sentido
     // preguntar "¿llegó?" por una cita de la próxima semana, ni ofrecer
     // recordatorio de una que ya se atendió.
@@ -4695,8 +5611,7 @@ async function renderCitasList() {
     else if (diffDays < 0) etiqueta = '<span class="mant-badge due">Ya pasó — ciérrala</span>';
     const veces = (c.reprogramaciones || []).length;
     if (veces) {
-      const desde = new Date(`${c.reprogramaciones[0].de.fecha}T${c.reprogramaciones[0].de.hora}`);
-      etiqueta += ` <span class="mant-badge soon" title="Movida desde el ${desde.toLocaleDateString("es-HN")} a las ${c.reprogramaciones[0].de.hora}">🔁 Movida${veces > 1 ? ` ${veces}×` : ""}</span>`;
+      etiqueta += ` <span class="mant-badge soon" title="Movida desde el ${FechaNegocio.dia(c.reprogramaciones[0].de.fecha)} a las ${c.reprogramaciones[0].de.hora}">🔁 Movida${veces > 1 ? ` ${veces}×` : ""}</span>`;
     }
     // estado del aviso de confirmación al cliente — "abierto" nunca "enviado":
     // no hay forma de confirmar que el mensaje de verdad salió (ver PASO 7)
@@ -4705,7 +5620,7 @@ async function renderCitasList() {
 
     return `
       <div class="cita-row${citaCerrada(c) ? " cita-cerrada" : ""}" data-id="${c.id}">
-        <div class="cita-when"><div class="d">${label}</div><div class="t">${dt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</div></div>
+        <div class="cita-when"><div class="d">${label}</div><div class="t">${FechaNegocio.hora(dt)}</div></div>
         <div class="cita-info">
           <div class="who">${esc(nombre)} ${c.origen === "web" ? '<span class="mant-badge soon">Desde la web</span>' : ""} ${etiqueta}</div>
           <div class="meta">${esc(c.motivo || "Sin motivo especificado")} · mecánico: ${esc(c.mecanico)}</div>
@@ -4719,6 +5634,7 @@ async function renderCitasList() {
     btn.addEventListener("click", async (e) => {
       if (!exigeGestion("Solo el administrador o el cajero registran la llegada")) return;
       e.stopPropagation();
+      await alDiaParaDecidir();   // 3.15 (Bloque 7): ¿esta cita ya tiene su orden? se decide con datos al día
       await abrirOrdenDesdeCita(Number(btn.dataset.id));
     });
   });
@@ -4777,8 +5693,8 @@ async function renderCitasList() {
       const ventanaWA = abrirVentanaWA();
       const id = Number(btn.dataset.id);
       const c = await DB.get("citas", id);
-      const { label, dt } = citaWhenInfo(c);
-      const texto = `Hola ${btn.dataset.nombre}, te recordamos tu cita en ENTIMOTORS el ${label === "Hoy" || label === "Mañana" ? label.toLowerCase() : dt.toLocaleDateString()} a las ${dt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}. ¡Te esperamos!`;
+      const { label, dt } = info(c);
+      const texto = `Hola ${btn.dataset.nombre}, te recordamos tu cita en ENTIMOTORS el ${label === "Hoy" || label === "Mañana" ? label.toLowerCase() : label} a las ${FechaNegocio.hora(dt)}. ¡Te esperamos!`;
       const sent = navegarWA(ventanaWA, btn.dataset.tel, texto);
       if (!sent) return;
       await DB.save("citas", { ...c, recordatorioEnviado: true });
@@ -4795,8 +5711,8 @@ async function renderCitasList() {
       const ventanaWA = btn.dataset.tel ? abrirVentanaWA() : null;
       const id = Number(btn.dataset.id);
       const c = await DB.get("citas", id);
-      const { label, dt } = citaWhenInfo(c);
-      const texto = `Hola ${btn.dataset.nombre}, tu cita en ENTIMOTORS del ${label === "Hoy" || label === "Mañana" ? label.toLowerCase() : dt.toLocaleDateString()} a las ${dt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })} fue cancelada. Escríbenos para reprogramarla.`;
+      const { label, dt } = info(c);
+      const texto = `Hola ${btn.dataset.nombre}, tu cita en ENTIMOTORS del ${label === "Hoy" || label === "Mañana" ? label.toLowerCase() : label} a las ${FechaNegocio.hora(dt)} fue cancelada. Escríbenos para reprogramarla.`;
       if (btn.dataset.tel) navegarWA(ventanaWA, btn.dataset.tel, texto);
       await DB.delete("citas", id);
       markDirty();
@@ -4805,7 +5721,7 @@ async function renderCitasList() {
     });
   });
 
-  const dueSoon = abiertas.filter(c => !c.recordatorioEnviado && citaWhenInfo(c).diffDays <= 1 && citaWhenInfo(c).diffDays >= 0).length;
+  const dueSoon = abiertas.filter(c => !c.recordatorioEnviado && info(c).diffDays <= 1 && info(c).diffDays >= 0).length;
   updateCitasBadge(dueSoon);
 }
 
@@ -4845,7 +5761,7 @@ async function abrirModalEditarCita(citaId) {
 
   // una cita vieja puede estar en el pasado; el min de "nueva cita" impediría
   // abrirla siquiera, así que aquí el mínimo es su propia fecha.
-  const hoy = new Date().toISOString().slice(0, 10);
+  const hoy = FechaNegocio.hoy();
   const campoFecha = document.getElementById("citaFecha");
   campoFecha.min = cita.fecha < hoy ? cita.fecha : hoy;
   campoFecha.value = cita.fecha;
@@ -4896,7 +5812,7 @@ document.getElementById("btnNuevaCita").addEventListener("click", async () => {
   document.getElementById("citaBuscarCliente").value = "";
   renderCitaClienteChip();
   ["citaNombre", "citaTelefono", "citaFecha", "citaMotivo"].forEach(id => document.getElementById(id).value = "");
-  document.getElementById("citaFecha").min = new Date().toISOString().slice(0, 10); // evita agendar por error en una fecha ya pasada
+  document.getElementById("citaFecha").min = FechaNegocio.hoy(); // evita agendar por error en una fecha ya pasada
   await refreshCitaHoraOptions();
   document.getElementById("modalCita").classList.add("active");
 });
@@ -4978,7 +5894,7 @@ alHacerClicUnaVez(document.getElementById("btnGuardarCita"), async () => {
      ENTIMOTORS no lo tiene todavía (ver comentario al inicio del archivo).
      Esto abre WhatsApp con el mensaje ya escrito, así que el estado que se
      guarda es "abierto", nunca "enviado". */
-  const fechaLegible = new Date(`${fecha}T${hora}`).toLocaleDateString("es-HN", { day: "numeric", month: "long" });
+  const fechaLegible = FechaNegocio.dia(fecha, { day: "numeric", month: "long" });
   const textoCliente = citaPrevia
     ? `Hola ${nombreCliente}, actualizamos tu cita en ENTIMOTORS: queda para el ${fechaLegible} a las ${hora}. ¡Te esperamos!`
     : `Hola ${nombreCliente}, tu cita en ENTIMOTORS quedó registrada para el ${fechaLegible} a las ${hora}. ¡Te esperamos!`;
@@ -5000,13 +5916,13 @@ alHacerClicUnaVez(document.getElementById("btnGuardarCita"), async () => {
 /* ================= CLIENTES ================= */
 function mantStatus(moto) {
   if (!moto?.mantenimiento?.fecha) return { cls: "none", label: "Sin programar" };
-  const today = new Date(); today.setHours(0, 0, 0, 0);
-  const fecha = new Date(`${moto.mantenimiento.fecha}T00:00:00`);
-  const diffDays = Math.round((fecha - today) / 86400000);
-  if (diffDays < 0) return { cls: "due", label: `Venció (${fecha.toLocaleDateString()})` };
+  const fecha = moto.mantenimiento.fecha;
+  if (!FechaNegocio.esDia(fecha)) return { cls: "none", label: "Sin programar" };
+  const diffDays = FechaNegocio.diferenciaDias(FechaNegocio.hoy(), fecha);
+  if (diffDays < 0) return { cls: "due", label: `Venció (${FechaNegocio.dia(fecha)})` };
   if (diffDays === 0) return { cls: "due", label: "Hoy" };
   if (diffDays <= 7) return { cls: "soon", label: `En ${diffDays}d` };
-  return { cls: "ok", label: fecha.toLocaleDateString() };
+  return { cls: "ok", label: FechaNegocio.dia(fecha) };
 }
 
 /* ---- clientes duplicados: mismo nombre + mismo teléfono ---- */
@@ -5028,7 +5944,63 @@ async function checkDuplicateBeforeCreate(nombre, telefono) {
   const key = dupKey(nombre, telefono);
   const match = clientes.find(c => dupKey(c.nombre, c.telefono) === key);
   if (!match) return true;
-  return showConfirm(`Ya existe un cliente "${match.nombre}" con ese mismo nombre y teléfono. ¿Crear un registro nuevo de todas formas? (Cancelar para elegir el existente en su lugar)`, { titulo: "Posible cliente duplicado", textoOk: "Crear de todas formas" });
+  // 3.15 (Checkpoint 8A): botones con su significado literal (antes «Cancelar para elegir el existente» no elegía nada)
+  return showConfirm(`Ya existe un cliente "${match.nombre}" con ese mismo nombre y teléfono. ¿Crear otro registro igual de todas formas?\n\nSi es la misma persona, elige «No crear» y búscalo en la lista.`, { titulo: "Posible cliente duplicado", textoOk: "Crear de todas formas", textoCancelar: "No crear" });
+}
+
+/* 3.15 (Checkpoint 8A) · ¿Ese nombre (y teléfono) ya es un cliente? Coincidencias para que la PERSONA decida — nunca se une ni se crea
+   solo, y un nombre igual NO prueba que sea la misma persona (homónimos). Orden: mismo teléfono › mismo nombre › nombre parecido. */
+const normalizarNombre = (t) => String(t || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9ñ ]/g, " ").replace(/\s+/g, " ").trim();
+const soloDigitos = (t) => String(t || "").replace(/\D/g, "");
+function distanciaEdicion(a, b) {
+  if (Math.abs(a.length - b.length) > 2) return 3;
+  const d = Array.from({ length: a.length + 1 }, (_, i) => [i, ...Array(b.length).fill(0)]);
+  for (let j = 1; j <= b.length; j++) d[0][j] = j;
+  for (let i = 1; i <= a.length; i++) for (let j = 1; j <= b.length; j++) d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+  return d[a.length][b.length];
+}
+async function buscarCoincidencias(nombre, telefono) {
+  const n = normalizarNombre(nombre), tel = soloDigitos(telefono);
+  if (!n && tel.length < 7) return [];
+  const out = [];
+  for (const c of await DB.getAll("clientes")) {
+    if (c.deletedAt || c.deleted_at) continue;
+    const cn = normalizarNombre(c.nombre), ct = soloDigitos(c.telefono);
+    let razon = null, peso = 0;
+    if (tel.length >= 7 && ct === tel) { razon = "mismo teléfono"; peso = 3; }
+    else if (n && cn === n) { razon = "mismo nombre"; peso = 2; }
+    else if (n && cn && n.length >= 4 && (cn.startsWith(n + " ") || n.startsWith(cn + " ") || (n.length >= 5 && distanciaEdicion(n, cn) <= 2))) { razon = "nombre parecido"; peso = 1; }
+    if (razon) out.push({ cliente: c, razon, peso });
+  }
+  return out.sort((a, b) => b.peso - a.peso || String(a.cliente.nombre).localeCompare(String(b.cliente.nombre))).slice(0, 8);
+}
+/* Pregunta y resuelve: {accion:"existente", cliente} | {accion:"nuevo"} | {accion:"sin-registrar"} | {accion:"cancelar"}.
+   preguntarSiNoHay=false: sin coincidencias no molesta (p. ej. el formulario de crédito ya es «cliente nuevo»).
+   permitirSinRegistrar: ofrece seguir solo con el nombre (venta rápida / crédito desde la venta). Cancelar NO toca el formulario. */
+async function decidirCliente({ nombre, telefono = "", permitirSinRegistrar = false, preguntarSiNoHay = false, contexto = "" }) {
+  const coincidencias = await buscarCoincidencias(nombre, telefono);
+  if (!coincidencias.length && !preguntarSiNoHay) return { accion: "nuevo" };
+  return new Promise((resolve) => {
+    const modal = document.getElementById("modalCoincidencias"), lista = document.getElementById("coincLista");
+    document.getElementById("coincTitulo").textContent = coincidencias.length ? "¿Es un cliente que ya tienes?" : `«${nombre}» no está registrado`;
+    document.getElementById("coincMensaje").textContent = coincidencias.length
+      ? `Para «${nombre}»${telefono ? ` (${telefono})` : ""} hay ${coincidencias.length === 1 ? "un cliente parecido" : coincidencias.length + " clientes parecidos"}. Si es la misma persona, úsalo; un nombre igual no siempre es la misma persona.`
+      : (contexto || "Puedes registrarlo como cliente o seguir solo con el nombre.");
+    lista.innerHTML = "";
+    const fin = (r) => { modal.classList.remove("active"); ["btnCoincCancelar", "btnCoincSinRegistrar", "btnCoincNuevo"].forEach((id) => { const b = document.getElementById(id); b.replaceWith(b.cloneNode(true)); }); resolve(r); };
+    for (const k of coincidencias) {
+      const b = document.createElement("button"); b.type = "button"; b.className = "btn ghost"; b.style.textAlign = "left"; b.dataset.clienteId = k.cliente.id;
+      b.textContent = `Usar este cliente: ${k.cliente.nombre}${k.cliente.telefono ? " · " + k.cliente.telefono : ""} (${k.razon})`;
+      b.addEventListener("click", () => fin({ accion: "existente", cliente: k.cliente }));
+      lista.appendChild(b);
+    }
+    document.getElementById("btnCoincSinRegistrar").style.display = permitirSinRegistrar ? "" : "none";
+    document.getElementById("btnCoincNuevo").textContent = `Crear cliente nuevo «${nombre}»`;
+    document.getElementById("btnCoincCancelar").addEventListener("click", () => fin({ accion: "cancelar" }));
+    document.getElementById("btnCoincSinRegistrar").addEventListener("click", () => fin({ accion: "sin-registrar" }));
+    document.getElementById("btnCoincNuevo").addEventListener("click", () => fin({ accion: "nuevo" }));
+    modal.classList.add("active");
+  });
 }
 async function mergeClientes(duplicateId, keepId) {
   const [motos, ordenes, citas] = await Promise.all([DB.getAll("motos"), DB.getAll("ordenes"), DB.getAll("citas")]);
@@ -5047,8 +6019,10 @@ async function renderClientes() {
   const dupOf = {}; // clienteId -> id del registro que se conserva
   dupGroups.forEach(g => g.slice(1).forEach(c => { dupOf[c.id] = g[0].id; }));
 
-  const conMoto = clientesAll.filter(c => motos.some(m => m.clienteId === c.id));
-  const conMantenimiento = clientesAll.filter(c => motos.some(m => m.clienteId === c.id && ["due", "soon"].includes(mantStatus(m).cls)));
+  const primeraMotoDe = indicePor(motos, "clienteId");
+  const conMantPorCliente = new Set(motos.filter(m => m.clienteId != null && ["due", "soon"].includes(mantStatus(m).cls)).map(m => m.clienteId));
+  const conMoto = clientesAll.filter(c => primeraMotoDe.has(c.id));
+  const conMantenimiento = clientesAll.filter(c => conMantPorCliente.has(c.id));
 
   renderWidgetRow("clientesWidgetRow", [
     { ic: "usuarios", val: clientesAll.length, lbl: "Clientes", active: clientesFiltro === null, onClick: () => { clientesFiltro = null; renderClientes(); } },
@@ -5066,12 +6040,13 @@ async function renderClientes() {
     body.innerHTML = `<tr><td colspan="8" style="color:var(--text-faint); text-align:center; padding:1.5rem 0;">Ningún cliente coincide con este filtro.</td></tr>`;
     return;
   }
-  body.innerHTML = clientes.map(c => {
-    const m = motos.find(mm => mm.clienteId === c.id);
+  const totalClientes = clientes.length;
+  body.innerHTML = clientes.slice(0, limiteLista("clientes")).map(c => {   // 3.15 (Bloque 7): por tramos (ver verMasLista)
+    const m = primeraMotoDe.get(c.id);
     const st = mantStatus(m);
     const isDup = dupOf[c.id] != null;
     return `<tr class="cliente-row" data-id="${c.id}" style="cursor:pointer;">
-      <td>${m?.foto ? `<img class="thumb-sm" src="${m.foto}">` : ""}</td>
+      <td>${m?.foto ? `<img class="thumb-sm" src="${m.foto}" loading="lazy" decoding="async" alt="">` : ""}</td>
       <td>${esc(c.nombre)} ${isDup ? '<span class="mant-badge due">Posible duplicado</span>' : ""}</td>
       <td>${esc(c.telefono || "—")}</td>
       <td>${m && (m.marca || m.modelo) ? esc((m.marca + " " + m.modelo).trim()) : "—"}</td>
@@ -5084,7 +6059,8 @@ async function renderClientes() {
         <button type="button" class="btn ghost small danger" data-action="eliminar-cliente" data-id="${c.id}" title="Eliminar cliente" aria-label="Eliminar cliente">🗑</button>
       </td>
     </tr>`;
-  }).join("");
+  }).join("") + verMasLista("clientes", totalClientes, { columnas: 8 });
+  conectarVerMas(body, "clientes", renderClientes);
 
   body.querySelectorAll('[data-action="recordar-mant"]').forEach(btn => {
     btn.addEventListener("click", async (e) => {
@@ -5092,7 +6068,7 @@ async function renderClientes() {
       const ventanaWA = abrirVentanaWA();
       const moto = await DB.get("motos", Number(btn.dataset.moto));
       const cliente = await DB.get("clientes", Number(btn.dataset.cliente));
-      const fecha = new Date(`${moto.mantenimiento.fecha}T00:00:00`).toLocaleDateString();
+      const fecha = FechaNegocio.dia(moto.mantenimiento.fecha);
       const texto = `Hola ${cliente.nombre}, tu ${moto.marca} ${moto.modelo} tiene programado "${moto.mantenimiento.tipo || "mantenimiento"}" para el ${fecha}. ¿Agendamos tu cita?`;
       const sent = navegarWA(ventanaWA, cliente.telefono, texto);
       if (!sent) return;
@@ -5153,7 +6129,7 @@ async function openClienteDetalle(id) {
 
   document.getElementById("clienteDetalleMotos").innerHTML = susMotos.length ? susMotos.map(m => `
     <div class="card" style="margin-bottom:0.6rem; display:flex; gap:0.8rem; align-items:center; flex-wrap:wrap;">
-      ${m.foto ? `<img class="thumb-sm" src="${m.foto}" style="width:44px;height:44px;">` : ""}
+      ${m.foto ? `<img class="thumb-sm" src="${m.foto}" style="width:44px;height:44px;" loading="lazy" decoding="async" alt="">` : ""}
       <div style="flex:1 1 160px;">
         <b>${esc(m.marca)} ${esc(m.modelo)}</b> · placa ${esc(m.placa || "s/p")} · ${m.km || 0} km
         <div class="mant-badge ${mantStatus(m).cls}" style="display:inline-block; margin-top:0.3rem;">${mantStatus(m).label}</div>
@@ -5175,7 +6151,7 @@ async function openClienteDetalle(id) {
     const total = (o.items || []).reduce((s, it) => s + it.cantidad * it.precio, 0);
     return `<div class="order-row" data-id="${o.id}" style="cursor:pointer;">
       <span class="pill ${o.estado}">${STAGES.find(s => s.key === o.estado)?.label ?? o.estado}</span>
-      <div class="order-info"><div class="moto">Orden #${o.id}</div><div class="meta">${new Date(o.creadoEn).toLocaleDateString()}</div></div>
+      <div class="order-info"><div class="moto">Orden #${o.id}</div><div class="meta">${FechaNegocio.fecha(o.creadoEn)}</div></div>
       <span class="amount">${money(total)}</span>
     </div>`;
   }).join("") : `<p class="hint" style="margin:0;">Sin órdenes todavía.</p>`;
@@ -5308,7 +6284,7 @@ alHacerClicUnaVez(document.getElementById("btnGuardarEditarMoto"), async () => {
     placa: document.getElementById("editMotoPlaca").value.trim(),
     km: Number(document.getElementById("editMotoKm").value) || 0,
     // solo se reemplaza la foto si se eligió una nueva
-    foto: fotoFile ? await fileToDataUrl(fotoFile) : moto.foto,
+    foto: fotoFile ? await fotoLocal(fotoFile) : moto.foto,
     mantenimiento: mantFecha
       // si se cambia la fecha del mantenimiento hay que volver a avisar, así que
       // el recordatorio se reinicia; si la fecha es la misma, se respeta.
@@ -5369,7 +6345,7 @@ alHacerClicUnaVez(document.getElementById("btnGuardarCliente"), async () => {
   markDirty();
 
   const fotoFile = document.getElementById("clienteFoto").files[0];
-  const foto = fotoFile ? await fileToDataUrl(fotoFile) : null;
+  const foto = fotoFile ? await fotoLocal(fotoFile) : null;
   const mantFecha = document.getElementById("clienteMantFecha").value;
 
   await DB.save("motos", {
@@ -5412,7 +6388,7 @@ async function renderInventario() {
   }
   body.innerHTML = inv.map(r => `
     <tr class="rep-row" data-id="${r.id}">
-      <td style="display:flex; align-items:center; gap:0.5rem; cursor:pointer;">${r.foto ? `<img class="thumb-sm" src="${r.foto}">` : ""}${esc(r.nombre)}</td>
+      <td style="display:flex; align-items:center; gap:0.5rem; cursor:pointer;">${r.foto ? `<img class="thumb-sm" src="${r.foto}" loading="lazy" decoding="async" alt="">` : ""}${esc(r.nombre)}</td>
       <td style="cursor:pointer;">${esc(r.modelo || "Todos")}</td>
       <td class="num" style="cursor:pointer;">${r.cantidad}${r.requiereRevision ? ` <span title="Stock negativo por una venta sin conexión: revisar">⚠</span>` : ""}</td>
       <td class="num" style="cursor:pointer;">${money(r.precio)}</td>
@@ -5515,7 +6491,7 @@ alHacerClicUnaVez(document.getElementById("btnGuardarRepuesto"), async () => {
   const nombre = document.getElementById("repuestoNombre").value.trim();
   if (!nombre) { toast("Falta el nombre del repuesto", "off"); return; }
   const fotoFile = document.getElementById("repuestoFoto").files[0];
-  const foto = fotoFile ? await fileToDataUrl(fotoFile) : (repuestoEditId ? (await DB.get("inventario", repuestoEditId))?.foto : null);
+  const foto = fotoFile ? await fotoLocal(fotoFile) : (repuestoEditId ? (await DB.get("inventario", repuestoEditId))?.foto : null);
   const precio = Number(document.getElementById("repuestoPrecio").value) || 0;
   const cantidad = Number(document.getElementById("repuestoCantidad").value) || 0;
   const costoCompra = Number(document.getElementById("repuestoCosto").value) || 0;
@@ -5567,7 +6543,7 @@ document.getElementById("btnExportarCSV").addEventListener("click", async () => 
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
-  a.download = `inventario_entimotors_${new Date().toISOString().slice(0, 10)}.csv`;
+  a.download = `inventario_entimotors_${FechaNegocio.hoy()}.csv`;
   document.body.appendChild(a);
   a.click();
   a.remove();
@@ -5789,6 +6765,8 @@ function tomarClienteDelModalServicio() {
   const escrito = document.getElementById("servicioPOSCliente").value.trim();
   posClienteLibre = escrito;
   if (escrito) document.getElementById("posCliente").value = "";
+  document.getElementById("posClienteNombre").value = escrito;   // 3.15 (8A): el mismo nombre en la pantalla principal
+  pintarAgregarClientePOS();
 }
 
 function validarServicioPOS() {
@@ -5875,7 +6853,32 @@ document.getElementById("posAbonoInicial").addEventListener("input", actualizarC
 
 document.getElementById("posBuscar").addEventListener("input", (e) => { posBusqueda = e.target.value; renderPOS(); });
 document.getElementById("posCliente").addEventListener("change", (e) => {
-  if (e.target.value) posClienteLibre = "";
+  if (e.target.value) { posClienteLibre = ""; document.getElementById("posClienteNombre").value = ""; }
+  pintarAgregarClientePOS();
+});
+/* 3.15 (Checkpoint 8A) · Venta rápida: cliente de la lista O un nombre escrito para ESTA venta. El nombre escrito queda en la factura tal
+   cual (instantánea: no cambia aunque luego se edite un cliente). «Agregar como cliente» es opcional: muestra coincidencias y la persona
+   decide (usar el existente, crear uno nuevo o nada). Nunca se crea ni se une un cliente solo por el nombre. */
+function pintarAgregarClientePOS() {
+  const escrito = document.getElementById("posClienteNombre").value.trim();
+  document.getElementById("btnPosAgregarCliente").style.display = escrito && !document.getElementById("posCliente").value ? "" : "none";
+}
+document.getElementById("posClienteNombre").addEventListener("input", (e) => {
+  posClienteLibre = e.target.value.trim();
+  if (posClienteLibre) document.getElementById("posCliente").value = "";
+  pintarAgregarClientePOS();
+});
+alHacerClicUnaVez(document.getElementById("btnPosAgregarCliente"), async () => {
+  const nombre = document.getElementById("posClienteNombre").value.trim();
+  if (!nombre) return;
+  const d = await decidirCliente({ nombre, preguntarSiNoHay: true, contexto: "Registrarlo guarda su historial. No es obligatorio: la venta vale igual solo con el nombre." });
+  if (d.accion === "cancelar" || d.accion === "sin-registrar") return;
+  const id = d.accion === "existente" ? d.cliente.id : await DB.save("clientes", { nombre, telefono: "" });
+  if (d.accion === "nuevo") { markDirty(); toast(`«${nombre}» quedó registrado como cliente`); }
+  await refreshPosClienteSelect();
+  document.getElementById("posCliente").value = String(id);
+  posClienteLibre = ""; document.getElementById("posClienteNombre").value = "";
+  pintarAgregarClientePOS();
 });
 document.getElementById("posMetodo").addEventListener("change", actualizarCambioPOS);
 document.getElementById("posEfectivoRecibido").addEventListener("input", actualizarCambioPOS);
@@ -5893,7 +6896,7 @@ async function cobrarCreditoPOS() {
 
   const sel = document.getElementById("posCliente");
   const cli = await resolverClienteCredito(sel.value ? Number(sel.value) : null, posClienteLibre);
-  if (!cli) { toast("Para vender al crédito elige un cliente o escribe su nombre", "off"); return false; }
+  if (!cli) { if (!sel.value && !posClienteLibre) toast("Para vender al crédito elige un cliente o escribe su nombre", "off"); return false; }   // cancelado: el carrito y el nombre quedan
 
   try {
     const { id, credito } = await cobrarAlCredito({
@@ -5909,7 +6912,7 @@ async function cobrarCreditoPOS() {
       ? `Crédito #${id} registrado — abonó ${money(abono)}, queda debiendo ${money(credito.saldo)}`
       : `Crédito #${id} registrado — queda debiendo ${money(credito.saldo)}`);
     posCarrito = [];
-    posClienteLibre = "";
+    posClienteLibre = ""; document.getElementById("posClienteNombre").value = ""; pintarAgregarClientePOS();
     document.getElementById("posAbonoInicial").value = "";
     renderPOS();
     renderDashboard();
@@ -5954,7 +6957,7 @@ async function cobrarVentaPOS(metodoPago, efectivoRecibido) {
     imprimirTicketPOS(id, venta, abrirVentanaImpresion());
     toast(`Venta #${id} registrada por ${money(total)}`);
     posCarrito = [];
-    posClienteLibre = "";
+    posClienteLibre = ""; document.getElementById("posClienteNombre").value = ""; pintarAgregarClientePOS();
     document.getElementById("posEfectivoRecibido").value = "";
     renderPOS();
     renderDashboard();
@@ -5987,7 +6990,7 @@ document.getElementById("btnEnviarTicket").addEventListener("click", () => {
 });
 
 function llenarTicketPOS(ventaId, venta) {
-  document.getElementById("ticketFecha").textContent = new Date(venta.fechaISO).toLocaleString("es-HN");
+  document.getElementById("ticketFecha").textContent = FechaNegocio.fechaHora(venta.fechaISO);
   const clienteRow = document.getElementById("ticketClienteRow");
   if (venta.clienteNombre) {
     document.getElementById("ticketCliente").textContent = venta.clienteNombre;
@@ -6064,10 +7067,12 @@ function motivoNoBorrable(m) {
    etapa) — contarla antes de eso inflaría los números. Esto es a propósito
    distinto del criterio de "Ganancias por línea de negocio" (que cuenta por
    estado==="entregado" sin mirar finalizada) — ver informe de Fase 3A. */
-async function calcularProduccion(desde, hasta) {
-  const [ordenesTodas, ventasTodas, creditosTodos] = await Promise.all([DB.getAll("ordenes"), DB.getAll("ventas_rapidas"), DB.getAll("creditos")]);
+async function calcularProduccion(desde, hasta, datos) {
+  const [ordenesTodas, ventasTodas, creditosTodos] = datos   // 3.15 (Bloque 7): la lectura de la pantalla, si se la pasan
+    ? [datos.ordenesTodas, datos.ventasTodas, datos.creditosTodos]
+    : await Promise.all([DB.getAll("ordenes"), DB.getAll("ventas_rapidas"), DB.getAll("creditos")]);
   const ordenes = ordenesTodas.filter(o => !o.anulada), ventas = ventasTodas.filter(v => !v.anulada), creditos = creditosTodos.filter(c => !c.anulado);
-  const enRango = (iso) => { const d = (iso || "").slice(0, 10); return !!d && d >= desde && d <= hasta; };
+  const enRango = (iso) => FechaNegocio.enRango(iso, desde, hasta);   // 3.15: día empresarial de Honduras
   const totalItems = (x) => (x.items || []).reduce((s, it) => s + it.cantidad * it.precio, 0);
   // se agrupa por identidadMecanico(): por uuid cuando lo hay, y si no por
   // nombre. Así dos tocayos con cuenta propia dejan de sumar en la misma fila,
@@ -6111,10 +7116,10 @@ async function calcularProduccion(desde, hasta) {
   };
 }
 
-async function renderRendimiento(desde, hasta) {
-  const r = await calcularProduccion(desde, hasta);
+async function renderRendimiento(desde, hasta, datos) {
+  const r = await calcularProduccion(desde, hasta, datos);
   document.getElementById("rendimientoResumen").innerHTML = `
-    <div class="widget-card tint-red"><span class="eyebrow">Taller</span><span class="big">${money(r.taller)}</span><span class="sub">Órdenes de taller cobradas en el rango</span></div>
+    <div class="widget-card tint-red"><span class="eyebrow">Taller</span><span class="big">${money(r.taller)}</span><span class="sub">Órdenes de taller cerradas en el rango (contado o crédito: es lo facturado, no lo cobrado)</span></div>
     <div class="widget-card tint-amber"><span class="eyebrow">Negocio</span><span class="big">${money(r.negocio)}</span><span class="sub">Ventas rápidas + órdenes marcadas "negocio"</span></div>
     <div class="widget-card tint-green"><span class="eyebrow">Total</span><span class="big">${money(r.total)}</span><span class="sub">Taller + Negocio, sin duplicar</span></div>
   `;
@@ -6134,75 +7139,75 @@ document.querySelectorAll("#finPeriodoRapido [data-periodo]").forEach(btn => {
   btn.addEventListener("click", () => {
     document.querySelectorAll("#finPeriodoRapido [data-periodo]").forEach(b => b.classList.toggle("active", b === btn));
     if (btn.dataset.periodo === "rango") return; // deja los campos Desde/Hasta como estén, para editarlos a mano
-    const hoy = new Date();
-    const desde = new Date(hoy);
-    if (btn.dataset.periodo === "semana") desde.setDate(hoy.getDate() - 6);
-    else if (btn.dataset.periodo === "mes") desde.setDate(1);
-    document.getElementById("finDesde").value = desde.toISOString().slice(0, 10);
-    document.getElementById("finHasta").value = hoy.toISOString().slice(0, 10);
+    // 3.15: días empresariales de Honduras (antes UTC: de noche el «hoy» del filtro ya era mañana)
+    const hoy = FechaNegocio.hoy();
+    let desde = hoy;
+    if (btn.dataset.periodo === "semana") desde = FechaNegocio.sumarDias(hoy, -6);
+    else if (btn.dataset.periodo === "mes") desde = FechaNegocio.inicioMes();
+    document.getElementById("finDesde").value = desde;
+    document.getElementById("finHasta").value = hoy;
     renderFinanzas();
   });
 });
 
+/* 3.15 (Bloque 5): facturado, costo histórico y utilidad bruta vienen del servidor (finanzas_resumen): necesitan las devoluciones
+   renglón por renglón, que el dispositivo no guarda. Devuelve { ok, datos } o { ok:false, motivo } con el porqué en palabras del taller. */
+async function resumenFinancieroNube(desde, hasta) {
+  if (!finanzasNube() || !syncRest) return { ok: false, motivo: "Se calcula en la nube con el costo histórico de cada renglón (no disponible en este modo)." };
+  if (currentUser?.rol !== "admin") return { ok: false, motivo: "Solo el administrador ve la utilidad." };
+  if (!isOnline()) return { ok: false, motivo: "Sin conexión: la utilidad se calcula en la nube. Lo de arriba sí está al día con lo guardado aquí." };
+  const r = await syncRest.rpc("finanzas_resumen", { p_desde: desde, p_hasta: hasta }, { timeout: 15000 });
+  if (r.ok && r.datos && typeof r.datos === "object") return { ok: true, datos: r.datos };
+  return { ok: false, motivo: /finanzas_resumen|PGRST202|404/.test(String(r.codigo || r.mensaje || "")) ? "La nube todavía no tiene el cálculo de utilidad (migración 3.15 pendiente)." : "No se pudo calcular ahora: " + (r.mensaje || "error de la nube") };
+}
+
 async function renderFinanzas() {
-  const movs = await DB.getAll("caja_movimientos");
   const desdeEl = document.getElementById("finDesde");
   const hastaEl = document.getElementById("finHasta");
-  if (!desdeEl.value) {
-    const d = new Date(); d.setDate(d.getDate() - 30);
-    desdeEl.value = d.toISOString().slice(0, 10);
-  }
-  if (!hastaEl.value) hastaEl.value = new Date().toISOString().slice(0, 10);
+  if (!desdeEl.value) desdeEl.value = FechaNegocio.sumarDias(FechaNegocio.hoy(), -30);
+  if (!hastaEl.value) hastaEl.value = FechaNegocio.hoy();
 
   const desde = desdeEl.value, hasta = hastaEl.value, tipoFiltro = document.getElementById("finTipoFiltro").value;
+  /* 3.15 (Bloque 7): el cálculo del servidor sale YA, en paralelo con la lectura local (antes se esperaba después de leer todo), y la
+     pantalla completa (tarjetas, tabla, gráficos, rendimiento) usa UNA sola lectura de cada almacén en vez de 2–3 por render. Mismos
+     cálculos y mismos datos — de hecho más coherentes: todo sale de la misma foto. */
+  const srvP = resumenFinancieroNube(desde, hasta).catch((e) => ({ ok: false, motivo: "No se pudo calcular ahora: " + (e?.message || "error") }));
+  const [movs, creditosTodos, ordenesTodas, ventasTodas, inventario] = await Promise.all([DB.getAll("caja_movimientos"), DB.getAll("creditos"), DB.getAll("ordenes"),
+    DB.getAll("ventas_rapidas"), DB.getAll("inventario")]);
+  const datos = { movs, creditosTodos, ordenesTodas, ventasTodas, inventario };
   const filtrados = movs.filter(m => {
-    const dia = m.fechaISO.slice(0, 10);
-    if (dia < desde || dia > hasta) return false;
+    if (!FechaNegocio.enRango(m.fechaISO, desde, hasta)) return false;
     if (tipoFiltro && m.tipo !== tipoFiltro) return false;
     return true;
   }).sort((a, b) => b.fechaISO.localeCompare(a.fechaISO));
 
-  const ingresos = filtrados.filter(m => m.tipo === "ingreso").reduce((s, m) => s + m.monto, 0);
-  const egresos = filtrados.filter(m => m.tipo === "egreso").reduce((s, m) => s + m.monto, 0);
-
-  /* Costo de lo vendido con el COSTO HISTÓRICO sellado en cada renglón.
-     Antes se leía el costoCompra actual del inventario, así que subirle el precio
-     a un repuesto cambiaba hacia atrás la utilidad de ventas ya cerradas, y
-     borrarlo del inventario la inflaba (costo cero). Ahora manda lo que costaba
-     el día de la venta; solo los registros anteriores a la v6 caen al costo
-     actual, y se avisa de cuántos son. */
-  const ventas = (await DB.getAll("ventas_rapidas")).filter(v => { if (v.anulada) return false; const d = v.fechaISO.slice(0, 10); return d >= desde && d <= hasta; });
-  let costoVentas = 0;
-  let renglonesEstimados = 0;
-  const inv = await DB.getAll("inventario");
-  ventas.forEach(v => v.items.forEach(it => {
-    if (!it.inventarioId) return;
-    costoVentas += costoDelItem(it, inv) * it.cantidad;
-    if (it.costoUnitario === undefined || it.costoEstimado) renglonesEstimados++;
-  }));
-  const costosTotal = egresos + costoVentas;
-  const utilidad = ingresos - costosTotal;
-  const margen = ingresos > 0 ? (utilidad / ingresos) * 100 : 0;
-
-  // saldo pendiente de créditos: es un saldo vivo, no depende del rango de
-  // fechas filtrado — por eso se calcula aparte de "filtrados".
-  const creditos = (await DB.getAll("creditos")).filter(c => !c.anulado);
-  const creditosPendientes = creditos.filter(c => c.estado !== "pagado");
-  const cuentasPorCobrar = creditosPendientes.reduce((s, c) => s + c.saldo, 0);
+  /* 3.15 (Bloque 5): indicadores con UN solo significado cada uno. Antes «Ingresos totales / Costos / Utilidad neta» mezclaban bases:
+     el ingreso era la caja (abonos incluidos), el costo solo el de repuestos del TPV (no el de órdenes ni créditos) más TODOS los egresos
+     (una «Compra de repuestos» se restaba dos veces: al comprar y al vender). Ahora:
+       · EFECTIVO (FinanzasCalc, sin red): cobrado hoy / en el rango, gastos, por cobrar, entregado sin cobrar;
+       · RESULTADO (servidor, finanzas_resumen): facturado, costo HISTÓRICO de repuestos (el sellado en cada renglón, nunca el costo actual)
+         y utilidad bruta. Sin red o sin nube no se inventa: se dice. */
+  const loc = FinanzasCalc.resumenLocal({ movs, creditos: creditosTodos, ordenes: ordenesTodas, desde, hasta, F: FechaNegocio });
+  const creditosPendientes = creditosTodos.filter(c => !c.anulado && c.saldo > 0.001);
+  const srv = await srvP;
+  const rango = desde === hasta ? FechaNegocio.dia(desde, { day: "2-digit", month: "short" }) : `${FechaNegocio.dia(desde, { day: "2-digit", month: "short" })} – ${FechaNegocio.dia(hasta, { day: "2-digit", month: "short" })}`;
+  const tarjetaServidor = (titulo) => `<div class="widget-card" data-fin="sin-servidor"><span class="eyebrow" style="color:var(--text-faint);">${titulo}</span><span class="big">—</span><span class="sub">${esc(srv.motivo)}</span></div>`;
 
   document.getElementById("finanzasResumen").innerHTML = `
-    <div class="widget-card tint-green"><span class="eyebrow">Ingresos totales</span><span class="big">${money(ingresos)}</span><span class="sub">En el rango filtrado</span></div>
-    <div class="widget-card tint-red"><span class="eyebrow">Costos</span><span class="big">${money(costosTotal)}</span><span class="sub">Egresos + costo de repuestos vendidos</span></div>
-    <div class="widget-card ${utilidad >= 0 ? "tint-green" : "tint-red"}"><span class="eyebrow">Utilidad neta</span><span class="big">${money(utilidad)}</span><span class="sub">${renglonesEstimados ? `Ingresos − costos · ${renglonesEstimados} renglón${renglonesEstimados === 1 ? "" : "es"} con costo estimado` : "Ingresos − costos (costo del día de la venta)"}</span></div>
-    <div class="widget-card"><span class="eyebrow" style="color:var(--text-faint);">Margen promedio</span><span class="big">${margen.toFixed(1)}%</span><span class="sub">Utilidad / ingresos</span></div>
-    <button type="button" class="widget-card ${cuentasPorCobrar > 0 ? "tint-amber" : ""}" id="cardCuentasPorCobrar" style="text-align:left; font-family:inherit; cursor:pointer;">
-      <span class="eyebrow">Cuentas por cobrar</span><span class="big">${money(cuentasPorCobrar)}</span><span class="sub">Saldo pendiente en créditos activos</span>
+    <div class="widget-card tint-green" data-fin="cobrado-hoy"><span class="eyebrow">Cobrado hoy</span><span class="big">${money(loc.cobradoHoy)}</span><span class="sub">Dinero que entró en caja hoy (${esc(FechaNegocio.dia(loc.hoy, { day: "2-digit", month: "short" }))}, hora de Honduras)</span></div>
+    <div class="widget-card tint-green" data-fin="cobrado"><span class="eyebrow">Cobrado en el rango</span><span class="big">${money(loc.cobrado)}</span><span class="sub">${esc(rango)} · entró ${money(loc.cobradoBruto)}${loc.devuelto ? ` − devuelto ${money(loc.devuelto)}` : ""}</span></div>
+    <div class="widget-card tint-red" data-fin="gastos"><span class="eyebrow">Gastos en el rango</span><span class="big">${money(loc.gastos)}</span><span class="sub">Egresos de caja (sin apertura/cierre de caja)</span></div>
+    <button type="button" class="widget-card ${loc.porCobrar > 0 ? "tint-amber" : ""}" id="cardCuentasPorCobrar" data-fin="por-cobrar" style="text-align:left; font-family:inherit; cursor:pointer;">
+      <span class="eyebrow">Por cobrar</span><span class="big">${money(loc.porCobrar)}</span><span class="sub">Saldo vivo de ${creditosPendientes.length} crédito${creditosPendientes.length === 1 ? "" : "s"} · no es dinero cobrado</span>
     </button>
-    <button type="button" class="widget-card" id="cardCreditosActivos" style="text-align:left; font-family:inherit; cursor:pointer;">
-      <span class="eyebrow" style="color:var(--text-faint);">Créditos activos</span><span class="big">${creditosPendientes.length}</span><span class="sub">Clientes con saldo pendiente</span>
-    </button>
+    <div class="widget-card ${loc.entregadoSinCobrar > 0 ? "tint-amber" : ""}" data-fin="entregado-sin-cobrar"><span class="eyebrow">Entregado sin cobrar</span><span class="big">${money(loc.entregadoSinCobrar)}</span><span class="sub">${loc.ordenesEntregadasSinCobrar} orden${loc.ordenesEntregadasSinCobrar === 1 ? "" : "es"} entregada${loc.ordenesEntregadasSinCobrar === 1 ? "" : "s"} sin cobro ni crédito</span></div>
+    ${srv.ok ? `
+    <div class="widget-card" data-fin="facturado"><span class="eyebrow" style="color:var(--text-faint);">Facturado en el rango</span><span class="big">${money(srv.datos.facturado)}</span><span class="sub">TPV + órdenes cerradas + créditos, sin anuladas ni devoluciones</span></div>
+    <div class="widget-card tint-red" data-fin="costo-repuestos"><span class="eyebrow">Costo de repuestos</span><span class="big">${money(srv.datos.costo_repuestos)}</span><span class="sub">Costo HISTÓRICO sellado en cada renglón (no el costo actual del inventario)</span></div>
+    <div class="widget-card ${srv.datos.utilidad_bruta >= 0 ? "tint-green" : "tint-red"}" data-fin="utilidad-bruta"><span class="eyebrow">Utilidad bruta</span><span class="big">${money(srv.datos.utilidad_bruta)}</span><span class="sub">Facturado − costo de repuestos${srv.datos.margen_bruto_pct != null ? ` · margen ${Number(srv.datos.margen_bruto_pct).toFixed(1)}%` : ""} · la mano de obra no tiene costo registrado${srv.datos.renglones_sin_costo ? ` · ${srv.datos.renglones_sin_costo} renglón${srv.datos.renglones_sin_costo === 1 ? "" : "es"} sin costo conocido` : ""}</span></div>`
+    : `${tarjetaServidor("Facturado en el rango")}${tarjetaServidor("Costo de repuestos")}${tarjetaServidor("Utilidad bruta")}`}
   `;
-  ["cardCuentasPorCobrar", "cardCreditosActivos"].forEach(id => {
+  ["cardCuentasPorCobrar"].forEach(id => {
     document.getElementById(id).addEventListener("click", () => {
       showView("creditos");
       document.querySelectorAll(".nav-item[data-view]").forEach(b => b.classList.toggle("active", b.dataset.view === "creditos"));
@@ -6215,11 +7220,12 @@ async function renderFinanzas() {
   // SYNC-7B: qué movimientos ya tienen su compensación, y las ventas (para anular/devolver desde su línea de caja)
   const revertidos = new Set(movs.map(m => m.reversoDe).filter(Boolean));
   const ventasPorId = {};
-  if (finanzasNube()) (await DB.getAll("ventas_rapidas")).forEach(v => { ventasPorId[v.id] = v; });
+  if (finanzasNube()) ventasTodas.forEach(v => { ventasPorId[v.id] = v; });
   const metodoLabel = { efectivo: "Efectivo", transferencia: "Transferencia", tarjeta: "Tarjeta" };
-  body.innerHTML = filtrados.map(m => `
+  // 3.15 (Bloque 7): por tramos (ver verMasLista)
+  body.innerHTML = filtrados.slice(0, limiteLista("movimientos")).map(m => `
     <tr>
-      <td>${new Date(m.fechaISO).toLocaleDateString("es-HN")}</td>
+      <td>${FechaNegocio.fecha(m.fechaISO)}</td>
       <td><span class="pill ${m.tipo === "ingreso" ? "entregado" : "reparacion"}">${m.tipo === "ingreso" ? "Ingreso" : "Egreso"}</span></td>
       <td>${esc(m.categoria)}</td>
       <td>${esc(metodoLabel[m.metodoPago] || "—")}</td>
@@ -6228,7 +7234,8 @@ async function renderFinanzas() {
       <td class="num">${finanzasNube() ? accionesCajaNube(m, revertidos, ventasPorId) : movimientoEsBorrable(m)
         ? `<button type="button" class="btn ghost small danger" data-eliminar-movi="${m.id}" title="Eliminar" aria-label="Eliminar movimiento">🗑</button>`
         : `<span class="mov-ligado" title="${esc(motivoNoBorrable(m))}">🔒</span>`}</td>
-    </tr>`).join("");
+    </tr>`).join("") + verMasLista("movimientos", filtrados.length, { columnas: 7 });
+  conectarVerMas(body, "movimientos", renderFinanzas);
   if (finanzasNube()) conectarAccionesCajaNube(body, ventasPorId);
   body.querySelectorAll("[data-eliminar-movi]").forEach(btn => {
     btn.addEventListener("click", () => {
@@ -6252,8 +7259,8 @@ async function renderFinanzas() {
     });
   });
 
-  await renderFinanzasCharts();
-  await renderRendimiento(desde, hasta);
+  await renderFinanzasCharts(datos);
+  await renderRendimiento(desde, hasta, datos);
 }
 
 /* SYNC-7B · caja en modo nube: nada se borra. Un movimiento manual se REVIERTE (reversar_caja); el de una venta se
@@ -6341,15 +7348,16 @@ alHacerClicUnaVez(document.getElementById("btnGuardarMovimiento"), async () => {
 
 document.getElementById("btnImprimirCierre").addEventListener("click", async () => {
   const ventana = abrirVentanaImpresion(); // sincrónico, antes del await de abajo
-  const hoyStr = new Date().toISOString().slice(0, 10);
-  const movsHoy = (await DB.getAll("caja_movimientos")).filter(m => m.fechaISO.slice(0, 10) === hoyStr).sort((a, b) => a.fechaISO.localeCompare(b.fechaISO));
+  // 3.15: la caja del DÍA EMPRESARIAL de Honduras (antes UTC: desde las 18:00 el cierre imprimía el día siguiente, vacío)
+  const hoyStr = FechaNegocio.hoy();
+  const movsHoy = (await DB.getAll("caja_movimientos")).filter(m => FechaNegocio.diaDe(m.fechaISO) === hoyStr).sort((a, b) => a.fechaISO.localeCompare(b.fechaISO));
 
   if (!movsHoy.length) { ventana?.close(); toast("No hay movimientos registrados hoy todavía", "off"); return; }
 
-  document.getElementById("cierreFecha").textContent = new Date().toLocaleDateString("es-HN", { day: "2-digit", month: "long", year: "numeric" });
+  document.getElementById("cierreFecha").textContent = FechaNegocio.dia(hoyStr, { day: "2-digit", month: "long", year: "numeric" });
   document.getElementById("cierreItems").innerHTML = movsHoy.map(m => `
     <tr>
-      <td>${new Date(m.fechaISO).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</td>
+      <td>${FechaNegocio.hora(m.fechaISO)}</td>
       <td>${m.tipo === "ingreso" ? "Ingreso" : "Egreso"}</td>
       <td>${esc(m.categoria)}</td>
       <td class="num">${money(m.monto)}</td>
@@ -6432,7 +7440,7 @@ async function renderCreditos() {
 
   document.getElementById("creditosResumen").innerHTML = `
     <div class="widget-card ${cuentasPorCobrar > 0 ? "tint-amber" : ""}"><span class="eyebrow">Cuentas por cobrar</span><span class="big">${money(cuentasPorCobrar)}</span><span class="sub">${pendientes.length} crédito${pendientes.length === 1 ? "" : "s"} pendiente${pendientes.length === 1 ? "" : "s"}</span></div>
-    <div class="widget-card tint-green"><span class="eyebrow">Cobrado este mes</span><span class="big">${money(cobradoMes)}</span><span class="sub">Abonos recibidos en ${esc(hoyMes.toLocaleDateString("es-HN", { month: "long" }))}</span></div>
+    <div class="widget-card tint-green"><span class="eyebrow">Cobrado este mes</span><span class="big">${money(cobradoMes)}</span><span class="sub">Abonos recibidos en ${esc(FechaNegocio.fecha(hoyMes, { month: "long" }))}</span></div>
     <div class="widget-card"><span class="eyebrow" style="color:var(--text-faint);">Créditos totales</span><span class="big">${creditos.length}</span><span class="sub">Histórico</span></div>
   `;
 
@@ -6451,17 +7459,19 @@ async function renderCreditos() {
   document.getElementById("creditosEmpty").style.display = filtrados.length ? "none" : "block";
   // una fila por cliente, no por factura: al tocarla se abre su historial
   // completo con cada factura por separado y sus propios botones.
-  body.innerHTML = filtrados.map(g => `
+  // 3.15 (Bloque 7): por tramos (ver verMasLista)
+  body.innerHTML = filtrados.slice(0, limiteLista("creditos")).map(g => `
     <tr class="credito-row" data-clave="${esc(g.clave)}" style="cursor:pointer;">
       <td>${esc(g.nombre)}</td>
       <td class="num">${g.creditos.length}</td>
-      <td>${new Date(g.ultimaFecha).toLocaleDateString("es-HN")}</td>
+      <td>${FechaNegocio.fecha(g.ultimaFecha)}</td>
       <td class="num">${money(g.total)}</td>
       <td class="num">${money(g.abonado)}</td>
       <td class="num">${money(g.saldo)}</td>
       <td><span class="pill ${g.estado}">${estadoLabel[g.estado]}</span></td>
       <td class="num" style="color:var(--text-faint);">›</td>
-    </tr>`).join("");
+    </tr>`).join("") + verMasLista("creditos", filtrados.length, { columnas: 8 });
+  conectarVerMas(body, "creditos", renderCreditos);
 
   body.querySelectorAll(".credito-row").forEach(tr => {
     tr.addEventListener("click", () => abrirCreditoDetalle(tr.dataset.clave));
@@ -6485,7 +7495,7 @@ document.getElementById("creditosFiltro").querySelectorAll(".cat-chip").forEach(
 function llenarFacturaCredito(cred) {
   if (!cred) return null;
   document.getElementById("credFacId").textContent = cred.id;
-  document.getElementById("credFacFecha").textContent = new Date(cred.fechaISO).toLocaleDateString("es-HN");
+  document.getElementById("credFacFecha").textContent = FechaNegocio.fecha(cred.fechaISO);
   document.getElementById("credFacCliente").textContent = cred.clienteNombre || "Cliente de mostrador";
   document.getElementById("credFacTelefono").textContent = cred.clienteTelefono ? ` — ${cred.clienteTelefono}` : "";
   document.getElementById("credFacItems").innerHTML = cred.items.map(it => `
@@ -6534,7 +7544,7 @@ function abrirCreditoDetalle(clave) {
   document.getElementById("credDetLista").innerHTML = g.creditos.map(c => `
     <div class="cred-factura" data-id="${c.id}">
       <div class="cred-factura-head">
-        <div><span class="quien">Crédito #${c.id}</span> <span class="cuando">${new Date(c.fechaISO).toLocaleDateString("es-HN")}</span></div>
+        <div><span class="quien">Crédito #${c.id}</span> <span class="cuando">${FechaNegocio.fecha(c.fechaISO)}</span></div>
         <span class="pill ${c.estado}">${estadoLabelDetalle[c.estado]}</span>
       </div>
       <div class="table-scroll">
@@ -6558,7 +7568,7 @@ function abrirCreditoDetalle(clave) {
         ${(finanzasNube() ? true : c.abonado === 0) ? `<button type="button" class="btn ghost small danger" data-act="eliminar" title="${finanzasNube() ? "Anular crédito" : "Eliminar"}">🗑</button>` : ""}
       </div>
       ${finanzasNube() && (c.historialAbonos || []).length ? `<div class="hint" style="margin-top:0.4rem;">Abonos: ${(c.historialAbonos || []).map((a, i) =>
-        `${money(a.monto)} (${new Date(a.fechaISO).toLocaleDateString("es-HN")}) ${a.uid ? `<button type="button" class="btn ghost small" data-act="revertir-abono" data-abono="${i}" title="Revertir abono">↩</button>` : "<em>pendiente</em>"}`).join(" · ")}</div>` : ""}
+        `${money(a.monto)} (${FechaNegocio.fecha(a.fechaISO)}) ${a.uid ? `<button type="button" class="btn ghost small" data-act="revertir-abono" data-abono="${i}" title="Revertir abono">↩</button>` : "<em>pendiente</em>"}`).join(" · ")}</div>` : ""}
     </div>
   `).join("");
 
@@ -6630,7 +7640,7 @@ document.getElementById("btnDetRecordar").addEventListener("click", () => {
   const g = creditosPorCliente[creditoDetalleClave];
   const pendientes = g.creditos.filter(c => c.saldo > 0.01);
   const detalle = pendientes
-    .map(c => `• Crédito #${c.id} del ${new Date(c.fechaISO).toLocaleDateString("es-HN")}: ${money(c.saldo)}`)
+    .map(c => `• Crédito #${c.id} del ${FechaNegocio.fecha(c.fechaISO)}: ${money(c.saldo)}`)
     .join("\n");
   const texto = pendientes.length === 1
     ? `Hola ${g.nombre}, te recordamos que tienes un saldo pendiente de ${money(g.saldo)} con ENTIMOTORS por el crédito #${pendientes[0].id}. ¡Gracias!`
@@ -6642,12 +7652,12 @@ document.getElementById("btnDetRecordar").addEventListener("click", () => {
 function llenarEstadoCuenta() {
   const g = creditosPorCliente[creditoDetalleClave];
   if (!g) return null;
-  document.getElementById("edcFecha").textContent = new Date().toLocaleDateString("es-HN");
+  document.getElementById("edcFecha").textContent = FechaNegocio.fecha(Date.now());
   document.getElementById("edcCliente").textContent = g.nombre;
   document.getElementById("edcTelefono").textContent = g.telefono ? ` — ${g.telefono}` : "";
   document.getElementById("edcFacturas").innerHTML = g.creditos.map(c => `
     <div class="edc-factura">
-      <div class="edc-factura-head">Crédito #${c.id} — ${new Date(c.fechaISO).toLocaleDateString("es-HN")}</div>
+      <div class="edc-factura-head">Crédito #${c.id} — ${FechaNegocio.fecha(c.fechaISO)}</div>
       <table>
         <thead><tr><th>Ítem</th><th class="num">Cant.</th><th class="num">Precio</th><th class="num">Subtotal</th></tr></thead>
         <tbody>${c.items.map(it => `
@@ -6795,7 +7805,12 @@ document.getElementById("btnAgregarItemCredito").addEventListener("click", () =>
   renderCreditoCarrito();
 });
 
+/* 3.15 (Checkpoint 8A): con la red lenta, registrar un crédito puede tardar; antes no se veía nada y «Nuevo crédito» vaciaba el formulario
+   mientras el anterior aún se enviaba (la persona lo veía «en cero» y al repetir chocaba con el duplicado). Ahora hay aviso inmediato y
+   el formulario en curso no se borra. */
+let creditoGuardando = false;
 document.getElementById("btnNuevoCredito").addEventListener("click", async () => {
+  if (creditoGuardando) { document.getElementById("modalCredito").classList.add("active"); toast("Se está registrando el crédito anterior: espera a que termine", "off"); return; }
   creditoClienteSel = null;
   creditoCarrito = [];
   document.getElementById("creditoBuscarCliente").value = "";
@@ -6823,15 +7838,25 @@ alHacerClicUnaVez(document.getElementById("btnGuardarCredito"), async () => {
     const nombre = document.getElementById("creditoNombre").value.trim();
     const telefono = document.getElementById("creditoTelefono").value.trim();
     if (!nombre) { toast("Falta el nombre del cliente", "off"); return; }
-    if (!(await checkDuplicateBeforeCreate(nombre, telefono))) return;
-    clienteId = await DB.save("clientes", { nombre, telefono });
-    markDirty();
-    clienteNombre = nombre;
-    clienteTelefono = telefono;
+    /* 3.15 (Checkpoint 8A): antes, sin teléfono se creaba en silencio otro cliente igual (un reintento = un duplicado), y con teléfono
+       «Cancelar» no elegía el existente. Ahora la persona elige: usar el existente, crear uno nuevo (explícito) o cancelar (el
+       formulario queda tal cual). Nunca se une por el nombre solo. */
+    const d = await decidirCliente({ nombre, telefono });
+    if (d.accion === "cancelar") return;
+    if (d.accion === "existente") {
+      clienteId = d.cliente.id; clienteNombre = d.cliente.nombre; clienteTelefono = d.cliente.telefono || telefono;
+    } else {
+      clienteId = await DB.save("clientes", { nombre, telefono });
+      markDirty();
+      clienteNombre = nombre;
+      clienteTelefono = telefono;
+    }
   }
 
+  const btnGuardar = document.getElementById("btnGuardarCredito"), textoGuardar = btnGuardar.textContent;
+  creditoGuardando = true; btnGuardar.textContent = "Registrando…"; toast("Registrando el crédito…"); estadoRegistro("registrando");
   try {
-    await registrarCredito({
+    const res = await registrarCredito({
       clienteId, clienteNombre, clienteTelefono,
       items: creditoCarrito.map(it => ({ inventarioId: it.inventarioId, nombre: it.nombre, cantidad: it.cantidad, precio: it.precio })),
       vencimiento: document.getElementById("creditoVencimiento").value || null,
@@ -6840,73 +7865,32 @@ alHacerClicUnaVez(document.getElementById("btnGuardarCredito"), async () => {
     markDirty();
     document.getElementById("modalCredito").classList.remove("active");
     creditoCarrito = [];
-    toast("Crédito registrado — toca 🖨️ en la lista para ver o imprimir la factura");
+    // 3.15 (Bloque 8): «registrado» SOLO con la confirmación del servidor; si quedó en cola (sin red / sin respuesta) se dice eso
+    if (finanzasNube() && res?.estado !== "ok") { estadoRegistro("en-cola"); toast("Crédito guardado en este dispositivo: se confirmará con la nube al volver la conexión. Lo verás marcado como pendiente.", "off"); }
+    else toast("Crédito registrado — toca 🖨️ en la lista para ver o imprimir la factura");
     renderCreditos();
   } catch (err) {
     toast("No se pudo registrar el crédito: " + err.message, "off");
-  }
+  } finally { creditoGuardando = false; btnGuardar.textContent = textoGuardar; }
 });
 
-/* ================= GESTOR DE LA WEB (CMS local) ================= */
-async function renderWebCMS() {
-  const [hero, promos, servicios, citasAll, clientes] = await Promise.all([
-    DB.get("web_cms", "landing_hero"), DB.get("web_cms", "promociones"), DB.get("web_cms", "servicios_catalogo"),
-    DB.getAll("citas"), DB.getAll("clientes"),
-  ]);
-  document.getElementById("cmsHeroTitulo").value = hero?.titulo || "";
-  document.getElementById("cmsHeroSubtitulo").value = hero?.subtitulo || "";
-  document.getElementById("cmsPromos").value = (promos?.items || []).join("\n");
-  document.getElementById("cmsServicios").value = (servicios?.items || []).join("\n");
-
-  const citasWeb = citasAll.filter(c => c.origen === "web");
-  const list = document.getElementById("citasWebList");
-  if (!citasWeb.length) {
-    list.innerHTML = `<div class="empty">No hay citas agendadas desde la página web todavía.</div>`;
-  } else {
-    citasWeb.sort((a, b) => `${a.fecha}${a.hora}`.localeCompare(`${b.fecha}${b.hora}`));
-    list.innerHTML = citasWeb.map(c => {
-      const cliente = clientes.find(cl => cl.id === c.clienteId);
-      const nombre = c.nombreTmp || cliente?.nombre || "Cliente web";
-      const telefono = c.telefonoTmp || cliente?.telefono || "";
-      const { label, dt } = citaWhenInfo(c);
-      return `
-        <div class="cms-row">
-          <div class="who">
-            <b>${esc(nombre)}</b> · ${label}, ${dt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
-            <div class="hint" style="margin:0;">${esc(c.motivo || "Sin motivo especificado")}</div>
-          </div>
-          ${c.confirmada ? `<span class="mant-badge ok">Confirmada</span>` : `<button class="btn wa small" data-confirmar="${c.id}" data-tel="${esc(telefono)}" data-nombre="${esc(nombre)}">Confirmar por WhatsApp</button>`}
-        </div>`;
-    }).join("");
-    list.querySelectorAll("[data-confirmar]").forEach(btn => {
-      btn.addEventListener("click", async () => {
-        const ventanaWA = abrirVentanaWA();
-        const c = await DB.get("citas", Number(btn.dataset.confirmar));
-        const { label, dt } = citaWhenInfo(c);
-        const texto = `Hola ${btn.dataset.nombre}, confirmamos tu cita en ENTIMOTORS el ${label === "Hoy" || label === "Mañana" ? label.toLowerCase() : dt.toLocaleDateString()} a las ${dt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}. ¡Te esperamos!`;
-        const sent = navegarWA(ventanaWA, btn.dataset.tel, texto);
-        if (!sent) return;
-        await DB.save("citas", { ...c, confirmada: true });
-        markDirty();
-        renderWebCMS();
-      });
-    });
-  }
-  updateCitasWebBadge(citasWeb.filter(c => !c.confirmada).length);
+/* ================= GESTOR WEB (panel REAL del sitio) =================
+   3.15 (Bloque 6): el «Gestor de la web» local era un CMS falso (guardaba en este dispositivo y nunca publicaba nada en entimotors.com).
+   El Gestor Web real es el panel del sitio (ENTIMOTORS_SUPABASE.gestorWebUrl, con su propio inicio de sesión en el servidor). Aquí solo se
+   abre, en otra pestaña y sin pasarle nada (ni sesión, ni tokens, ni credenciales). Solo el administrador lo ve (permiso «web-cms»:
+   puedeVerVista + rol admin). La URL vive en UN solo lugar: ENTIMOTORS_SUPABASE.gestorWebUrl (supabase-config.js).
+   El almacén web_cms se conserva (respaldos e importador 3.13), solo deja de mostrarse. */
+function urlGestorWeb() {
+  const u = String(window.ENTIMOTORS_SUPABASE?.gestorWebUrl || "");
+  return /^https:\/\/[a-z0-9.-]+\/[^\s]*$/i.test(u) ? u : null;
 }
-
-function updateCitasWebBadge(n) {
-  const b = document.getElementById("citasWebBadge");
-  if (n > 0) { b.style.display = "inline-block"; b.textContent = n; } else { b.style.display = "none"; }
+function abrirGestorWeb() {
+  if (!puedeVerVista("web-cms") || currentUser?.rol !== "admin") { toast("No tienes acceso a esa sección", "off"); return false; }
+  const u = urlGestorWeb();
+  if (!u) { toast("Falta configurar la dirección del Gestor Web", "off"); return false; }
+  window.open(u, "_blank", "noopener,noreferrer");
+  return true;
 }
-
-document.getElementById("btnGuardarCMS").addEventListener("click", async () => {
-  await DB.save("web_cms", { key: "landing_hero", titulo: document.getElementById("cmsHeroTitulo").value.trim(), subtitulo: document.getElementById("cmsHeroSubtitulo").value.trim() });
-  await DB.save("web_cms", { key: "promociones", items: document.getElementById("cmsPromos").value.split("\n").map(s => s.trim()).filter(Boolean) });
-  await DB.save("web_cms", { key: "servicios_catalogo", items: document.getElementById("cmsServicios").value.split("\n").map(s => s.trim()).filter(Boolean) });
-  markDirty();
-  toast("Contenido guardado (local — publicarlo en entimotors.com real requiere el backend del sitio)");
-});
 
 /* ================= AJUSTES: respaldo, restauración, reset, permisos ================= */
 function aplicarPermisosPorRol() {
@@ -6937,12 +7921,14 @@ function aplicarPermisosPorRol() {
 }
 
 async function renderAjustes() {
-  const modo = localStorage.getItem("enti_modo_datos") === "demo" ? "con datos de ejemplo" : "en blanco";
-  const conteos = await Promise.all(ALL_STORES.map(s => DB.getAll(s).then(r => r.length)));
+  // 3.15 (Bloque 6): en el producto (nube) no existe «arrancó con datos de ejemplo»: se dice de dónde vienen los datos
+  const modo = demoProhibido() ? "Datos del taller en la nube"
+    : localStorage.getItem("enti_modo_datos") === "demo" ? "Este dispositivo arrancó con datos de ejemplo (desarrollo)" : "Este dispositivo arrancó en blanco";
+  const conteos = await Promise.all(ALL_STORES.map(s => DB.count(s)));   // 3.15 (Bloque 7): antes leía TODO cada almacén solo para contarlo
   const totalRegistros = conteos.reduce((a, b) => a + b, 0);
   document.getElementById("ajustesInfo").innerHTML = `
     Usuario: <b>${esc(currentUser?.nombre || "—")}</b> (${esc(NOMBRE_ROL[currentUser?.rol] || currentUser?.rol || "—")})<br>
-    Este dispositivo arrancó ${modo} · ${totalRegistros} registros guardados en total.
+    ${modo} · ${totalRegistros} registros guardados en este dispositivo.
   `;
 
   // Lee la versión directo del nombre de la caché activa (la pone sw.js al
@@ -7085,7 +8071,7 @@ async function tokenSesionActual() {
   if (!window.SupabaseCliente) return null;
   let s = SupabaseCliente.sesion();
   if (!s) {
-    try { await SupabaseCliente.refrescarSesion(); } catch (e) { /* sin sesión */ }
+    try { await renovarSesionNube(); } catch (e) { /* sin sesión */ }
     s = SupabaseCliente.sesion();
   }
   return s && typeof s.access_token === "string" && s.access_token ? s.access_token : null;
@@ -7164,6 +8150,7 @@ function prepararSeguridad() {
   if (!card) return;
   const visible = !!currentUser && currentUser.rol === "admin" && puedeVerVista("ajustes");
   card.style.display = visible ? "" : "none";
+  prepararPinPropietario();   // 3.15 (Bloque 4): tarjeta propia, mismas reglas de visibilidad
   if (!visible) { limpiarFormClave(); pintarEstadoClave(null, ""); return; }
   const conCuenta = currentUser.origen === "supabase";
   document.getElementById("claveSinCuenta").style.display = conCuenta ? "none" : "";
@@ -7171,6 +8158,111 @@ function prepararSeguridad() {
 }
 
 document.getElementById("formClaveAdmin")?.addEventListener("submit", (e) => { e.preventDefault(); enviarCambioClave(); });
+
+/* ================= 3.15 · BLOQUE 4 · PIN DEL PROPIETARIO (Ajustes → Seguridad) =================
+   Configurar (no hay PIN), cambiar (con el PIN actual), recuperar («olvidé»: con la contraseña de la cuenta) y desbloquear (tras
+   demasiados intentos: con la contraseña). El servidor es la autoridad: hash scrypt+pepper, límites de intentos y auditoría. El PIN solo
+   vive en los campos mientras se escribe: tras cada envío se vacían; nunca entra en almacenamiento, logs, URLs ni mensajes.
+   Sin PIN configurado: lo normal funciona; lo destructivo queda bloqueado hasta configurarlo (no hay PIN por defecto). */
+const CAMPOS_PIN_PROP = ["pinPropActual", "pinPropClave", "pinPropNuevo", "pinPropConfirmar"];
+let pinPropModo = "cambiar", pinPropEstadoSrv = null, pinPropEnviando = false;
+const MENSAJES_PIN_PROP = {
+  PIN_INVALIDO: "El PIN son exactamente 6 dígitos.", PIN_DEBIL: "Ese PIN es demasiado fácil de adivinar (repetido, en escalera o muy común). Elige otro.",
+  PIN_NO_COINCIDE: "La confirmación no coincide con el PIN nuevo.", PIN_INCORRECTO: "El PIN actual no es correcto.",
+  CLAVE_INCORRECTA: "La contraseña de la cuenta no es correcta.", REAUTENTICACION_REQUERIDA: "Confirma con tu PIN actual o con la contraseña de tu cuenta.",
+  CLAVE_BLOQUEADA: "Demasiados intentos con la contraseña. Espera unos minutos.", BLOQUEADO_SOLICITANTE: "Demasiados intentos. Espera unos minutos.",
+  BLOQUEADO_GLOBAL: "Demasiados intentos. Espera unos minutos.", BLOQUEADO_ADMIN: "El PIN está bloqueado por demasiados intentos. Desbloquéalo con la contraseña de tu cuenta.",
+  PIN_NO_CONFIGURADO_EN_SERVIDOR: "El servidor todavía no tiene activadas las autorizaciones con PIN.", SIN_SESION: "Inicia sesión de nuevo.",
+  SESION_INVALIDA: "Inicia sesión de nuevo.", SOLO_ADMIN: "Solo el administrador.",
+};
+function limpiarFormPinProp() { CAMPOS_PIN_PROP.forEach((id) => { const el = document.getElementById(id); if (el) el.value = ""; }); }
+function pintarPinProp(tipo, texto) { const el = document.getElementById("pinPropMsg"); if (el) { el.textContent = texto || ""; el.dataset.tipo = tipo || ""; } }
+function pinPropBase() { return ((window.ENTIMOTORS_SUPABASE || {}).apiUrl || "").replace(/\/+$/, ""); }
+async function pinPropLlamar(metodo, ruta, cuerpo) {
+  const base = pinPropBase(), token = await tokenSesionActual();
+  if (!base) return { status: 0, datos: { codigo: "PIN_NO_CONFIGURADO_EN_SERVIDOR" } };
+  if (!token) return { status: 401, datos: { codigo: "SIN_SESION" } };
+  const ctl = typeof AbortController === "function" ? new AbortController() : null;
+  const t = ctl ? setTimeout(() => ctl.abort(), 20000) : null;
+  try {
+    const res = await fetch(base + ruta, { method: metodo, headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+      body: cuerpo ? JSON.stringify(cuerpo) : undefined, cache: "no-store", credentials: "omit", signal: ctl ? ctl.signal : undefined });
+    const txt = await res.text(); let datos = null; try { datos = txt ? JSON.parse(txt) : null; } catch (e) { datos = null; }
+    return { status: res.status, datos };
+  } finally { if (t) clearTimeout(t); }
+}
+function pintarModoPinProp() {
+  const e = pinPropEstadoSrv || {};
+  const modo = e.bloqueado ? "desbloquear" : !e.configurado ? "configurar" : pinPropModo;
+  const ver = (id, v) => { const el = document.getElementById(id); if (el) el.style.display = v ? "" : "none"; };
+  ver("filaPinActual", modo === "cambiar"); ver("filaPinClaveCuenta", modo !== "cambiar");
+  ver("filaPinNuevo", modo !== "desbloquear"); ver("filaPinConfirmar", modo !== "desbloquear");
+  ver("btnPinPropOlvide", modo === "cambiar"); ver("btnPinPropCambiar", modo === "recuperar");
+  const btn = document.getElementById("btnPinPropGuardar");
+  if (btn) btn.textContent = modo === "configurar" ? "Configurar PIN" : modo === "desbloquear" ? "Desbloquear" : modo === "recuperar" ? "Reemplazar PIN" : "Cambiar PIN";
+  const est = document.getElementById("pinPropEstado");
+  if (est) est.textContent = e.error ? e.error : e.bloqueado ? "Bloqueado por demasiados intentos: las acciones destructivas no se pueden autorizar hasta desbloquearlo."
+    : !e.configurado ? "Todavía NO hay PIN del propietario: las acciones destructivas están bloqueadas hasta configurarlo."
+    : `Configurado${e.actualizado_en ? " · último cambio " + FechaNegocio.fechaHora(e.actualizado_en) : ""}.`;
+  return modo;
+}
+async function prepararPinPropietario() {
+  const form = document.getElementById("formPinPropietario");
+  if (!form) return;
+  const card = document.getElementById("cardPinPropietario");
+  const visible = !!currentUser && currentUser.rol === "admin" && puedeVerVista("ajustes");
+  if (card) card.style.display = visible ? "" : "none";
+  if (!visible) { limpiarFormPinProp(); return; }
+  const conCuenta = currentUser?.rol === "admin" && currentUser?.origen === "supabase";
+  form.style.display = conCuenta ? "" : "none";
+  limpiarFormPinProp(); pintarPinProp(null, "");
+  if (!conCuenta) { const est = document.getElementById("pinPropEstado"); if (est) est.textContent = "Disponible cuando inicias sesión con tu cuenta de administrador."; return; }
+  if (!isOnline()) { pinPropEstadoSrv = { error: "Sin conexión: el estado del PIN se consulta al servidor." }; pintarModoPinProp(); return; }
+  try {
+    const r = await pinPropLlamar("GET", "/api/admin/pin/estado");
+    pinPropEstadoSrv = r.status === 200 && r.datos ? r.datos : { error: MENSAJES_PIN_PROP[r.datos?.codigo] || "No se pudo consultar el PIN." };
+  } catch (e) { pinPropEstadoSrv = { error: "No se pudo consultar el PIN (sin respuesta del servidor)." }; }
+  pinPropModo = "cambiar";
+  pintarModoPinProp();
+}
+async function enviarPinPropietario() {
+  if (pinPropEnviando) return;
+  const modo = pintarModoPinProp();
+  const v = (id) => (document.getElementById(id)?.value || "");
+  const actual = v("pinPropActual"), clave = v("pinPropClave"), nuevo = v("pinPropNuevo"), conf = v("pinPropConfirmar");
+  if (!isOnline()) { limpiarFormPinProp(); pintarPinProp("aviso", "Sin conexión: el PIN solo se cambia en línea. No se hizo nada."); return; }
+  if (modo !== "desbloquear") {
+    if (!/^[0-9]{6}$/.test(nuevo)) { pintarPinProp("error", MENSAJES_PIN_PROP.PIN_INVALIDO); return; }
+    if (nuevo !== conf) { limpiarFormPinProp(); pintarPinProp("error", MENSAJES_PIN_PROP.PIN_NO_COINCIDE); return; }
+  }
+  if (modo === "cambiar" && !/^[0-9]{6}$/.test(actual)) { pintarPinProp("error", "Escribe tu PIN actual (o usa «Olvidé el PIN»)."); return; }
+  if (modo !== "cambiar" && !clave) { pintarPinProp("error", "Escribe la contraseña de tu cuenta."); return; }
+  const cuerpo = modo === "desbloquear" ? { clave_cuenta: clave }
+    : modo === "cambiar" ? { pin_actual: actual, pin_nuevo: nuevo, pin_confirmacion: conf } : { clave_cuenta: clave, pin_nuevo: nuevo, pin_confirmacion: conf };
+  limpiarFormPinProp();   // el PIN y la contraseña ya solo viven en `cuerpo`, que muere con esta función
+  pinPropEnviando = true; pintarPinProp("aviso", "Guardando…");
+  let r;
+  try { r = await pinPropLlamar(modo === "desbloquear" ? "POST" : "PUT", modo === "desbloquear" ? "/api/admin/pin/desbloquear" : "/api/admin/pin", cuerpo); }
+  catch (e) { r = { status: 0, datos: null }; }
+  finally { pinPropEnviando = false; }
+  if (r.status === 200) {
+    pintarPinProp("ok", modo === "desbloquear" ? "Desbloqueado. Los intentos vuelven a cero."
+      : modo === "configurar" ? "PIN del propietario configurado. Ya se pueden autorizar las acciones destructivas."
+      : "PIN reemplazado. El anterior ya no sirve y las autorizaciones pendientes quedaron anuladas.");
+    await prepararPinPropietario();
+    pintarPinProp("ok", document.getElementById("pinPropMsg")?.textContent || "Listo.");
+    return;
+  }
+  const c = r.datos?.codigo;
+  const seg = Number(r.datos?.reintentar_en_s);
+  pintarPinProp("error", (MENSAJES_PIN_PROP[c] || (r.status === 0 ? "Sin respuesta del servidor: revisa el estado antes de reintentar." : "No se pudo guardar el PIN."))
+    + (seg > 0 ? ` (unos ${Math.ceil(seg / 60)} min)` : ""));
+  if (c === "BLOQUEADO_ADMIN") await prepararPinPropietario();
+}
+document.getElementById("formPinPropietario")?.addEventListener("submit", (e) => { e.preventDefault(); enviarPinPropietario(); });
+document.getElementById("btnPinPropOlvide")?.addEventListener("click", () => { pinPropModo = "recuperar"; limpiarFormPinProp(); pintarPinProp(null, "Recuperación: confirma con la contraseña de tu cuenta y elige un PIN nuevo. El anterior no se puede ver: se reemplaza."); pintarModoPinProp(); });
+document.getElementById("btnPinPropCambiar")?.addEventListener("click", () => { pinPropModo = "cambiar"; limpiarFormPinProp(); pintarPinProp(null, ""); pintarModoPinProp(); });
+window.addEventListener("pagehide", () => limpiarFormPinProp());
 document.querySelectorAll(".btn-ver-clave").forEach((btn) => btn.addEventListener("click", () => alternarVerClave(btn)));
 // al irse de la página (o congelarla el navegador) no queda nada escrito
 window.addEventListener("pagehide", () => limpiarFormClave());
@@ -7276,7 +8368,7 @@ alHacerClicUnaVez(document.getElementById("btnForzarActualizacion"), buscarActua
    fecha e identificador, para que al restaurarlo se sepa exactamente de dónde
    salió y si el esquema es compatible. */
 
-const VERSION_APP = "3.14.1";
+const VERSION_APP = "3.15.0";
 const VERSION_RESPALDO = 2; // formato del archivo, no de la app
 
 async function armarRespaldo() {
@@ -7289,10 +8381,13 @@ async function armarRespaldo() {
   }
   const total = Object.values(conteos).reduce((a, b) => a + b, 0);
   return {
+    // 3.15 (Bloque 5): la copia dice QUÉ es. En modo nube es la caché de este dispositivo, no el respaldo de la empresa: el importador 3.13
+    // la rechaza (importarla duplicaría la nube) y ningún restaurador la toma por un respaldo completo.
+    formato: "entimotors-copia-dispositivo", alcance: alcanceCopia(),
     version: VERSION_RESPALDO,
     versionApp: VERSION_APP,
     esquemaDB: db?.version ?? null,
-    idRespaldo: `ENTI-${new Date().toISOString().slice(0, 10)}-${Math.random().toString(36).slice(2, 8).toUpperCase()}`,
+    idRespaldo: `ENTI-${FechaNegocio.hoy()}-${Math.random().toString(36).slice(2, 8).toUpperCase()}`,
     exportadoEn: new Date().toISOString(),
     exportadoPor: currentUser?.nombre || "—",
     dispositivo: navigator.userAgent.slice(0, 120),
@@ -7325,16 +8420,57 @@ async function verificarRespaldo(respaldo) {
 }
 
 function nombreArchivoRespaldo(respaldo) {
-  return `entimotors-backup-${respaldo.exportadoEn.slice(0, 10)}-${respaldo.idRespaldo.split("-").pop()}.json`;
+  return `entimotors-backup-${FechaNegocio.diaDe(respaldo.exportadoEn) || String(respaldo.exportadoEn).slice(0, 10)}-${respaldo.idRespaldo.split("-").pop()}.json`;
 }
 
+/* 3.15 (Bloque 5) · la interfaz dice la verdad sobre QUÉ se respalda. En modo nube, lo que hay en el teléfono es una caché: la copia sirve
+   para tener a mano lo que se veía, pero NO recupera la empresa (no trae las fotos, ni la auditoría completa de la nube, ni los usuarios)
+   y en ese modo no se restaura desde aquí. El respaldo de la EMPRESA (base de datos + fotos, con manifiesto y restauración de prueba) lo
+   hace el administrador técnico con operacion/respaldo antes de cada actualización. */
+function alcanceCopia() { return demoProhibido() ? "cache-nube" : "datos-locales"; }
+const TEXTOS_RESPALDO = {
+  "cache-nube": {
+    titulo: "Copia de este dispositivo (no es el respaldo de la empresa)",
+    alcance: "Guarda lo que este teléfono tiene en caché de la nube, para tenerlo a mano. Se vuelve a leer y se comprueba tabla por tabla antes de dártelo.",
+    noEmpresa: "Esta copia NO recupera la empresa: no incluye las fotos, ni la auditoría completa, ni los usuarios, y en modo nube no se restaura desde aquí. El respaldo completo (base de datos + fotos, verificado y restaurado en una prueba) lo hace el administrador técnico antes de cada actualización.",
+    restaurar: "No disponible en modo nube: restaurar un archivo aquí mezclaría o sobrescribiría los datos reales del taller. Para los datos de la 3.13 usa «Pasar los datos de la versión 3.13 a la nube».",
+    compartir: "Copia de la caché de ENTIMOTORS de este dispositivo (NO es el respaldo completo de la empresa)",
+    aviso: "Antes de actualizar puedes guardar una copia de lo que este dispositivo tiene en caché. Tus datos siguen en la nube: la actualización no los toca.",
+  },
+  "datos-locales": {
+    titulo: "Copia de este dispositivo",
+    alcance: "Guarda un archivo con TODO lo que este dispositivo tiene guardado (modo local). Antes de dártelo se vuelve a leer y se comprueba tabla por tabla.",
+    noEmpresa: "",
+    restaurar: "Elige el archivo y te mostramos qué trae antes de tocar nada. Después decides si reemplaza lo que hay o si se suma.",
+    compartir: "Copia de los datos de ENTIMOTORS guardados en este dispositivo",
+    aviso: "Antes de actualizar conviene guardar una copia de lo que este dispositivo tiene guardado. Si algo saliera mal, con esa copia se recupera lo de este dispositivo.",
+  },
+};
+function prepararTarjetaRespaldo() {
+  const t = TEXTOS_RESPALDO[alcanceCopia()];
+  const poner = (id, txt) => { const el = document.getElementById(id); if (el) el.textContent = txt; };
+  poner("respaldoTitulo", t.titulo); poner("respaldoAlcance", t.alcance); poner("restaurarAlcance", t.restaurar); poner("versionNuevaAvisoCopia", t.aviso);
+  const ne = document.getElementById("respaldoNoEmpresa");
+  if (ne) { ne.textContent = t.noEmpresa; ne.style.display = t.noEmpresa ? "" : "none"; }
+  const lab = document.getElementById("labelRestaurar");   // estado «restauración no disponible en este modo»: ni se ofrece el botón
+  if (lab) lab.style.display = alcanceCopia() === "cache-nube" ? "none" : "inline-block";
+}
+/* Estados de la copia: preparando → verificada | fallida. «Verificada» significa aquí: conteos iguales y el archivo se relee igual. */
+function pintarEstadoPreparando(caja) {
+  const el = document.getElementById(caja);
+  if (!el) return;
+  el.style.display = "block"; el.className = "respaldo-estado"; el.setAttribute("data-estado", "preparando");
+  el.innerHTML = `<b>⏳ Preparando la copia…</b><br><span style="color:var(--text-faint);">Leyendo y comprobando tabla por tabla.</span>`;
+}
 function pintarEstadoRespaldo(caja, respaldo, verificacion) {
   const el = document.getElementById(caja);
   if (!el) return;
   el.style.display = "block";
   el.className = `respaldo-estado ${verificacion.ok ? "ok" : "mal"}`;
+  el.setAttribute("data-estado", verificacion.ok ? "verificada" : "fallida");
   el.innerHTML = verificacion.ok
-    ? `<b>✅ Copia verificada — ${respaldo.totalRegistros} registros</b><br>
+    ? `<b>✅ Copia ${respaldo.alcance === "cache-nube" ? "de la caché " : ""}verificada — ${respaldo.totalRegistros} registros</b><br>
+       <span style="color:var(--text-faint);">Conteos iguales a lo guardado y el archivo se relee igual.${respaldo.alcance === "cache-nube" ? " No es el respaldo de la empresa." : ""}</span><br>
        <span style="color:var(--text-faint);">${respaldo.idRespaldo} · ${Math.max(1, Math.round(verificacion.bytes / 1024))} KB</span>
        <div class="respaldo-conteos">${ALL_STORES.filter(k => respaldo.conteos[k]).map(k => `<span>${esc(k)} <b>${respaldo.conteos[k]}</b></span>`).join("")}</div>`
     : `<b>⚠️ La copia no se pudo verificar</b><br>${verificacion.problemas.map(esc).join("<br>")}`;
@@ -7352,12 +8488,14 @@ function anotarUltimoRespaldo(respaldo) {
 }
 
 function pintarUltimoRespaldo() {
+  prepararTarjetaRespaldo();
   const el = document.getElementById("ultimoRespaldoInfo");
   if (!el) return;
   let info = null;
   try { info = JSON.parse(localStorage.getItem("enti_ultimo_respaldo") || "null"); } catch (e) {}
   if (!info) { el.innerHTML = `<b style="color:var(--red);">Todavía no has hecho ninguna copia en este dispositivo.</b>`; return; }
-  const dias = Math.floor((Date.now() - new Date(info.en).getTime()) / 86400000);
+  // días de calendario empresariales («ayer» = el día anterior en Honduras, no «hace 24 h»)
+  const dias = FechaNegocio.diaDe(info.en) ? FechaNegocio.diferenciaDias(FechaNegocio.diaDe(info.en), FechaNegocio.hoy()) : 0;
   const cuando = dias <= 0 ? "hoy" : dias === 1 ? "ayer" : `hace ${dias} días`;
   el.innerHTML = dias >= 7
     ? `<b style="color:var(--amber);">Última copia ${cuando}</b> (${info.registros} registros) — conviene hacer una nueva.`
@@ -7379,6 +8517,7 @@ function descargarArchivo(nombre, texto, tipo = "application/json") {
 /* Genera, verifica y entrega. Devuelve el respaldo verificado o null si algo
    no cuadró — quien la llama decide qué hacer, pero nunca sigue a ciegas. */
 async function generarRespaldoVerificado(cajaEstado) {
+  if (cajaEstado) pintarEstadoPreparando(cajaEstado);
   const respaldo = await armarRespaldo();
   const verif = await verificarRespaldo(respaldo);
   if (cajaEstado) pintarEstadoRespaldo(cajaEstado, respaldo, verif);
@@ -7413,7 +8552,7 @@ document.getElementById("btnCompartirRespaldo").addEventListener("click", async 
       await navigator.share({
         files: [archivo],
         title: "Copia de seguridad ENTIMOTORS",
-        text: `Copia de ENTIMOTORS OS del ${new Date(r.respaldo.exportadoEn).toLocaleDateString("es-HN")} · ${r.respaldo.totalRegistros} registros. Guárdala: con este archivo se recupera todo el sistema.`,
+        text: `${TEXTOS_RESPALDO[r.respaldo.alcance || "datos-locales"].compartir} · ${FechaNegocio.fecha(r.respaldo.exportadoEn)} · ${r.respaldo.totalRegistros} registros.`,
       });
       toast("Copia compartida");
     } catch (err) {
@@ -7436,7 +8575,7 @@ document.getElementById("inputRestaurar").addEventListener("change", async (e) =
   if (!file) return;
   // SYNC-10: con nube, «Restaurar» mezclaría el archivo registro a registro con la base real (y el dinero ni siquiera se
   // puede escribir así). Un respaldo de la 3.13 va por el importador: validado, atómico y sin duplicar.
-  if (demoProhibido()) { toast("Con la nube no se restaura aquí: usa «Pasar los datos de la versión 3.13 a la nube».", "off"); return; }
+  if (demoProhibido()) { toast("En modo nube no se restaura un respaldo del teléfono: mezclaría o sobrescribiría los datos reales del taller. Para los datos de la 3.13 usa «Pasar los datos de la versión 3.13 a la nube».", "off"); return; }
 
   let respaldo;
   try { respaldo = JSON.parse(await file.text()); }
@@ -7447,7 +8586,7 @@ document.getElementById("inputRestaurar").addEventListener("change", async (e) =
   modoRestauracion = "reemplazar";
   document.querySelectorAll("#restaurarModo .seg-opt").forEach(b => b.classList.toggle("active", b.dataset.modo === "reemplazar"));
 
-  const fecha = respaldo.exportadoEn ? new Date(respaldo.exportadoEn).toLocaleString("es-HN") : "fecha desconocida";
+  const fecha = respaldo.exportadoEn ? FechaNegocio.fechaHora(respaldo.exportadoEn) : "fecha desconocida";
   document.getElementById("restaurarOrigen").innerHTML =
     `${esc(file.name)} · hecho el ${esc(fecha)}${respaldo.versionApp ? ` con la versión ${esc(respaldo.versionApp)}` : ""}${respaldo.idRespaldo ? ` · ${esc(respaldo.idRespaldo)}` : ""}`;
 
@@ -7503,6 +8642,8 @@ document.getElementById("btnCancelarRestaurar").addEventListener("click", () => 
 alHacerClicUnaVez(document.getElementById("btnConfirmarRestaurar"), async () => {
   const respaldo = respaldoParaRestaurar;
   if (!respaldo) return;
+  // 3.15 (Bloque 4): segunda barrera — si la sesión pasó a ser de nube con el modal abierto, no se toca nada
+  if (demoProhibido()) { respaldoParaRestaurar = null; document.getElementById("modalRestaurar").classList.remove("active"); toast("En modo nube no se restaura un respaldo del teléfono: mezclaría o sobrescribiría los datos reales del taller. Para los datos de la 3.13 usa «Pasar los datos de la versión 3.13 a la nube».", "off"); return; }
   const modo = modoRestauracion;
 
   requestAdminCode(async () => {
@@ -7622,17 +8763,54 @@ async function revisarDatos313() {
   el.style.display = "none";
   if (!demoProhibido() || esMecanicoCuenta()) return;
   const marca = leerMarcaImport313();
-  if (marca?.estado === "terminado") return;
-  const n = await contarDatosLocales313();
-  if (!n && !["aplicado", "enviando"].includes(marca?.estado)) return;
   const admin = currentUser?.rol === "admin";
+  // una importación a medias se sigue mostrando como siempre (nada queda a medias sin avisar)
+  if (["aplicado", "enviando"].includes(marca?.estado)) {
+    el.innerHTML = (marca.estado === "aplicado"
+      ? `<b>Los datos de la versión anterior ya están en la nube.</b> Revisa que todo cuadre y dala por terminada.`
+      : `<b>Una importación de los datos de la versión anterior quedó sin confirmar.</b> Ábrela para ver en qué quedó (nada queda a medias).`)
+      + (admin ? ` <button type="button" class="btn small primary" id="btnAviso313" style="margin-top:0.5rem;">Revisar e importar</button>` : "");
+    el.style.display = "block";
+    document.getElementById("btnAviso313")?.addEventListener("click", () => abrirImport313());
+    return;
+  }
+  const est = await estadoLegado313();
+  if (!est.local) return;                                        // este dispositivo no tiene datos de la 3.13
+  if (est.fuente === "servidor" && !est.pendientes.length) return; // todo lo de este teléfono ya está en la nube (lo dice el servidor)
+  if (est.fuente !== "servidor" && marca?.estado === "terminado") return;   // sin red: se respeta lo que se sabía aquí
   let txt;
-  if (marca?.estado === "aplicado") txt = `<b>Los datos de la versión anterior ya están en la nube.</b> Revisa que todo cuadre y dala por terminada.`;
-  else if (marca?.estado === "enviando") txt = `<b>Una importación de los datos de la versión anterior quedó sin confirmar.</b> Ábrela para ver en qué quedó (nada queda a medias).`;
-  else txt = `<b>Este teléfono tiene ${n} registros de la versión anterior (3.13) que todavía no están en la nube.</b> No se han borrado: ${admin ? "pásalos a la nube para verlos aquí." : "pídele al administrador que los pase a la nube."}`;
-  el.innerHTML = txt + (admin ? ` <button type="button" class="btn small primary" id="btnAviso313" style="margin-top:0.5rem;">Revisar e importar</button>` : "");
+  if (est.fuente === "servidor") {
+    const ej = est.pendientes.filter((x) => x.posibleEjemplo).length;
+    const lista = est.pendientes.slice(0, 50).map((x) => `${esc(x.store)} #${esc(String(x.id))}${x.posibleEjemplo ? " (parece de ejemplo)" : ""}`).join(", ");
+    txt = `<b>Este teléfono tiene ${est.pendientes.length} registro${est.pendientes.length === 1 ? "" : "s"} de la versión anterior (3.13) que no ${est.pendientes.length === 1 ? "está" : "están"} en la nube</b>`
+      + `${ej ? ` (${ej} parece${ej === 1 ? "" : "n"} datos de ejemplo)` : ""}. ${est.migrado ? "El resto del taller ya se pasó a la nube. " : ""}No se han borrado ni se descartan solos.`
+      + `<details style="margin-top:0.4rem;"><summary>Ver cuáles</summary><span class="hint">${lista}${est.pendientes.length > 50 ? " …" : ""}</span></details>`;
+  } else {
+    txt = `<b>Este teléfono tiene ${est.local} registros de la versión anterior (3.13).</b> No se pudo comprobar con la nube cuáles ya están allá (${esc(est.motivo || "sin conexión")}). No se han borrado.`;
+  }
+  const ofrecerImportar = admin && !est.migrado;   // negocio ya migrado: importar ya no es el flujo normal (queda en Ajustes → recuperación)
+  el.innerHTML = txt + (ofrecerImportar ? ` <button type="button" class="btn small primary" id="btnAviso313" style="margin-top:0.5rem;">Revisar e importar</button>`
+    : admin ? "" : " Avísale al administrador.");
   el.style.display = "block";
   document.getElementById("btnAviso313")?.addEventListener("click", () => abrirImport313());
+}
+
+/* 3.15 (Bloque 6) · ESTADO DEL LEGADO 3.13, decidido por el SERVIDOR (ya no por una marca del localStorage de un dispositivo):
+   · migrado = hay una importación confirmada del negocio (migracion_313_estado);
+   · pendientes = registros 3.13 de ESTE dispositivo cuyo uuid determinista no existe en la nube (migracion_313_presentes).
+   Nada se marca ni se descarta: un registro nuevo (el registro 119) aparece como pendiente hasta que alguien decida qué es.
+   → { local, fuente: "servidor"|"local", migrado, pendientes: [{store, id, uuid, posibleEjemplo}], motivo } */
+async function estadoLegado313() {
+  const local = await contarDatosLocales313();
+  const base = { local, fuente: "local", migrado: false, pendientes: [], motivo: null };
+  if (!demoProhibido() || !isOnline() || !syncRest) return { ...base, motivo: isOnline() ? "sin sesión de nube" : "sin conexión" };
+  const e = await rpcImport313("migracion_313_estado", {});
+  if (!e.ok) return { ...base, motivo: e.mensaje || e.codigo || "la nube no respondió" };
+  const migrado = !!e.datos?.migrado;
+  if (!local) return { ...base, fuente: "servidor", migrado };
+  const p = await Import313.pendientesEnNube(await armarRespaldoLocal313(), (porTabla) => rpcImport313("migracion_313_presentes", { p_ids: porTabla }));
+  if (!p.ok) return { ...base, migrado, motivo: p.motivo };
+  return { local, fuente: "servidor", migrado, pendientes: p.faltan, motivo: null };
 }
 
 async function pintarEstadoImport313() {
@@ -7640,6 +8818,16 @@ async function pintarEstadoImport313() {
   if (!el) return;
   const marca = leerMarcaImport313();
   const n = await contarDatosLocales313();
+  // 3.15 (Bloque 6): con el negocio ya migrado (según el servidor) esto deja de ser el flujo normal: queda como RECUPERACIÓN
+  // (p. ej. un registro de la 3.13 que no llegó a la nube). No se retira mientras el registro 119 siga pendiente.
+  const est = await estadoLegado313().catch(() => null);
+  const titulo = document.getElementById("import313Titulo");
+  if (titulo) titulo.textContent = est?.migrado ? "Recuperación de datos de la versión 3.13" : "Pasar los datos de la versión 3.13 a la nube";
+  if (est?.fuente === "servidor" && est.migrado) {
+    el.textContent = n ? `El taller ya se pasó a la nube. Este teléfono tiene ${est.pendientes.length} registro${est.pendientes.length === 1 ? "" : "s"} de la 3.13 que no están allá.`
+      : "El taller ya se pasó a la nube. Usa esto solo para recuperar algo de la 3.13 que haya quedado fuera.";
+    return;
+  }
   el.textContent = marca?.estado === "terminado" ? `Importación terminada (${marca.idRespaldo || "respaldo"}). Los datos originales siguen en este teléfono.`
     : marca?.estado === "aplicado" ? "Importado: falta revisar y darlo por terminado."
     : marca?.estado === "enviando" ? "Hay una importación sin confirmar: ábrela para ver en qué quedó."
@@ -7672,7 +8860,7 @@ async function abrirImport313() {
     const e = await rpcImport313("import_estado", { p_lote: marca.lote });
     if (e.ok && ["aplicado", "confirmado"].includes(e.datos?.estado)) {
       guardarMarcaImport313({ ...marca, estado: e.datos.estado === "confirmado" ? "terminado" : "aplicado" });
-      await imp313Verificar(marca, "Los datos ya están en la nube (importación del " + esc(String(marca.en || "").slice(0, 10)) + ").");
+      await imp313Verificar(marca, "Los datos ya están en la nube (importación del " + esc(FechaNegocio.fecha(marca.en) || String(marca.en || "").slice(0, 10)) + ").");
     } else if (e.ok) {
       imp313Mostrar("imp313Resultado", "La importación anterior no llegó a aplicarse: no quedó nada a medias. Vuelve a elegir los datos para intentarlo otra vez.", "respaldo-estado");
     } else {
@@ -7991,11 +9179,12 @@ async function startApp(session) {
   // del taller "un momento" y cambiar después ya habría expuesto los datos.
   const baseDeEstaSesion = nombreBaseParaSesion(session);
   if (!baseDeEstaSesion) { await denegarSesion("No se pudo preparar tu espacio de trabajo."); return; }
-  db = await openDb(baseDeEstaSesion);
+  try { db = await openDb(baseDeEstaSesion); }
+  catch (e) { mostrarFalloAlmacen({ tipo: window.SyncDB?.clasificarFallo ? SyncDB.clasificarFallo(e) : "no-disponible", error: { nombre: e?.name || "Error", mensaje: String(e?.message || "").slice(0, 200) } }); return; }
 
   // Antes de la primera lectura: si esta sesión tiene nube, clientes/motos/
   // citas/categorias_inv/cotizaciones ya vienen de allá (bootstrap SYNC-5 §10).
-  await prepararModoNube(session);
+  if ((await prepararModoNube(session)) === "bloqueado") { mostrarFalloAlmacen(falloAlmacen); return; }
 
   const clientesExistentes = await DB.getAll("clientes");
   const modo = localStorage.getItem("enti_modo_datos");
@@ -8016,11 +9205,39 @@ async function startApp(session) {
    trabajo real). Se decide por la SESIÓN, no por si el motor arrancó ni por lo que haya en la nube: fail closed. El
    modo demo sigue igual que siempre en una sesión local (sin nube). */
 function demoProhibido() { return currentUser?.origen === "supabase"; }
+/* 3.15 (Bloque 6): herramientas de DESARROLLO (datos de ejemplo, «Simular sin conexión», acceso local de TEAM) solo existen si está
+   config-local.js, que nunca se publica (sw.js no lo cachea y los builds lo quitan). En el producto publicado esto es siempre false.
+   Ojo: no tiene nada que ver con el funcionamiento SIN INTERNET real (Bloque 3), que sigue igual. */
+function modoDesarrollo() { return !!(window.ENTIMOTORS_LOCAL && window.ENTIMOTORS_LOCAL.teamPasswords); }
+/* panel-tecnico.html es una herramienta INTERNA: vive en el código fuente pero NO se publica (ni en GitHub Pages ni en Mi Trabajo). En el
+   producto, enlazarla era un enlace roto: solo se enlaza en desarrollo. */
+function mensajeCuentaTecnica() {
+  return modoDesarrollo() ? 'Cuenta técnica: no abre el taller. Usa el <a href="panel-tecnico.html" style="text-decoration:underline;">panel técnico</a>.'
+    : "Cuenta técnica: no abre el taller. El panel técnico se usa desde el entorno de soporte.";
+}
+/* Lo visible que distingue producto de desarrollo: la etiqueta de la barra superior y el simulador de «sin conexión». */
+function aplicarModoProducto() {
+  const dev = modoDesarrollo();
+  const tag = document.getElementById("topbarTag");
+  if (tag) tag.textContent = dev ? "OS · desarrollo local" : "OS";
+  const sim = document.getElementById("offlineToggle");
+  if (sim) {   // el texto ni siquiera se publica: solo existe en desarrollo
+    sim.style.display = dev ? "" : "none";
+    if (dev && !sim.textContent) { sim.textContent = "Simular sin conexión"; sim.title = "Simular pérdida de señal para probar el modo sin internet"; }
+  }
+}
 function prepararGateModo() {
   const nube = demoProhibido();
   document.getElementById("btnModoDemo").style.display = nube ? "none" : "";
   document.getElementById("gateModoNubeAviso").style.display = nube ? "" : "none";
   document.getElementById("btnModoImportar").style.display = nube && currentUser?.rol === "admin" ? "" : "none";
+  // 3.15 (Bloque 6): si el servidor dice que el negocio YA se migró y este dispositivo no trae nada pendiente de la 3.13,
+  // traer datos de la versión anterior deja de ser el flujo normal de un dispositivo nuevo
+  if (nube && currentUser?.rol === "admin") estadoLegado313().then((est) => {
+    if (est.fuente === "servidor" && est.migrado && !est.pendientes.length) document.getElementById("btnModoImportar").style.display = "none";
+  }).catch(() => { /* sin respuesta: queda como estaba */ });
+  // dev: «Ver un ejemplo» solo existe con config-local.js (desarrollo); en el producto publicado nunca se ofrece
+  if (!modoDesarrollo()) document.getElementById("btnModoDemo").style.display = "none";
 }
 
 async function elegirModoDatos(modo) {
@@ -8049,6 +9266,7 @@ async function continuarArranque(modo) {
     if (totalReal === 0) await sembrarDatosPrueba();
     else console.info("[ENTIMOTORS] cuenta de prueba: ya hay datos reales, no se siembra nada");
   }
+  aplicarModoProducto();
   aplicarPermisosPorRol();
   /* Un mecánico solo necesita su pantalla. Pintar de paso el POS, las finanzas
      y el CMS no solo sobra: cada uno de esos render hace DB.getAll de tablas
@@ -8061,6 +9279,14 @@ async function continuarArranque(modo) {
     wireServiceWorkerUpdates();
     return;
   }
+  /* 3.15 (Bloque 7): la pantalla que se ve al abrir (Dashboard) se pinta PRIMERO y se deja dibujar; después, en el mismo orden de
+     siempre, las demás (sus contadores del menú, avisos y formularios quedan listos igual que antes). Antes el Dashboard era el último:
+     con volumen, la persona miraba un tablero vacío mientras se pintaban Finanzas, TPV, Ajustes… que no estaba viendo. */
+  await renderDashboard();
+  await renderNotificaciones();
+  renderSyncChip();
+  // dejar dibujar: rAF no corre con la pestaña oculta (PWA abierta en segundo plano), así que nunca se espera más de 100 ms
+  await new Promise((r) => { let hecho = false; const listo = () => { if (!hecho) { hecho = true; r(); } }; requestAnimationFrame(() => setTimeout(listo, 0)); setTimeout(listo, 100); });
   await renderOrdersList();
   await renderClientes();
   await renderInventario();
@@ -8068,11 +9294,7 @@ async function continuarArranque(modo) {
   await renderCotizaciones();
   await renderPOS();
   await renderFinanzas();
-  await renderWebCMS();
   await renderAjustes();
-  await renderDashboard();
-  await renderNotificaciones();
-  renderSyncChip();
   document.getElementById("fabHome").classList.add("fab-hidden"); // arranca siempre en la página principal
   revisarDatos313();   // SYNC-10: datos de la 3.13 en este teléfono que aún no están en la nube → a la vista
 
@@ -8143,6 +9365,7 @@ function abrirAvisoVersionNueva({ forzar = false } = {}) {
   if (document.getElementById("modalRestaurar")?.classList.contains("active")) return; // no interrumpir una restauración
   avisoVersionMostrado = true;
 
+  prepararTarjetaRespaldo();   // 3.15 (Bloque 5): el aviso de copia dice la verdad según el modo
   document.getElementById("versionNuevaDetalle").textContent =
     `Hay una versión nueva de ENTIMOTORS OS lista para instalarse en este dispositivo. La que tienes ahora seguirá funcionando hasta que decidas actualizar.`;
   const estado = document.getElementById("versionNuevaEstado");
@@ -8224,8 +9447,7 @@ async function arrancarConSesion() {
       if (sesion.rol === "desarrollador") {
         wireLoginGate();
         document.getElementById("gateLogin").classList.add("active");
-        document.getElementById("loginError").innerHTML =
-          'Cuenta técnica: no abre el taller. Usa el <a href="panel-tecnico.html" style="text-decoration:underline;">panel técnico</a>.';
+        document.getElementById("loginError").innerHTML = mensajeCuentaTecnica();
         await Auth.cerrarSesion();
         localStorage.removeItem("enti_session");
         return;
@@ -8236,12 +9458,13 @@ async function arrancarConSesion() {
     }
     // la sesión del servidor ya no vale: si la guardada venía de ahí, se descarta
     if (guardada && guardada.origen === "supabase" &&
-        ["cuenta-desactivada", "sin-perfil", "sin-permiso"].includes(r.motivo)) {
+        ["cuenta-desactivada", "sin-perfil", "sin-permiso", "sesion-revocada"].includes(r.motivo)) {
       localStorage.removeItem("enti_session");
       wireLoginGate();
       document.getElementById("gateLogin").classList.add("active");
       document.getElementById("loginError").textContent =
         r.motivo === "cuenta-desactivada" ? "Esta cuenta está dada de baja."
+        : r.motivo === "sesion-revocada"  ? "Tu sesión terminó. Vuelve a entrar."
                                           : "Esta cuenta ya no tiene perfil válido.";
       return;
     }
@@ -8260,6 +9483,10 @@ async function arrancarConSesion() {
 if (window.Auth) {
   Auth.alCambiar((evento) => {
     if (evento !== "SIGNED_OUT") return;
+    // 3.15 (Checkpoint 8A): Auth confirmó la desactivación (user_banned) → el cierre del Bloque 4, con su mensaje
+    if (Auth.motivoSalida?.() === "cuenta-desactivada" && typeof cerrarPorCuentaEliminada === "function" && document.getElementById("shell")?.classList.contains("active")) {
+      cerrarPorCuentaEliminada(); return;
+    }
     const g = readSession();
     if (g && g.origen === "supabase" && document.getElementById("shell")?.classList.contains("active")) {
       localStorage.removeItem("enti_session");

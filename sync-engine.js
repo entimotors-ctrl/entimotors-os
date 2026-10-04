@@ -158,6 +158,7 @@
        perfil está desactivado: fail closed, no se reanuda sola. `validarPerfil`: comprobar rol/activo del perfil antes
        del primer envío de este motor (y tras cada pausa por sesión). */
     var PAUSA_AUTH_MS = o.pausaAuthMs || 60000;
+    var ESQUEMA_CACHE = 315;   // 3.15 (O-2): versión de la app que descargó por última vez la caché COMPLETA (meta.esquema_cache)
     var pausa = null;                     // null | {motivo:"auth"|"cuenta-inactiva", desde}
     var perfilOk = !o.validarPerfil;
 
@@ -206,7 +207,9 @@
     }
     /* SYNC-8: el mapper puede declarar cómo combinar lo que baja con lo que solo existe en ESTE dispositivo (p. ej. los
        renglones de una orden que todavía no llegaron a la nube). Sin el hook, lo de la nube reemplaza campo a campo. */
-    function combinarLocal(m, local, campos) { return typeof m.fusionarLocal === "function" && local ? m.fusionarLocal(local, campos) : campos; }
+    /* 3.15 (F-1): el hook recibe además las operaciones en cola de ESE registro, para que el mapper pueda conservar lo que solo
+       existe aquí y cuya única representación es una operación RECHAZADA (terminal: ni se reenvía ni pasa a pendiente). */
+    function combinarLocal(m, local, campos, ops) { return typeof m.fusionarLocal === "function" && local ? m.fusionarLocal(local, campos, ops || []) : campos; }
     /* SYNC-8: campos que decide SOLO el servidor (cantidad, estado de cobro…). Bajan aunque haya un cambio local pendiente
        del mismo registro: nunca son parte de lo que el cliente edita, así que no hay nada que fusionar. */
     function soloServidor(m, campos) {
@@ -219,6 +222,23 @@
       if (pendiente && i < 0) l.push(uid); else if (!pendiente && i >= 0) l.splice(i, 1); else return;
       if (l.length) v[entidad] = l.slice(-500); else delete v[entidad];
       await t.put("meta", { k: "fk_pendientes", v: v });
+    }
+    /* 3.15 (Bloque 7): lo mismo que anotarFkPendiente, pero para TODA una página dentro de su transacción: fk_pendientes se lee una vez,
+       se modifica en memoria con la MISMA regla (agregar/quitar, máximo 500 por entidad) y se escribe una sola vez al final — y solo si
+       algo cambió, igual que antes. Si la transacción falla, no se escribe nada (como antes: todo o nada). */
+    function loteFkPendientes(t) {
+      var v = null, cambio = false;
+      return {
+        anotar: async function (entidad, uid, pendiente) {
+          if (!v) { var r = await t.get("meta", "fk_pendientes"); v = (r && r.v) || {}; }
+          var l = v[entidad] || [];
+          var i = l.indexOf(uid);
+          if (pendiente && i < 0) l.push(uid); else if (!pendiente && i >= 0) l.splice(i, 1); else return;
+          if (l.length) v[entidad] = l.slice(-500); else delete v[entidad];
+          cambio = true;
+        },
+        guardar: async function () { if (cambio) await t.put("meta", { k: "fk_pendientes", v: v }); },
+      };
     }
 
     /* ============ ESCRITURA LOCAL (registro + cola en UNA transacción) ============ */
@@ -305,17 +325,26 @@
       var tablas = [m.store, "mapa", "outbox", "cursores", "meta"];
       // los padres de las llaves foráneas solo se consultan por el mapa
       return bd.transaccion(tablas, "readwrite", async function (t) {
+        /* 3.15 (Bloque 7) · RENDIMIENTO sin cambiar la regla: antes cada fila esperaba, una por una, su entrada del mapa, su registro
+           local y su cola (3 viajes a IndexedDB en serie por fila, más fk_pendientes). Ahora se piden JUNTAS para toda la página, en esta
+           MISMA transacción (IndexedDB las resuelve en orden), y luego cada fila se procesa exactamente igual que antes y en el mismo orden.
+           Es equivalente porque una página nunca repite un uid (llave primaria) y lo que se precarga es SOLO lo de la propia fila: las
+           llaves foráneas (otras entidades) se siguen resolviendo en el momento, al procesar cada fila. */
+        var mps = await Promise.all(filas.map(function (row) { return t.get("mapa", row.id); }));
+        var locales = await Promise.all(mps.map(function (mp) { return mp ? t.get(m.store, mp.local_id) : null; }));
+        var opsDe = await Promise.all(locales.map(function (local, i) { return local ? t.todosPorIndice("outbox", "by_registro", [m.entidad, filas[i].id]) : []; }));
+        var fkLote = loteFkPendientes(t);
         for (var i = 0; i < filas.length; i++) {
           var row = filas[i], uid = row.id;
-          var mp = await t.get("mapa", uid);
-          var local = mp ? await t.get(m.store, mp.local_id) : null;
-          var ops = local ? await t.todosPorIndice("outbox", "by_registro", [m.entidad, uid]) : [];
+          var mp = mps[i];
+          var local = locales[i];
+          var ops = opsDe[i];
           if (row.deleted_at) {
             if (local) {
               await t.borrar(m.store, local.id);
               for (var q = 0; q < ops.length; q++) if (ops[q].estado === "pending") { ops[q].estado = "conflict"; ops[q].error = "borrado_remoto"; await t.put("outbox", ops[q]); }
             }
-            await anotarFkPendiente(t, m.entidad, uid, false);
+            await fkLote.anotar(m.entidad, uid, false);
             continue;
           }
           if (local && !forzar && (row.rev || 0) <= (local._rev || 0)) continue;             // ya lo tengo (solapamiento)
@@ -330,12 +359,13 @@
             if (Object.keys(srv).length) await t.put(m.store, Object.assign({}, local, srv));
             continue;
           }
-          var reg = Object.assign({}, local || {}, combinarLocal(m, local, campos), { uid: uid, _rev: row.rev || 0, _base: snap, _pend: false });
+          var reg = Object.assign({}, local || {}, combinarLocal(m, local, campos, ops), { uid: uid, _rev: row.rev || 0, _base: snap, _pend: false });
           if (local) reg.id = local.id; else if (mp) reg.id = mp.local_id; else delete reg.id;
           var id = await t.put(m.store, reg);
           if (!mp) await t.put("mapa", { uid: uid, entidad: m.entidad, local_id: id });
-          await anotarFkPendiente(t, m.entidad, uid, faltan.length > 0);
+          await fkLote.anotar(m.entidad, uid, faltan.length > 0);
         }
+        await fkLote.guardar();
         if (!nuevoCursor) return;
         var previo = await t.get("cursores", m.entidad);
         if (!previo || compararCursor(nuevoCursor, previo) > 0) await t.put("cursores", { entidad: m.entidad, t: nuevoCursor.t, id: nuevoCursor.id });
@@ -345,11 +375,12 @@
     async function pull(entidad, opciones) {
       if (apagado()) return { omitido: "apagado" };
       var m = mapper(entidad);
-      var cur = await bd.cursor.get(entidad);
+      var releer = !!(opciones && opciones.releer);   // 3.15 (O-2): desde el principio y aplicando aunque la revisión sea la misma
+      var cur = releer ? null : await bd.cursor.get(entidad);
       // select: para una entidad con hijos embebidos sin cursor propio (SYNC-5: cotizacion_items dentro de
       // cotizaciones), el mapper declara `select` (p. ej. "*,cotizacion_items(...)") y viaja tal cual a PostgREST.
       var r = await rest.paginar(m.tabla, { cursor: cur ? { t: cur.t, id: cur.id } : null, pagina: (opciones && opciones.pagina) || 500, maxPaginas: opciones && opciones.maxPaginas,
-        solapamientoMs: opciones && opciones.solapamientoMs, select: m.select, onPagina: function (filas, nuevo) { return aplicarPagina(m, filas, nuevo); } });
+        solapamientoMs: opciones && opciones.solapamientoMs, select: m.select, onPagina: function (filas, nuevo) { return aplicarPagina(m, filas, nuevo, releer); } });
       if (!r.ok) return { ok: false, clase: r.clase, codigo: r.codigo, mensaje: r.mensaje, entidad: entidad };
       return { ok: true, total: r.total, completo: r.completo, entidad: entidad };
     }
@@ -364,6 +395,14 @@
     async function pullTodo(opciones) {
       if (apagado()) return [{ omitido: "apagado" }];
       var salida = [], todoOk = true;
+      /* 3.15 (O-2) · CACHÉ HEREDADA. Una versión anterior de la app pudo bajar un registro en su revisión actual SIN los campos que
+         esta versión conoce (p. ej. el presupuesto de la orden, si 3.14.1 sincronizó contra el servidor ya migrado). Como la revisión
+         coincide y el cursor ya pasó, no volvería a bajar nunca. La primera vez que ESTA versión completa una descarga sobre una caché
+         que no hizo ella, la relee entera UNA vez: solo lectura en el servidor (no cambia revisiones), con las mismas reglas de siempre
+         (lo mío pendiente se queda; lo que decide el servidor baja). Una caché nueva no relee nada: solo queda marcada. */
+      var b0 = await bd.meta.get("bootstrap"), esq = await bd.meta.get("esquema_cache");
+      var heredada = !!(b0 && b0.completo) && !(esq >= ESQUEMA_CACHE);
+      if (heredada) opciones = Object.assign({}, opciones || {}, { releer: true });
       for (var i = 0; i < ORDEN.length; i++) {
         var r = await pull(ORDEN[i], opciones);
         salida.push(r);
@@ -374,6 +413,7 @@
         try { await resolverFkPendientes(); } catch (e) { todoOk = false; }
         var b = await bd.meta.get("bootstrap");
         if (!b || !b.completo) { await bd.meta.set("bootstrap", { completo: true, en: reloj() }); emitir("bootstrap-completo", null); }
+        if (todoOk && !(esq >= ESQUEMA_CACHE)) await bd.meta.set("esquema_cache", ESQUEMA_CACHE);
       }
       estadoVivo.ultimoPull = reloj();
       return salida;
@@ -398,6 +438,53 @@
       }
     }
 
+    /* 3.15 · Bloque 3 · ACTUALIZACIÓN SELECTIVA (aviso en tiempo real → solo ESE registro).
+       Se pide el registro por su id, con el token de la persona y bajo RLS (o la función del mecánico, que ya filtra por
+       asignación). Si vuelve: se aplica FORZADO (un aviso de renglones no cambia la revisión de la orden). Si no vuelve, ya no
+       le corresponde (reasignado, cerrado, oculto): se RETIRA de la caché — salvo que tenga algo propio sin confirmar, que se
+       conserva a la vista hasta que el servidor lo acepte o lo rechace (nunca se pierde en silencio). Idempotente: dos avisos
+       iguales, o fuera de orden, llevan al mismo estado, porque manda lo que el servidor tiene AHORA, no el aviso. */
+    async function retirarLocal(m, uid) {
+      return bd.transaccion([m.store, "mapa", "outbox"], "readwrite", async function (t) {
+        var mp = await t.get("mapa", uid);
+        if (!mp) return false;
+        var local = await t.get(m.store, mp.local_id);
+        if (!local) return false;
+        var ops = await t.todosPorIndice("outbox", "by_registro", [m.entidad, uid]);
+        if (ops.some(function (x) { return x.estado === "pending" || x.estado === "syncing" || x.estado === "conflict"; })) return false;
+        await t.borrar(m.store, local.id);   // el mapa se conserva: si vuelve a ser suyo, recupera el mismo id local
+        return true;
+      });
+    }
+    async function pullUno(entidad, uid) {
+      if (apagado()) return { omitido: "apagado" };
+      var m = mapper(entidad);
+      var r = await rest.seleccionar(m.tabla, { select: m.select || "*", filtros: [["id", "eq", uid]], limite: 1 });
+      if (!r.ok) return { ok: false, clase: r.clase, codigo: r.codigo };
+      var filas = Array.isArray(r.datos) ? r.datos : [];
+      if (filas.length && !filas[0].deleted_at) { await aplicarPagina(m, filas, null, true); emitir("remoto", { entidad: entidad, uid: uid, estado: "actualizado" }); return { ok: true, estado: "actualizado" }; }
+      var quitado = await retirarLocal(m, uid);
+      if (quitado) emitir("remoto", { entidad: entidad, uid: uid, estado: "retirado" });
+      return { ok: true, estado: quitado ? "retirado" : "sin-cambio" };
+    }
+    /* Conciliación tras reconexión (o al abrir): para las entidades que el servidor FILTRA por persona (m.barrer: las del
+       mecánico), lo que ya no aparece en la lista de ids visibles se retira (mismas garantías que retirarLocal). Una sola
+       petición de ids por entidad; nunca se descarga la base completa. */
+    async function barrer(entidad) {
+      if (apagado()) return { omitido: "apagado" };
+      var m = mapper(entidad);
+      if (!m.barrer) return { ok: true, retirados: 0 };
+      var r = await rest.seleccionar(m.tabla, { select: "id", limite: 2000 });
+      if (!r.ok) return { ok: false, clase: r.clase };
+      var visibles = {}; (Array.isArray(r.datos) ? r.datos : []).forEach(function (f) { visibles[f.id] = true; });
+      var locales = await bd.datos.todos(m.store), retirados = 0;
+      for (var i = 0; i < locales.length; i++) {
+        var u = locales[i].uid;
+        if (u && !visibles[u] && (await retirarLocal(m, u))) { retirados++; emitir("remoto", { entidad: entidad, uid: u, estado: "retirado" }); }
+      }
+      return { ok: true, retirados: retirados };
+    }
+
     /* ============ ENVÍO ============ */
     function descripcionError(r) { return { clase: r.clase, codigo: r.codigo || "", mensaje: String(r.mensaje || "").slice(0, 300), http: r.status || 0 }; }
 
@@ -413,7 +500,7 @@
         var hayMas = restantes.some(function (x) { return x.estado === "pending" || x.estado === "syncing" || x.estado === "conflict"; });
         var reg;
         if (!hayMas) {
-          reg = Object.assign({}, local, combinarLocal(m, local, await camposLocales(t, m, row)), { _rev: row.rev || 0, _base: snap, _pend: false });
+          reg = Object.assign({}, local, combinarLocal(m, local, await camposLocales(t, m, row), restantes), { _rev: row.rev || 0, _base: snap, _pend: false });
         } else {
           reg = Object.assign({}, local, { _rev: row.rev || 0, _base: snap, _pend: true });
           for (var i = 0; i < restantes.length; i++) if (restantes[i].estado === "pending" && restantes[i].kind !== "insert") { restantes[i].base = snap; restantes[i].base_rev = row.rev || 0; await t.put("outbox", restantes[i]); }
@@ -639,10 +726,11 @@
     /* Una operación rechazada por permisos deja el registro local distinto de la nube: se vuelve a la versión del servidor. */
     async function restaurar(op, filaServidor) {
       var m = mapper(op.entidad);
-      await bd.transaccion([m.store, "mapa"], "readwrite", async function (t) {
+      await bd.transaccion([m.store, "mapa", "outbox"], "readwrite", async function (t) {
         var mp = await t.get("mapa", op.uid);
         var local = mp ? await t.get(m.store, mp.local_id) : null;
-        var reg = Object.assign({}, combinarLocal(m, local, await camposLocales(t, m, filaServidor)), { uid: op.uid, _rev: filaServidor.rev || 0, _base: columnasNube(m, filaServidor), _pend: false });
+        var ops = local ? await t.todosPorIndice("outbox", "by_registro", [op.entidad, op.uid]) : [];
+        var reg = Object.assign({}, combinarLocal(m, local, await camposLocales(t, m, filaServidor), ops), { uid: op.uid, _rev: filaServidor.rev || 0, _base: columnasNube(m, filaServidor), _pend: false });
         if (mp) reg.id = mp.local_id;
         var id = await t.put(m.store, reg);
         if (!mp) await t.put("mapa", { uid: op.uid, entidad: op.entidad, local_id: id });
@@ -679,7 +767,7 @@
     }
 
     /* ============ CICLO Y DISPAROS ============ */
-    var temporizadorEnvio = null, intervalo = null, oyentes = [];
+    var temporizadorEnvio = null, intervalo = null, oyentes = [], cadaMs = 30000;
     function programarEnvio() {
       if (apagado() || !o.autoenvio) return;
       if (temporizadorEnvio) return;
@@ -695,13 +783,34 @@
       var p = ["auth", "red", "cuenta-inactiva", "perfil"].indexOf(f.detenido) >= 0 ? [] : await pullTodo();
       return { flush: f, pull: p };
     }
-    function arrancar() {
+    /* 3.15 (Bloque 7): `descargaReciente` = quien llama ACABA de terminar una descarga completa (el arranque de la app). Antes el primer
+       ciclo repetía esa descarga entera de inmediato (≈13 peticiones más, cada una con su preflight, en cada arranque). Ahora ese primer
+       ciclo envía la cola igual que siempre y solo vuelve a descargar si envió, rechazó o encontró un conflicto (la descarga correctiva
+       de SYNC-8 sigue ocurriendo cuando hace falta). Sin la opción, idéntico a antes. Los ciclos siguientes no cambian. */
+    async function primerCicloTrasDescarga() {
+      if (apagado()) return { omitido: "apagado" };
+      if (global.navigator && global.navigator.onLine === false) return { omitido: "sin-conexion" };
+      var f = await flush();
+      if (f && f.omitido) return { flush: f };
+      var toco = (f.enviadas || 0) + (f.rechazadas || 0) + (f.conflictos || 0) > 0;
+      var p = !toco || ["auth", "red", "cuenta-inactiva", "perfil"].indexOf(f.detenido) >= 0 ? [] : await pullTodo();
+      return { flush: f, pull: p };
+    }
+    function arrancar(opciones) {
       if (apagado() || intervalo) return;
       var alVolver = function () { if (!global.document || global.document.visibilityState === "visible") sincronizar(); };
       if (global.addEventListener) { global.addEventListener("online", alVolver); oyentes.push(["online", alVolver, global]); }
       if (global.document && global.document.addEventListener) { global.document.addEventListener("visibilitychange", alVolver); oyentes.push(["visibilitychange", alVolver, global.document]); }
-      intervalo = setInterval(function () { sincronizar(); }, o.cadaMs || 30000);
-      sincronizar();
+      cadaMs = o.cadaMs || 30000;
+      intervalo = setInterval(function () { sincronizar(); }, cadaMs);
+      if (opciones && opciones.descargaReciente) primerCicloTrasDescarga(); else sincronizar();
+    }
+    /* 3.15 · Bloque 3: con los avisos en tiempo real conectados, la descarga periódica queda solo como red de seguridad
+       (intervalo largo); sin ellos, vuelve al de siempre. No dispara nada por sí misma. */
+    function ajustarIntervalo(ms) {
+      if (!intervalo || !ms || ms === cadaMs) return;
+      clearInterval(intervalo); cadaMs = ms;
+      intervalo = setInterval(function () { sincronizar(); }, cadaMs);
     }
     function detener() {
       if (intervalo) { clearInterval(intervalo); intervalo = null; }
@@ -725,25 +834,50 @@
        enviados (pueden llevar montos o datos del cliente). */
     async function revision() {
       var ops = await bd.outbox.todos(), conf = await bd.conflictos.todos();
-      var rechazadas = ops.filter(function (x) { return x.estado === "rejected"; }).map(function (x) {
+      var rech = ops.filter(function (x) { return x.estado === "rejected"; });
+      var rechazadas = rech.map(function (x) {
         var er = x.error && typeof x.error === "object" ? x.error : { clase: "", codigo: String(x.error || ""), mensaje: "" };
         return { tipo: er.clase === "dependencia" ? "dependencia" : "rechazada", seq: x.seq, entidad: x.entidad, uid: x.uid, kind: x.kind, rpc: x.rpc || null,
+          retieneLocal: false, protegida: false,
           clase: er.clase || "", codigo: er.codigo || "", mensaje: String(er.mensaje || "").slice(0, 200), creadoEn: x.creado_en || null, actor: x.actor_uid };
       });
+      for (var i = 0; i < rech.length; i++) { rechazadas[i].retieneLocal = await respaldaLocal(rech[i]); rechazadas[i].protegida = rechazadas[i].retieneLocal && PROTEGER_RESPALDO_LOCAL; }
       var conflictos = conf.map(function (c) { return { tipo: "conflicto", id: c.id, entidad: c.entidad, uid: c.uid, motivo: c.tipo, campos: c.campos || [], creadoEn: c.creado_en || null }; });
       var s = sesion();
       var esperando = ops.filter(function (x) { return s && x.actor_uid !== s.uid && (x.estado === "pending" || x.estado === "syncing"); }).length;
       return { rechazadas: rechazadas, conflictos: conflictos, esperandoOtraPersona: esperando, total: rechazadas.length + conflictos.length };
     }
-    /** La persona ya vio un rechazo y lo da por atendido: sale de la lista (el registro local no se toca). Solo rechazadas. */
-    async function descartarRechazada(seq) {
-      var op = await bd.outbox.get(seq);
-      if (!op || op.estado !== "rejected") return false;
-      await bd.outbox.borrar(seq); emitir("estado", null); return true;
+    /* 3.15 (protección temporal) · ¿Esta operación rechazada es lo ÚNICO que respalda un dato que solo existe en este dispositivo?
+       Lo decide el mapper por el tipo y el contenido de la operación y por su relación con la copia local (nunca por números de cola).
+       Solo lee. */
+    async function respaldaLocal(op) {
+      var m = op && mappers[op.entidad];
+      if (!m || typeof m.retieneLocal !== "function" || op.estado !== "rejected") return false;
+      var idLocal = op.uid ? await bd.mapa.localDe(op.uid) : null;
+      var local = idLocal !== null && idLocal !== undefined ? await bd.datos.get(m.store, idLocal) : null;
+      return !!m.retieneLocal(op, local || null);
     }
+    /* TEMPORAL: mientras esos datos no estén respaldados fuera del dispositivo, una operación así NO se puede quitar de la lista —ni desde
+       la pantalla ni llamando al motor—. Se retira en una versión posterior; con `false` vuelve el descarte con relectura de 3.15 (F-1). */
+    var PROTEGER_RESPALDO_LOCAL = true;
+    /** La persona ya vio un rechazo y lo da por atendido: sale de la lista (el registro local no se toca). Solo rechazadas.
+        Devuelve { ok, motivo }: "no-existe" · "no-rechazada" · "protegida" (no se borró, no se modificó, no se reenvía: nada cambia). */
+    async function descartarRechazadaDetalle(seq) {
+      var op = await bd.outbox.get(seq);
+      if (!op) return { ok: false, motivo: "no-existe" };
+      if (op.estado !== "rejected") return { ok: false, motivo: "no-rechazada" };
+      if (!(await respaldaLocal(op))) { await bd.outbox.borrar(seq); emitir("estado", null); return { ok: true, motivo: null }; }
+      if (PROTEGER_RESPALDO_LOCAL) return { ok: false, motivo: "protegida", protegida: true };
+      // 3.15 (F-1), sin la protección temporal: el registro queda anotado para releerse en la siguiente sincronización: desde ese
+      // momento manda la versión del servidor, aunque su revisión no haya cambiado.
+      await bd.transaccion(["outbox", "meta"], "readwrite", async function (t) { await t.borrar("outbox", seq); await anotarFkPendiente(t, op.entidad, op.uid, true); });
+      emitir("estado", null); return { ok: true, motivo: null };
+    }
+    /** Igual que siempre para quien ya la usa: true si salió de la lista, false si no (el motivo lo da descartarRechazadaDetalle). */
+    async function descartarRechazada(seq) { return (await descartarRechazadaDetalle(seq)).ok; }
 
-    return { escribir: escribir, pull: pull, pullTodo: pullTodo, flush: flush, sincronizar: sincronizar, encolarRpc: encolarRpc, rpcInmediato: rpcInmediato, resolverConflicto: resolverConflicto,
-      revision: revision, descartarRechazada: descartarRechazada, reanudar: reanudar,
+    return { escribir: escribir, pull: pull, pullTodo: pullTodo, pullUno: pullUno, barrer: barrer, ajustarIntervalo: ajustarIntervalo, intervaloMs: function () { return cadaMs; }, flush: flush, sincronizar: sincronizar, encolarRpc: encolarRpc, rpcInmediato: rpcInmediato, resolverConflicto: resolverConflicto,
+      revision: revision, descartarRechazada: descartarRechazada, descartarRechazadaDetalle: descartarRechazadaDetalle, reanudar: reanudar,
       estado: estado, arrancar: arrancar, detener: detener, onCambio: function (f) { escuchas.push(f); return function () { escuchas = escuchas.filter(function (x) { return x !== f; }); }; } };
   }
 

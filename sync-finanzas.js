@@ -49,6 +49,31 @@
       return { item_id: it.itemUid || nuevoUuid(), inventario_id: it.inventarioUid || null, nombre: texto(it.nombre) || "", cantidad: cant, precio: r2(precio) };
     });
   }
+  var TIPOS = ["mano_obra", "repuesto_inventario", "repuesto_manual"];
+  var DECISIONES = ["aprobar", "rechazar", "reabrir"];
+  /** Precio obligatorio: un campo vacío NO es L 0.00 (null, "" o texto no numérico → error). */
+  function precioValido(v, nombre) {
+    if (v === null || v === undefined || (typeof v === "string" && !v.trim())) falla("Falta el precio de «" + (nombre || "renglón") + "»");
+    var n = Number(v);
+    if (!isFinite(n) || n < 0) falla("Precio inválido en «" + (nombre || "renglón") + "»");
+    return r2(n);
+  }
+  /** Renglón de orden/cotización: tipo, producto (solo el repuesto del inventario lo lleva), cantidad y precio. tipo null = renglón
+      viejo sin clasificar: se respeta tal cual (nunca se adivina por el nombre). */
+  function renglonOrden(o) {
+    var tipo = o.tipo == null ? null : o.tipo;
+    if (tipo !== null && TIPOS.indexOf(tipo) < 0) falla("Tipo de renglón inválido");
+    var cant = Number(o.cantidad);
+    if (!isFinite(cant) || cant <= 0) falla("La cantidad debe ser mayor a cero");
+    var precio = precioValido(o.precio, o.nombre);
+    if (o.inventarioId != null && !o.inventarioUid) falla("El repuesto todavía no tiene identidad en la nube");
+    var inv = o.inventarioUid || null;
+    if (tipo === "repuesto_inventario" && !inv) falla("Elige el producto del inventario");
+    if ((tipo === "mano_obra" || tipo === "repuesto_manual") && inv) falla("La mano de obra y el repuesto manual no llevan producto del inventario");
+    if (tipo === null && inv) tipo = "repuesto_inventario";
+    if (!inv && !texto(o.nombre)) falla("Falta la descripción del renglón");
+    return { tipo: tipo, inventario: inv, cantidad: cant, precio: precio };
+  }
   function motivoValido(m) { if (!texto(m) || texto(m).length < 3) falla("El motivo es obligatorio (mínimo 3 caracteres)"); return texto(m); }
 
   /* ---------------- constructores puros: {rpc, params, meta} ---------------- */
@@ -94,15 +119,32 @@
           p_occurred_at: o.ocurrioEn, p_device: o.deviceId || null,
         } };
       },
+      /* 3.15 (Bloque 2): cada renglón de la orden lleva su TIPO. El stock NO se decide aquí: el servidor descuenta solo si el
+         presupuesto está aprobado (y exactamente la diferencia); pendiente/rechazado no tocan el inventario. */
       itemOrden: function (o) {
         if (!o.ordenUid) falla("La orden todavía no tiene identidad en la nube");
-        var cant = Number(o.cantidad), precio = Number(o.precio);
-        if (!isFinite(cant) || cant <= 0 || !isFinite(precio) || precio < 0) falla("Cantidad y precio deben ser válidos");
-        if (o.inventarioId != null && !o.inventarioUid) falla("El repuesto todavía no tiene identidad en la nube");
+        var r = renglonOrden(o);
         var item = o.itemUid || nuevoUuid();
         return { rpc: "agregar_item_orden", meta: { entidad: "ordenes", uid: o.ordenUid }, params: {
-          p_orden_id: o.ordenUid, p_inventario_id: o.inventarioUid || null, p_nombre: texto(o.nombre), p_cantidad: cant, p_precio: r2(precio),
-          p_item_id: item, p_offline: !!o.offline, p_occurred_at: o.ocurrioEn, p_device: o.deviceId || null,
+          p_orden_id: o.ordenUid, p_inventario_id: r.inventario, p_nombre: texto(o.nombre), p_cantidad: r.cantidad, p_precio: r.precio,
+          p_item_id: item, p_offline: !!o.offline, p_occurred_at: o.ocurrioEn, p_device: o.deviceId || null, p_tipo: r.tipo,
+        } };
+      },
+      /** Editar un renglón ya guardado: cantidad, precio (de ESTA operación; el precio maestro no cambia), descripción o producto. */
+      actualizarItemOrden: function (o) {
+        if (!o.itemUid) falla("El ítem no tiene identidad en la nube");
+        var r = renglonOrden(o);
+        return { rpc: "actualizar_item_orden", meta: { entidad: "ordenes", uid: o.ordenUid }, params: {
+          p_item_id: o.itemUid, p_cantidad: r.cantidad, p_precio: r.precio, p_nombre: texto(o.nombre), p_inventario_id: r.inventario,
+          p_tipo: r.tipo, p_device: o.deviceId || null,
+        } };
+      },
+      /** Aprobar / rechazar / reabrir el presupuesto. Aprobar descuenta los repuestos del negocio UNA vez (lo garantiza la base). */
+      decidirPresupuesto: function (o) {
+        if (!o.ordenUid) falla("La orden todavía no tiene identidad en la nube");
+        if (DECISIONES.indexOf(o.decision) < 0) falla("Decisión inválida");
+        return { rpc: "decidir_presupuesto_orden", meta: { entidad: "ordenes", uid: o.ordenUid }, params: {
+          p_orden_id: o.ordenUid, p_decision: o.decision, p_via: texto(o.via), p_device: o.deviceId || null,
         } };
       },
       quitarItemOrden: function (o) {
@@ -213,12 +255,17 @@
     }
 
     /** Acción sensible: SIEMPRE en línea y nunca al outbox. Cajero → PIN (autorización de un solo uso ligada a
-        solicitante/acción/registro/dispositivo/monto); admin → sin PIN; cualquier otro rol → negado sin red.
+        solicitante/acción/registro/dispositivo/monto/sesión); admin → sin PIN en lo SENSIBLE y con el PIN del propietario en lo
+        DESTRUCTIVO (3.15 · Bloque 4, lo decide PinUI y lo exige la base); cualquier otro rol → negado sin red.
         accion: {rpc, registro, params, monto} de los constructores. rol: currentUser.rol. */
-    async function conAutorizacion(accion, rol) {
+    async function conAutorizacion(accion, rol, opciones) {
       if (rol !== "admin" && rol !== "cajero") return { ok: false, motivo: "sin-permiso", mensaje: "Tu rol no puede realizar esta acción." };
       if (!enLinea()) return { ok: false, motivo: "sin-conexion", mensaje: SIN_CONEXION_PIN };
-      var aut = await deps.autorizar({ accion: accion.rpc, rol: rol, registroId: accion.registro, monto: accion.monto, deviceId: accion.params.p_device });
+      // 3.15 · Bloque 4: «eliminar una orden SIN dinero» es del admin con su sesión (el servidor lo decide y lo exige: anular_orden
+      // modo eliminar no pide autorización); pedir el PIN ahí sería poner PIN a una operación normal. Solo el admin puede saltarlo.
+      var aut = opciones && opciones.sinPinAdmin && rol === "admin"
+        ? { ok: true, admin: true, autorizacion_id: null }
+        : await deps.autorizar({ accion: accion.rpc, rol: rol, registroId: accion.registro, monto: accion.monto, deviceId: accion.params.p_device });
       if (!aut || !aut.ok) return Object.assign({ ok: false }, aut || { motivo: "sin-autorizacion", mensaje: "No se obtuvo la autorización." });
       var params = Object.assign({}, accion.params, { p_autorizacion: aut.autorizacion_id || null });
       var opId = nuevoUuid();
@@ -233,5 +280,6 @@
     return { ejecutar: ejecutar, descartarRechazo: descartarRechazo, conAutorizacion: conAutorizacion, construir: construir(nuevoUuid) };
   }
 
-  global.SyncFinanzas = { crear: crear, construir: function (o) { return construir(uuidPor(o)); }, r2: r2, SIN_CONEXION_PIN: SIN_CONEXION_PIN };
+  global.SyncFinanzas = { crear: crear, construir: function (o) { return construir(uuidPor(o)); }, r2: r2, SIN_CONEXION_PIN: SIN_CONEXION_PIN,
+    TIPOS_RENGLON: TIPOS, precioValido: precioValido };
 })(typeof window !== "undefined" ? window : this);

@@ -29,6 +29,11 @@
      recargar ni al cambiar de usuario, y no forma parte de ningún respaldo (el respaldo es de la base de siempre): ni se
      restaura de un archivo ni se copia a otro equipo (SYNC-9). Otro perfil de navegador = otro almacenamiento = otro id. */
   var NOMBRE_DISPOSITIVO = "entimotors_dispositivo";
+  /* 3.15 (Bloque 3): los mensajes admin → mecánico viven en el almacén `auditoria`, que existe desde v1 y la caché de sync nunca
+     usó (la bitácora local va en la base de siempre). Crear un almacén nuevo exigiría subir a v2, y la 3.14.1 (VERSION = 1) ya
+     no podría abrir una base «más nueva» (VersionError) → caería a modo local: justo el fallo silencioso que este bloque cierra. */
+  var ALMACEN_MENSAJES = "auditoria";
+  var ESPERA_BLOQUEO_MS = 4000;
 
   function nombreParaSesion(sesion) {
     if (sesion && sesion.rol === "mecanico" && sesion.perfilId) return NOMBRE + "_mec_" + sesion.perfilId;
@@ -102,14 +107,70 @@
         var b = d.createObjectStore("blobs", { keyPath: "id", autoIncrement: true });
         b.createIndex("by_registro", ["entidad", "uid"]);
       };
-      req.onblocked = function () { /* otra pestaña con la versión anterior abierta: no ocurre con v1 */ };
-      req.onerror = function () { mal(req.error || new Error("no se pudo abrir " + nombre)); };
-      req.onsuccess = function () { ok(envolver(req.result, nombre, idbf)); };
+      // otra pestaña retiene la base (no ocurre con v1, salvo una versión futura abierta en otra pestaña): no se espera para
+      // siempre — se reporta «Bloqueada» y quien llama decide reintentar (abrirSeguro)
+      var tBloqueo = null, terminado = false;
+      req.onblocked = function () {
+        if (tBloqueo) return;
+        tBloqueo = setTimeout(function () { if (terminado) return; terminado = true; var e = new Error("La base local está ocupada por otra pestaña"); e.name = "Bloqueada"; mal(e); }, o.esperaBloqueoMs || ESPERA_BLOQUEO_MS);
+      };
+      req.onerror = function () { if (terminado) return; terminado = true; clearTimeout(tBloqueo); mal(req.error || new Error("no se pudo abrir " + nombre)); };
+      req.onsuccess = function () {
+        clearTimeout(tBloqueo);
+        if (terminado) { try { req.result.close(); } catch (e) { /* ya */ } return; }
+        terminado = true; ok(envolver(req.result, nombre, idbf));
+      };
     });
   }
 
+  /* 3.15 · Bloque 3 · APERTURA SEGURA (fail closed). Distingue lo que se puede reintentar de lo que no, y comprueba que la base
+     de verdad ESCRIBE (una sonda en meta) antes de dar por buena la apertura. Nunca borra, recrea ni limpia nada: si la base no
+     sirve, lo dice y quien llama BLOQUEA las operaciones (no hay «modo local» de respaldo que guarde datos que nunca subirían).
+       tipo: "ocupada"    → otra pestaña la retiene / fallo pasajero (se reintentó y siguió así)
+             "llena"      → sin espacio de almacenamiento
+             "version"    → la base es de una versión MÁS NUEVA de la app
+             "no-disponible" → el navegador no la abre o falla al escribir (dañada, desactivada, modo privado restringido)
+     No tiene nada que ver con Internet: sin red, IndexedDB abre igual y la app trabaja offline como siempre. */
+  function clasificar(err) {
+    var n = (err && err.name) || "";
+    if (n === "Bloqueada" || n === "AbortError" || n === "TimeoutError" || n === "TransactionInactiveError") return "ocupada";
+    if (n === "QuotaExceededError") return "llena";
+    if (n === "VersionError") return "version";
+    return "no-disponible";
+  }
+  function dormir(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+  async function abrirSeguro(o) {
+    o = o || {};
+    var idbf = o.indexedDB || global.indexedDB;
+    var esperas = o.esperasMs || [300, 900, 2000], ultimo = null;
+    if (!idbf || typeof idbf.open !== "function") {
+      return { ok: false, tipo: "no-disponible", error: { nombre: "SinIndexedDB", mensaje: "Este navegador no permite guardar datos en el dispositivo." }, intentos: 0 };
+    }
+    for (var i = 0; i <= esperas.length; i++) {
+      var bd = null;
+      try {
+        bd = await abrir(o);
+        await bd.meta.set("sonda_escritura", { en: Date.now() });   // abrir no basta: tiene que poder escribir
+        return { ok: true, bd: bd, intentos: i + 1 };
+      } catch (e) {
+        if (bd) bd.cerrar();
+        ultimo = e;
+        var tipo = clasificar(e);
+        if (tipo === "version" || tipo === "llena") break;          // reintentar no lo arregla
+        if (i < esperas.length) await dormir(esperas[i]);
+      }
+    }
+    return { ok: false, tipo: clasificar(ultimo), error: { nombre: (ultimo && ultimo.name) || "Error", mensaje: String((ultimo && ultimo.message) || ultimo || "") .slice(0, 200) }, intentos: esperas.length + 1 };
+  }
+
   function envolver(idb, nombre, idbf) {
-    var bd = { nombre: nombre, idb: idb };
+    var bd = { nombre: nombre, idb: idb, cerradaPorNavegador: false };
+    /* 3.15 (Bloque 3): el navegador puede cerrar la base a mitad de sesión (datos del sitio borrados, disco dañado): a partir de
+       ahí cualquier escritura fallaría. Se avisa a quien escuche para que lo muestre y bloquee, en vez de fallar a medias. */
+    var alCerrar = [];
+    bd.alCerrarse = function (fn) { alCerrar.push(fn); };
+    idb.onclose = function () { bd.cerradaPorNavegador = true; alCerrar.forEach(function (f) { try { f(); } catch (e) { /* un oyente roto no rompe */ } }); };
+    idb.onversionchange = function () { try { idb.close(); } catch (e) { /* ya */ } bd.cerradaPorNavegador = true; alCerrar.forEach(function (f) { try { f(); } catch (e) { /* idem */ } }); };
 
     /* Transacción con varias tablas. `fn` recibe un acceso `t` cuyas operaciones devuelven promesas de IndexedDB:
        dentro de `fn` solo se debe esperar a `t.*` (esperar a cualquier otra cosa cierra la transacción). */
@@ -122,6 +183,7 @@
         add: function (s, v) { return promesa(t.objectStore(s).add(v)); },
         borrar: function (s, k) { return promesa(t.objectStore(s).delete(k)); },
         todos: function (s) { return promesa(t.objectStore(s).getAll()); },
+        contar: function (s) { return promesa(t.objectStore(s).count()); },   // 3.15 (Bloque 7): contar sin copiar los registros
         porIndice: function (s, ind, k) { return promesa(t.objectStore(s).index(ind).get(k)); },
         todosPorIndice: function (s, ind, k) { return promesa(t.objectStore(s).index(ind).getAll(k)); },
         vaciar: function (s) { return promesa(t.objectStore(s).clear()); },
@@ -165,6 +227,7 @@
       todos: function (e) { return bd.transaccion([e], "readonly", function (t) { return t.todos(e); }); },
       get: function (e, id) { return bd.transaccion([e], "readonly", function (t) { return t.get(e, id); }); },
       porUid: function (e, uid) { return bd.transaccion([e], "readonly", function (t) { return t.porIndice(e, "by_uid", uid); }); },
+      contar: function (e) { return bd.transaccion([e], "readonly", function (t) { return t.contar(e); }); },
     };
     bd.outbox = {
       todos: function () { return bd.transaccion(["outbox"], "readonly", function (t) { return t.todos("outbox"); }); },
@@ -208,5 +271,5 @@
     return bd;
   }
 
-  global.SyncDB = { abrir: abrir, nombre: NOMBRE, nombreDispositivo: NOMBRE_DISPOSITIVO, version: VERSION, ENTIDADES: ENTIDADES, OTRAS: OTRAS, nombreParaSesion: nombreParaSesion, uuid: uuid };
+  global.SyncDB = { abrir: abrir, abrirSeguro: abrirSeguro, clasificarFallo: clasificar, ALMACEN_MENSAJES: ALMACEN_MENSAJES, nombre: NOMBRE, nombreDispositivo: NOMBRE_DISPOSITIVO, version: VERSION, ENTIDADES: ENTIDADES, OTRAS: OTRAS, nombreParaSesion: nombreParaSesion, uuid: uuid };
 })(typeof window !== "undefined" ? window : this);

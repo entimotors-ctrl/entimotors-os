@@ -102,8 +102,10 @@
     return Promise.resolve(o.obtenerToken ? o.obtenerToken() : null).catch(function () { return null; }).then(function (token) {
       if (token) return fn(token);
       if (!o.refrescar) return { ok: false, clase: "auth", status: 0, codigo: "SIN_SESION", mensaje: "No hay sesión válida." };
-      return Promise.resolve(o.refrescar()).catch(function () { return false; }).then(function (ok) {
-        return ok ? Promise.resolve(o.obtenerToken()).then(function (t2) { return t2 ? fn(t2) : { ok: false, clase: "auth", status: 0, codigo: "SIN_SESION", mensaje: "No hay sesión válida." }; })
+      // 3.15 (Checkpoint 8A): solo true es «renovó»; "temporal" (red/servidor) es un fallo de RED, nunca de sesión
+      return Promise.resolve(o.refrescar()).catch(function () { return "temporal"; }).then(function (ok) {
+        if (ok === "temporal") return { ok: false, clase: "red", status: 0, codigo: "RENOVACION_PENDIENTE", mensaje: "No se pudo renovar la sesión ahora." };
+        return ok === true ? Promise.resolve(o.obtenerToken()).then(function (t2) { return t2 ? fn(t2) : { ok: false, clase: "auth", status: 0, codigo: "SIN_SESION", mensaje: "No hay sesión válida." }; })
           : { ok: false, clase: "auth", status: 0, codigo: "SIN_SESION", mensaje: "No hay sesión válida." };
       });
     });
@@ -129,8 +131,9 @@
         if (r && r.falloRed) return { ok: false, clase: "red", status: 0, mensaje: r.mensaje || "sin red" };
         var k = clasificarStorage(r);
         if (k.clase === "auth" && o.refrescar) {
-          return Promise.resolve(o.refrescar()).catch(function () { return false; }).then(function (ok) {
-            if (!ok) return k;
+          return Promise.resolve(o.refrescar()).catch(function () { return "temporal"; }).then(function (ok) {
+            if (ok === "temporal") return { ok: false, clase: "red", status: 0, codigo: "RENOVACION_PENDIENTE", mensaje: "No se pudo renovar la sesión ahora." };
+            if (ok !== true) return k;
             return conToken({ obtenerToken: o.obtenerToken }, function (t2) {
               return unaVez(t2).then(function (r2) { return r2 && r2.falloRed ? { ok: false, clase: "red", status: 0, mensaje: r2.mensaje || "sin red" } : clasificarStorage(r2); });
             });
@@ -199,8 +202,9 @@
       return unaVez(token).then(function (r) {
         if (r && r.falloRed) return { ok: false, clase: "red", mensaje: r.mensaje || "sin red" };
         if (r.status === 401 && o.refrescar) {
-          return Promise.resolve(o.refrescar()).then(function (ok) {
-            if (!ok) return { ok: false, clase: "auth" };
+          return Promise.resolve(o.refrescar()).catch(function () { return "temporal"; }).then(function (ok) {
+            if (ok === "temporal") return { ok: false, clase: "red" };
+            if (ok !== true) return { ok: false, clase: "auth" };
             return Promise.resolve(o.obtenerToken()).then(unaVez).then(armar);
           });
         }
