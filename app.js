@@ -1141,7 +1141,7 @@ async function alCambiosRemotos(cambios) {
   programarChipNube();
   await pintarBadgeMensajes();
   if (esMecanicoCuenta()) {
-    if (cambios.some((c) => c.ent === "mensajes" && c.nuevo)) toast("Tienes un mensaje nuevo del administrador");
+    if (cambios.some((c) => c.ent === "mensajes" && c.nuevo)) await avisarMensajeNuevo();
     if (cambios.some((c) => c.ent === "ordenes" && c.nuevo)) toast("Te asignaron un trabajo nuevo");
     if (currentOrderId != null && document.getElementById("view-detalle")?.classList.contains("active")) {
       const uid = await syncBd.mapa.uidDe("ordenes", currentOrderId);
@@ -1203,16 +1203,36 @@ async function contextoMensaje(m) {
 async function renderMensajesMiTrabajo() {
   const cont = document.getElementById("miTrabajoMensajes");
   if (!cont) return;
+  const contFijos = document.getElementById("miTrabajoMensajesFijos");
+  if (contFijos) contFijos.innerHTML = "";
   if (!esMecanicoCuenta()) { cont.innerHTML = ""; return; }
   const [msgs, ops] = await Promise.all([mensajesLocales(), opsDeMensajes()]);
   const mios = msgs.filter((m) => m.destinatarioId === currentUser.perfilId);
   if (!mios.length) { cont.innerHTML = `<div class="card"><p style="color:var(--text-muted); margin:0;">No tienes mensajes del administrador.</p></div>`; return; }
+  // 3.16 (cambio 6): los de las últimas 36 h y los sin leer quedan FIJOS arriba de Mi Trabajo; el resto, plegado más abajo
+  const { fijos, historial } = MensajesFijos.separar(mios, Date.now(), noLeido);
+  // la franja de «mensaje nuevo» sobra cuando ya no queda ninguno sin leer (se marcó leído o se leyó en otro dispositivo)
+  if (!mios.some(noLeido)) { const franja = document.getElementById("avisoMensajeNuevo"); if (franja) franja.style.display = "none"; }
+  if (contFijos) contFijos.innerHTML = fijos.length
+    ? `<h3 class="font-display" style="font-size:0.95rem; margin:0 0 0.5rem;">📌 Mensajes del administrador</h3>` + (await tarjetasMensajes(fijos, ops, "mensaje-fijo")).join("")
+    : "";
+  const viejos = await tarjetasMensajes(historial.slice(0, 50), ops, "");
+  cont.innerHTML = viejos.length
+    ? `<details><summary class="btn ghost small">Mensajes anteriores (${historial.length})</summary><div style="margin-top:0.6rem;">${viejos.join("")}</div></details>`
+    : (fijos.length ? "" : `<div class="card"><p style="color:var(--text-muted); margin:0;">No tienes mensajes del administrador.</p></div>`);
+  [contFijos, cont].forEach((c) => {
+    if (!c) return;
+    c.querySelectorAll("[data-marcar-leido]").forEach((b) => b.addEventListener("click", () => marcarMensajeLeido(Number(b.dataset.marcarLeido))));
+    c.querySelectorAll("[data-abrir-orden]").forEach((a) => a.addEventListener("click", (e) => { e.preventDefault(); openOrder(Number(a.dataset.abrirOrden)); }));
+  });
+}
+async function tarjetasMensajes(lista, ops, clase) {
   const filas = [];
-  for (const m of mios.slice(0, 50)) {
+  for (const m of lista) {
     const ctx = await contextoMensaje(m);
     const confirmando = ops.some((o) => o.rpc === "marcar_mensaje_leido" && o.uid === m.uid && ["pending", "syncing"].includes(o.estado));
     const estado = m.leidoEn ? `Leído ${esc(FechaNegocio.fechaHora(m.leidoEn))}` : (m.leidoLocal || confirmando) ? "Leído · pendiente de confirmar" : "";
-    filas.push(`<div class="card mensaje-mt${noLeido(m) ? " no-leido" : ""}" data-mensaje="${m.id}" style="margin-bottom:0.6rem;">
+    filas.push(`<div class="card mensaje-mt${clase ? " " + clase : ""}${noLeido(m) ? " no-leido" : ""}" data-mensaje="${m.id}" style="margin-bottom:0.6rem;">
       <div style="display:flex; justify-content:space-between; gap:0.6rem; align-items:baseline;">
         <b>${esc(m.remitenteNombre || "Administrador")}</b>
         <span class="meta">${esc(FechaNegocio.fechaHora(m.creadoEn))}</span>
@@ -1225,9 +1245,33 @@ async function renderMensajesMiTrabajo() {
       </div>
     </div>`);
   }
-  cont.innerHTML = filas.join("");
-  cont.querySelectorAll("[data-marcar-leido]").forEach((b) => b.addEventListener("click", () => marcarMensajeLeido(Number(b.dataset.marcarLeido))));
-  cont.querySelectorAll("[data-abrir-orden]").forEach((a) => a.addEventListener("click", (e) => { e.preventDefault(); openOrder(Number(a.dataset.abrirOrden)); }));
+  return filas;
+}
+
+/* 3.16 (cambio 6): el aviso de mensaje nuevo era un toast de 3,4 s sin el texto. Ahora es una franja arriba con el comienzo del
+   mensaje, que se queda hasta que el mecánico la cierra o toca «Ver». El texto va con textContent: nunca como marcado. */
+async function avisarMensajeNuevo() {
+  if (!esMecanicoCuenta()) return;
+  const ultimo = (await mensajesLocales()).filter(noLeido)[0];
+  if (!ultimo) return;
+  let el = document.getElementById("avisoMensajeNuevo");
+  if (!el) {
+    el = document.createElement("div");
+    el.id = "avisoMensajeNuevo"; el.setAttribute("role", "status");
+    el.innerHTML = `<div class="aviso-msg-cuerpo"><b>📌 Mensaje nuevo del administrador</b><span data-texto></span></div>
+      <div class="aviso-msg-acciones"><button type="button" class="btn primary small" data-ver-aviso>Ver</button>
+      <button type="button" class="btn ghost small" data-cerrar-aviso>Cerrar</button></div>`;
+    el.querySelector("[data-cerrar-aviso]").addEventListener("click", () => { el.style.display = "none"; });
+    el.querySelector("[data-ver-aviso]").addEventListener("click", async () => {
+      el.style.display = "none";
+      if (showView("mi-trabajo")) await renderMiTrabajo();
+      document.getElementById("miTrabajoMensajesFijos")?.scrollIntoView({ block: "start" });
+    });
+    document.body.appendChild(el);
+  }
+  const texto = String(ultimo.texto || "");
+  el.querySelector("[data-texto]").textContent = texto.length > 120 ? texto.slice(0, 120) + "…" : texto;
+  el.style.display = "flex";
 }
 async function marcarMensajeLeido(localId) {
   if (!syncMotor || !esMecanicoCuenta()) return;
@@ -2118,11 +2162,14 @@ function alHacerClicUnaVez(btn, handler) {
 }
 
 /* ---------------- toasts ---------------- */
+/* 3.15.1 (TOAST-XSS): `msg` es TEXTO PLANO y se escapa aquí, una sola vez, para TODAS las llamadas. Antes se pintaba como HTML
+   y varias llamadas metían nombres escritos por usuarios (cliente, repuesto, CSV importado, sincronizados de otro dispositivo):
+   un nombre con marcado ejecutaba código en la sesión de quien viera el aviso. Nadie le pasa HTML a propósito. */
 function toast(msg, kind = "on") {
   const wrap = document.getElementById("toastWrap");
   const el = document.createElement("div");
   el.className = "toast";
-  el.innerHTML = `<span class="dot ${kind}"></span>${msg}`;
+  el.innerHTML = `<span class="dot ${kind}"></span>${esc(msg)}`;
   wrap.appendChild(el);
   setTimeout(() => el.remove(), 3400);
 }
@@ -2671,13 +2718,19 @@ function sesionDesdePerfil(perfil, correo) {
            activo: perfil.activo !== false };
 }
 
+/* 3.15.1 (LOGIN-ESTADO): antes decía «Conectado al servidor» solo porque el aparato tenía internet (navigator.onLine), aunque el
+   servidor no contestara; y sin señal ofrecía «acceso local», que en el producto publicado no existe (solo con config-local.js).
+   Ahora dice solo lo que sabe: si hay internet o no. Lo del servidor lo dice el intento de entrar (ver el submit), sin llamar al
+   servidor solo por abrir la app: sin sesión no se le habla. */
+const loginLocalDisponible = () => PERMITE_LOGIN_LOCAL && modoDesarrollo();
+const AVISO_SERVIDOR_NO_RESPONDE = "El servidor no responde ahora. Revisa la conexión y vuelve a intentarlo en un momento.";
 function pintarModoLogin() {
   const el = document.getElementById("loginModo");
   if (!el) return;
   const hay = window.Auth && Auth.disponible();
-  el.textContent = hay
-    ? (navigator.onLine ? "Conectado al servidor — entra con tu correo." : "Sin señal — solo acceso local.")
-    : "";
+  el.textContent = !hay ? ""
+    : navigator.onLine ? "Con internet — entra con tu correo."
+    : loginLocalDisponible() ? "Sin señal — solo acceso local." : "Sin señal — para entrar hace falta internet.";
 }
 
 let loginGateCableado = false;
@@ -2710,8 +2763,11 @@ function wireLoginGate() {
           r.motivo === "credenciales-invalidas" ? "Correo o contraseña incorrectos." :
           r.motivo === "cuenta-desactivada"     ? "Esta cuenta está dada de baja. Habla con el administrador." :
           r.motivo === "sin-perfil"             ? "La cuenta existe pero no tiene perfil asignado." :
-          r.motivo === "sin-conexion"           ? "Sin conexión con el servidor. Entra con tu usuario local." :
+          r.motivo === "sin-conexion"           ? (loginLocalDisponible() ? "Sin conexión con el servidor. Entra con tu usuario local."
+                                                                          : "Sin conexión con el servidor. Revisa tu internet y vuelve a intentarlo.") :
                                                   "No se pudo entrar. Inténtalo de nuevo.";
+        // con internet pero sin respuesta: el aviso de arriba lo dice (sin internet ya lo decía «Sin señal»)
+        if (r.motivo === "sin-conexion" && navigator.onLine) { const m = document.getElementById("loginModo"); if (m) m.textContent = AVISO_SERVIDOR_NO_RESPONDE; }
         return;
       }
       entrarConSesion(sesionDesdePerfil(r.datos, entrada.toLowerCase()));
@@ -3547,18 +3603,32 @@ async function renderDetalleMecanico(o) {
         <option value="taller">Taller</option><option value="negocio">Negocio</option>
       </select>`;
   await poblarSelectMecanico("detalleMecanicoSel", o.mecanico, o.mecanicoId);
-  document.getElementById("detalleOrigenSel").value = origenTrabajoDe(o);
-  document.getElementById("detalleMecanicoSel").addEventListener("change", async (e) => {
+  const selMec = document.getElementById("detalleMecanicoSel"), selOrigen = document.getElementById("detalleOrigenSel");
+  selOrigen.value = origenTrabajoDe(o);
+  /* 3.15.1 (OBS-E1a): cada cambio de estos selectores es una escritura en la nube (+1 revisión de la orden). En un teléfono es fácil
+     cambiarlos sin querer al desplazar, así que se confirma antes de guardar; si se cancela, el selector vuelve a lo guardado. */
+  let mecGuardado = selMec.value, origenGuardado = selOrigen.value;
+  selMec.addEventListener("change", async () => {
     if (!puedeAsignarMecanico()) { bloquear("Solo el administrador asigna trabajo"); return; }
+    const nombre = selMec.selectedOptions?.[0]?.textContent?.trim() || "sin asignar";
+    if (!(await showConfirm(`¿Asignar la orden #${o.id} a «${nombre}»?`, { titulo: "Cambiar mecánico", textoOk: "Sí, asignar" }))) {
+      selMec.value = mecGuardado; return;
+    }
     await updateOrder(o.id, ord => {
       const a = asignacionDesdeSelect("detalleMecanicoSel");
       ord.mecanico = a.mecanico; ord.mecanicoId = a.mecanicoId;
     });
+    mecGuardado = selMec.value;
     toast("Mecánico actualizado");
     renderOrdersList();
   });
-  document.getElementById("detalleOrigenSel").addEventListener("change", async (e) => {
-    await updateOrder(o.id, ord => { ord.origenTrabajo = e.target.value === "negocio" ? "negocio" : "taller"; });
+  selOrigen.addEventListener("change", async (e) => {
+    const origen = e.target.value === "negocio" ? "negocio" : "taller";
+    if (!(await showConfirm(`¿Marcar la orden #${o.id} como trabajo del ${origen === "negocio" ? "negocio" : "taller"}?`, { titulo: "Origen del trabajo", textoOk: "Sí, cambiar" }))) {
+      selOrigen.value = origenGuardado; return;
+    }
+    await updateOrder(o.id, ord => { ord.origenTrabajo = origen; });
+    origenGuardado = origen;
     toast("Origen del trabajo actualizado");
   });
 }
@@ -3638,6 +3708,11 @@ function renderStageTracker(estado, finalizada) {
     btn.addEventListener("click", async () => {
       if (finalizada) { toast("Este trabajo ya está finalizado", "off"); return; }
       const i = Number(btn.dataset.i);
+      /* 3.15.1 (OBS-E1a): un toque en la barra era una escritura en la nube sin preguntar (fácil al desplazar en un teléfono), y tocar
+         la etapa en la que ya estaba la orden también guardaba (+1 revisión sin cambio). Ahora la etapa actual no hace nada y las demás
+         se confirman. */
+      if (i === idx) return;
+      if (!(await showConfirm(`¿Pasar la orden #${currentOrderId} a «${STAGES[i].label}»?`, { titulo: "Cambiar etapa", textoOk: "Sí, cambiar" }))) return;
       const o = await updateOrder(currentOrderId, ord => setStage(ord, STAGES[i].key));
       toast(`Etapa: ${STAGES[i].label}`);
       openOrder(o.id);
@@ -3707,6 +3782,8 @@ async function renderStageContent(o) {
         ord.calidadChecklist = { ...(ord.calidadChecklist || {}), [e.target.dataset.key]: e.target.checked };
       }));
     });
+    // 3.16: en Calidad todavía se corrigen repuestos y mano de obra (lo que se encontró en la prueba de manejo)
+    if (!esMecanicoCuenta()) await renderPresupuestoStage(o, { anexar: true, soloLectura: !puedeCorregirRenglones(o) });
 
   } else if (o.estado === "entregado" && esMecanicoCuenta()) {
     // ni importes ni tipo de cobro ni garantía: para él es un registro cerrado
@@ -3802,6 +3879,8 @@ async function renderStageContent(o) {
       const texto = `Hola ${cliente.nombre}, ${cuerpo} — ENTIMOTORS`;
       navegarWA(ventana, cliente.telefono, texto);
     });
+    // 3.16: antes de cobrar todavía se corrige el detalle; ya cobrada queda a la vista en solo lectura
+    await renderPresupuestoStage(o, { anexar: true, soloLectura: !puedeCorregirRenglones(o) });
   }
 }
 
@@ -3827,7 +3906,13 @@ function etiquetaStockRenglon(it) {
   return `<span class="renglon-tag">se descuenta al aprobar</span>`;
 }
 
-async function renderPresupuestoStage(o, { anexar = false } = {}) {
+/* 3.16 · Los renglones se corrigen en CUALQUIER etapa mientras la orden no esté cobrada (el servidor solo los cierra con
+   finalizada/anulada: editar_item_orden y quitar_item_orden, sync-15b). Ya cobrada se ven en solo lectura: corregirla es anularla. */
+function puedeCorregirRenglones(o) {
+  return !esMecanicoCuenta() && !o.finalizada && !o.anulada;
+}
+
+async function renderPresupuestoStage(o, { anexar = false, soloLectura = false } = {}) {
   const items = o.items || [];
   const el = document.getElementById("stageContent");
   const html = `
@@ -3835,7 +3920,7 @@ async function renderPresupuestoStage(o, { anexar = false } = {}) {
       <h4 class="font-display" style="font-size:0.95rem; margin-bottom:0.6rem;">${anexar ? "Repuestos y mano de obra" : "Presupuesto"}</h4>
       <div class="presupuesto-estado" id="presupuestoEstado"></div>
       <div class="table-scroll">
-        <table id="tablaItems" class="tabla-renglones">
+        <table id="tablaItems" class="tabla-renglones tabla-tarjetas">
           <thead><tr><th>Ítem</th><th class="num">Cant.</th><th class="num">Precio</th><th class="num">Subtotal</th><th></th></tr></thead>
           <tbody id="itemsBody"></tbody>
         </table>
@@ -3843,17 +3928,20 @@ async function renderPresupuestoStage(o, { anexar = false } = {}) {
       <div style="display:flex; justify-content:space-between; margin-top:0.6rem; font-weight:600;">
         <span>Total</span><span id="itemsTotal" style="font-variant-numeric:tabular-nums;">${money(items.reduce((s, it) => s + it.cantidad * it.precio, 0))}</span>
       </div>
-      <button class="btn small" id="btnAgregarItem" style="margin-top:0.7rem;">+ Agregar mano de obra o repuesto</button>
-      <div id="aprobacionBox" style="margin-top:1rem; padding-top:1rem; border-top:1px solid var(--line);"></div>
+      ${soloLectura
+        ? `<p class="hint" style="margin:0.7rem 0 0;">La orden ya se cobró: para corregirla hay que anularla (PIN del propietario).</p>`
+        : `<button class="btn small" id="btnAgregarItem" style="margin-top:0.7rem;">+ Agregar mano de obra o repuesto</button>
+      <div id="aprobacionBox" style="margin-top:1rem; padding-top:1rem; border-top:1px solid var(--line);"></div>`}
     </div>`;
   if (anexar) el.insertAdjacentHTML("beforeend", html); else el.innerHTML = html;
 
   document.getElementById("itemsBody").innerHTML = items.length ? filasTablaRenglones(items, ({ it, i }) => `
     <tr>
-      <td>${esc(it.nombre)}${etiquetaStockRenglon(it)}</td><td class="num">${it.cantidad}</td><td class="num">${money(it.precio)}</td><td class="num">${money(it.cantidad * it.precio)}</td>
-      <td class="num"><span class="acciones"><button type="button" class="btn ghost small" data-editar="${i}" title="Editar renglón" aria-label="Editar ${esc(it.nombre)}">✎</button><button type="button" class="btn ghost small danger" data-quitar="${i}" title="Quitar ítem" aria-label="Quitar ítem">🗑</button></span></td>
+      <td class="celda-principal">${esc(it.nombre)}${etiquetaStockRenglon(it)}</td><td class="num" data-label="Cantidad">${it.cantidad}</td><td class="num" data-label="Precio">${money(it.precio)}</td><td class="num" data-label="Subtotal">${money(it.cantidad * it.precio)}</td>
+      <td class="num">${soloLectura ? "" : `<span class="acciones acciones-renglon"><button type="button" class="btn ghost small" data-editar="${i}" title="Editar renglón" aria-label="Editar ${esc(it.nombre)}">✎<span class="solo-telefono"> Editar</span></button><button type="button" class="btn ghost small danger" data-quitar="${i}" title="Quitar ítem" aria-label="Quitar ${esc(it.nombre)}">🗑<span class="solo-telefono"> Quitar</span></button></span>`}</td>
     </tr>`, { cols: 5, colSub: 3 }) : `<tr><td colspan="5" style="color:var(--text-faint);">Sin ítems todavía</td></tr>`;
 
+  if (soloLectura) return;
   document.getElementById("itemsBody").querySelectorAll("[data-editar]").forEach(btn => {
     btn.addEventListener("click", async () => {
       const idx = Number(btn.dataset.editar);
@@ -4673,15 +4761,166 @@ async function guardarRenglonOrden(r, editando, ctx) {
   return true;
 }
 
-/* ---- enviar progreso de la reparación por WhatsApp ---- */
-document.getElementById("btnEnviarProgresoWA").addEventListener("click", () => {
-  const ventana = abrirVentanaWA(); // sincrónico, antes de cualquier await
-  const { o, moto, cliente } = currentOrderCache;
+/* 3.16 (cambio 3) · Tablas largas como tarjetas en el teléfono. Las tablas marcadas con data-etiquetas="auto" (Clientes,
+   Inventario, Finanzas, Créditos) copian a cada celda el texto de su columna como data-label, cada vez que se repintan: el CSS
+   de .tabla-tarjetas lo usa en pantallas angostas. data-principal es la columna que hace de título de la tarjeta. Así ninguna de
+   las funciones que pintan esas filas tiene que cambiar. Las filas con colspan («Ver más», «Sin datos») se dejan como están. */
+function etiquetarTabla(tabla) {
+  const titulos = [...tabla.querySelectorAll("thead th")].map((th) => th.textContent.trim());
+  const principal = Number(tabla.dataset.principal || 0);
+  tabla.querySelectorAll("tbody tr").forEach((tr) => {
+    if (tr.querySelector("td[colspan]")) return;
+    [...tr.children].forEach((td, i) => {
+      if (i === principal) td.classList.add("celda-principal");
+      else if (titulos[i] && !td.dataset.label) td.dataset.label = titulos[i];
+    });
+  });
+}
+document.querySelectorAll('table[data-etiquetas="auto"]').forEach((tabla) => {
+  const tbody = tabla.querySelector("tbody");
+  if (!tbody) return;
+  etiquetarTabla(tabla);
+  new MutationObserver(() => etiquetarTabla(tabla)).observe(tbody, { childList: true });
+});
+
+/* ---- enviar progreso de la reparación por WhatsApp ----
+   3.16 (cambio 1): un enlace wa.me solo lleva texto, así que las fotos se quedaban en el sistema. Si la orden tiene fotos que
+   todavía no se le mandaron al cliente, se abre una ventana con ellas marcadas y se comparten con el menú del teléfono (que ya
+   trae WhatsApp), igual que la factura. Solo se marcan como enviadas cuando el menú de compartir termina bien: si se cancela o el
+   navegador no comparte archivos, el próximo avance las vuelve a ofrecer. Sin fotos nuevas, el texto sale como siempre. */
+function textoProgreso(o, moto, cliente) {
   const motoDesc = `${moto.marca} ${moto.modelo}`.trim();
   const cuerpo = (PROGRESO_MENSAJES[o.estado] || (() => `tu ${motoDesc} avanzó de etapa.`))(motoDesc);
-  const texto = `Hola ${cliente.nombre}, ${cuerpo} — ENTIMOTORS`;
-  navegarWA(ventana, cliente.telefono, texto);
+  return `Hola ${cliente.nombre}, ${cuerpo} — ENTIMOTORS`;
+}
+function llaveFotosAvance(o) { return o.uid || "local:" + o.id; }
+function fotosDeLaOrden(o) {
+  // las del Taller (base64 en el dispositivo; en Mi Trabajo, rutas) + la evidencia de los mecánicos (rutas de Storage)
+  return [...(o.fotos || []), ...(o.fotosNube || []).filter(esRutaFoto)];
+}
+
+document.getElementById("btnEnviarProgresoWA").addEventListener("click", () => {
+  const { o, moto, cliente } = currentOrderCache;
+  const texto = textoProgreso(o, moto, cliente);
+  const fotos = fotosDeLaOrden(o);
+  if (!FotosAvance.pendientes(fotos, FotosAvance.enviadasDe(llaveFotosAvance(o))).length) {
+    navegarWA(abrirVentanaWA(), cliente.telefono, texto);   // abrirVentanaWA sincrónico: el toque sigue vigente
+    return;
+  }
+  abrirProgresoFotos(o, cliente, texto, fotos);
 });
+
+let progresoFotos = null;   // { o, cliente, texto, fotos: [{ src, clave, enviada, archivo, error }] }
+
+function dataUrlABlob(url) {
+  const [cab, datos] = url.split(",");
+  const tipo = (cab.match(/^data:([^;,]+)/i) || [])[1] || "image/jpeg";
+  const bin = /;base64/i.test(cab) ? atob(datos) : decodeURIComponent(datos);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new Blob([bytes], { type: tipo });
+}
+
+function abrirProgresoFotos(o, cliente, texto, fotos) {
+  const enviadas = FotosAvance.enviadasDe(llaveFotosAvance(o));
+  const ctx = { o, cliente, texto, fotos: fotos.map((src) => ({ src, clave: FotosAvance.claveFoto(src), enviada: false, archivo: null, error: false })) };
+  ctx.fotos.forEach((f) => { f.enviada = enviadas.includes(f.clave); });
+  progresoFotos = ctx;
+  document.getElementById("progFotosTexto").textContent = texto;
+  const lista = document.getElementById("progFotosLista");
+  lista.innerHTML = ctx.fotos.map((f, i) => `
+    <label class="prog-foto">
+      <input type="checkbox" data-i="${i}" ${f.enviada ? "" : "checked"}>
+      <img data-i="${i}" alt="Foto ${i + 1} de la orden" ${/^data:/i.test(f.src) ? `src="${esc(f.src)}"` : ""}>
+      <span class="prog-foto-estado">${f.enviada ? "Ya enviada" : "Nueva"}</span>
+    </label>`).join("");
+  lista.querySelectorAll("input[type=checkbox]").forEach((c) => c.addEventListener("change", pintarEstadoProgresoFotos));
+  document.getElementById("modalProgresoFotos").classList.add("active");
+  pintarEstadoProgresoFotos();
+  prepararArchivosProgreso(ctx);
+}
+
+/* Los archivos se arman ANTES de tocar «Enviar»: navigator.share solo funciona mientras el toque sigue vigente. */
+async function prepararArchivosProgreso(ctx) {
+  await Promise.all(ctx.fotos.map(async (f, i) => {
+    try {
+      let blob;
+      if (/^data:/i.test(f.src)) blob = dataUrlABlob(f.src);
+      else {
+        const url = await obtenerUrlFotoFirmada(f.src);
+        if (!url) throw new Error("sin URL");
+        blob = await (await fetch(url)).blob();
+        const img = document.querySelector(`#progFotosLista img[data-i="${i}"]`);
+        if (img && progresoFotos === ctx) img.src = URL.createObjectURL(blob);
+      }
+      const ext = (blob.type.split("/")[1] || "jpg").replace("jpeg", "jpg");
+      f.archivo = new File([blob], `avance-orden-${ctx.o.id}-${i + 1}.${ext}`, { type: blob.type || "image/jpeg" });
+    } catch (e) { f.error = true; }
+  }));
+  if (progresoFotos === ctx) pintarEstadoProgresoFotos();
+}
+
+function fotosElegidas(ctx) {
+  return [...document.querySelectorAll("#progFotosLista input[type=checkbox]")].filter((c) => c.checked).map((c) => ctx.fotos[Number(c.dataset.i)]);
+}
+
+function pintarEstadoProgresoFotos() {
+  const ctx = progresoFotos;
+  if (!ctx) return;
+  const elegidas = fotosElegidas(ctx);
+  const faltan = elegidas.filter((f) => !f.archivo && !f.error).length;
+  const fallaron = elegidas.filter((f) => f.error).length;
+  const btn = document.getElementById("btnProgFotosEnviar");
+  btn.disabled = !elegidas.length || faltan > 0 || fallaron === elegidas.length;
+  btn.textContent = elegidas.length ? `Enviar ${elegidas.length} foto${elegidas.length === 1 ? "" : "s"} por WhatsApp` : "Elige al menos una foto";
+  document.getElementById("progFotosEstado").textContent = faltan ? "Preparando las fotos…"
+    : fallaron ? `${fallaron} foto${fallaron === 1 ? "" : "s"} no se pudo cargar (sin conexión o sin permiso) y no se enviará.` : "";
+}
+
+function cerrarProgresoFotos() {
+  document.querySelectorAll("#progFotosLista img").forEach((img) => { if (img.src.startsWith("blob:")) URL.revokeObjectURL(img.src); });
+  progresoFotos = null;
+  document.getElementById("modalProgresoFotos").classList.remove("active");
+}
+
+document.getElementById("btnProgFotosEnviar").addEventListener("click", () => {
+  const ctx = progresoFotos;
+  if (!ctx) return;
+  const elegidas = fotosElegidas(ctx).filter((f) => f.archivo);
+  const files = elegidas.map((f) => f.archivo);
+  if (!files.length) return;
+  // ni un solo await antes de share(): el navegador solo lo permite mientras el toque sigue vigente
+  if (navigator.canShare?.({ files })) {
+    navigator.clipboard?.writeText(ctx.texto).catch(() => {});   // en iPhone WhatsApp a veces descarta el texto: queda para pegarlo
+    navigator.share({ files, text: ctx.texto, title: `Avance de la orden #${ctx.o.id}` })
+      .then(() => {
+        const llave = llaveFotosAvance(ctx.o);
+        FotosAvance.guardar(llave, FotosAvance.marcar(FotosAvance.enviadasDe(llave), elegidas.map((f) => f.src)));
+        cerrarProgresoFotos();
+        toast(`Avance enviado · ${files.length} foto${files.length === 1 ? "" : "s"} (el texto también quedó copiado)`);
+      })
+      .catch((err) => {
+        if (err?.name === "AbortError") return;   // canceló el menú: no se marca nada
+        toast("No se pudo abrir el menú de compartir", "off");
+      });
+    return;
+  }
+  // PC u otro navegador que no comparte archivos: se descargan para adjuntarlas a mano y NO se marcan como enviadas
+  files.forEach((archivo) => {
+    const url = URL.createObjectURL(archivo), a = document.createElement("a");
+    a.href = url; a.download = archivo.name; document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+  });
+  toast("Este navegador no comparte fotos: se descargaron para que las adjuntes", "off");
+});
+
+document.getElementById("btnProgFotosSoloTexto").addEventListener("click", () => {
+  const ctx = progresoFotos;
+  if (!ctx) return;
+  navegarWA(abrirVentanaWA(), ctx.cliente.telefono, ctx.texto);
+  cerrarProgresoFotos();
+});
+document.getElementById("btnProgFotosCerrar").addEventListener("click", cerrarProgresoFotos);
 
 /* ---- factura de la orden: imprimirla o mandarla como archivo ----
    Llenar la plantilla es lo mismo en los dos casos, así que va aparte y
@@ -4897,8 +5136,8 @@ function renderCotItemsEdit() {
       <div class="cot-item-fila">
         <span class="nom">${esc(it.nombre)}<small>${it.cantidad} × ${money(it.precio)}</small></span>
         <span class="sub">${money(it.cantidad * it.precio)}</span>
-        <button type="button" data-editar="${i}" title="Editar" aria-label="Editar ${esc(it.nombre)}">✎</button>
-        <button type="button" data-quitar="${i}" title="Quitar" aria-label="Quitar ${esc(it.nombre)}">🗑</button>
+        <span class="acciones-renglon"><button type="button" data-editar="${i}" title="Editar" aria-label="Editar ${esc(it.nombre)}">✎<span class="solo-telefono"> Editar</span></button>
+        <button type="button" data-quitar="${i}" title="Quitar" aria-label="Quitar ${esc(it.nombre)}">🗑<span class="solo-telefono"> Quitar</span></button></span>
       </div>`).join("")}`).join("")
     : `<div class="cot-vacia">Sin renglones todavía — agrega la mano de obra y los repuestos.</div>`;
 
@@ -5053,7 +5292,7 @@ async function abrirCotizacionDetalle(id) {
   document.getElementById("cotDetDiagnostico").textContent = cot.diagnostico || "";
 
   document.getElementById("cotDetItems").innerHTML = filasTablaRenglones(cot.items || [], ({ it }) => `
-    <tr><td>${esc(it.nombre)}</td><td class="num">${it.cantidad}</td><td class="num">${money(it.precio)}</td><td class="num">${money(it.cantidad * it.precio)}</td></tr>`);
+    <tr><td class="celda-principal">${esc(it.nombre)}</td><td class="num" data-label="Cantidad">${it.cantidad}</td><td class="num" data-label="Precio">${money(it.precio)}</td><td class="num" data-label="Subtotal">${money(it.cantidad * it.precio)}</td></tr>`);
 
   document.getElementById("cotDetTotales").innerHTML = totalesPorTipoHtml(cot.items || []);
 
@@ -5074,6 +5313,12 @@ async function abrirCotizacionDetalle(id) {
   document.getElementById("btnCotRechazar").style.display = (estado === "pendiente" || estado === "vencida") ? "inline-flex" : "none";
   document.getElementById("btnCotRenovar").style.display = (estado === "vencida" || estado === "rechazada") ? "inline-flex" : "none";
   document.getElementById("btnCotEnviarWA").style.display = yaCerrada ? "none" : "inline-flex";
+  // 3.16: una aceptada no se borra (ya es una orden con su inventario): se corrige en la orden, a un toque
+  document.getElementById("btnCotEliminar").style.display = yaCerrada || cot.ordenId ? "none" : "inline-flex";
+  const abrirOrden = document.getElementById("btnCotAbrirOrden");
+  abrirOrden.style.display = cot.ordenId ? "inline-flex" : "none";
+  abrirOrden.textContent = cot.ordenId ? `Abrir la orden #${cot.ordenId} para corregir` : "";
+  abrirOrden.dataset.orden = cot.ordenId || "";
 
   document.getElementById("modalCotDetalle").classList.add("active");
 }
@@ -5128,16 +5373,35 @@ document.getElementById("btnCotRechazar").addEventListener("click", async () => 
   abrirCotizacionDetalle(cot.id);
 });
 
-document.getElementById("btnCotEliminar").addEventListener("click", () => {
+/* 3.16: antes pedía el código de administrador de config-local.js, que NO se publica: en producción ningún código servía y la
+   cotización no se podía borrar. Una cotización sin aceptar no movió inventario ni caja, así que basta con confirmar. */
+document.getElementById("btnCotEliminar").addEventListener("click", async () => {
   const id = cotizacionDetalleId;
-  requestAdminCode(async () => {
-    await DB.delete("cotizaciones", id);
-    markDirty();
-    toast("Cotización eliminada");
-    cerrarCotDetalle();
-    await renderCotizaciones();
-    renderDashboard();
-  });
+  // primero al día con la nube (como aceptar): otro teléfono pudo haberla aceptado y esta copia todavía no lo sabe
+  await alDiaParaDecidir();
+  const cot = await DB.get("cotizaciones", id);
+  if (!cot || cot.estado === "aceptada" || cot.ordenId) {
+    toast(cot ? `La cotización #${cot.id} ya se aceptó: se corrige en su orden` : "Esa cotización ya no existe", "off");
+    if (cot) abrirCotizacionDetalle(cot.id);
+    return;
+  }
+  const ok = await showConfirm(`Se borra la cotización #${cot.id} de ${cot.clienteNombre || cot.nombre || "este cliente"}. No movió inventario ni caja.`,
+    { titulo: "Eliminar cotización", textoOk: "Eliminar" });
+  if (!ok) return;
+  await DB.delete("cotizaciones", id);
+  markDirty();
+  registrarAuditoria("eliminar", "cotizaciones", id, `Cotización #${cot.id}`);
+  toast("Cotización eliminada");
+  cerrarCotDetalle();
+  await renderCotizaciones();
+  renderDashboard();
+});
+
+document.getElementById("btnCotAbrirOrden").addEventListener("click", (e) => {
+  const ordenId = Number(e.currentTarget.dataset.orden);
+  if (!ordenId) return;
+  cerrarCotDetalle();
+  openOrder(ordenId);
 });
 
 /* ---- 3.15 · Bloque 1A · aceptar en MODO NUBE = convertir_cotizacion ----
@@ -6383,7 +6647,7 @@ async function renderInventario() {
   const body = document.getElementById("inventarioBody");
   document.getElementById("inventarioEmpty").style.display = invAll.length ? "none" : "block";
   if (inventarioFiltro && !inv.length) {
-    body.innerHTML = `<tr><td colspan="5" style="color:var(--text-faint); text-align:center; padding:1.5rem 0;">Ningún repuesto coincide con este filtro.</td></tr>`;
+    body.innerHTML = `<tr><td colspan="6" style="color:var(--text-faint); text-align:center; padding:1.5rem 0;">Ningún repuesto coincide con este filtro.</td></tr>`;
     return;
   }
   body.innerHTML = inv.map(r => `
@@ -6392,12 +6656,14 @@ async function renderInventario() {
       <td style="cursor:pointer;">${esc(r.modelo || "Todos")}</td>
       <td class="num" style="cursor:pointer;">${r.cantidad}${r.requiereRevision ? ` <span title="Stock negativo por una venta sin conexión: revisar">⚠</span>` : ""}</td>
       <td class="num" style="cursor:pointer;">${money(r.precio)}</td>
-      <td><label style="display:flex; align-items:center; gap:0.4rem; cursor:pointer; margin:0;"><input type="checkbox" class="chk-publicar" data-id="${r.id}" ${r.publicarEnWeb ? "checked" : ""} style="width:1.05rem; height:1.05rem; margin:0; accent-color:var(--red);"></label></td>
+      <td class="no-abrir"><label style="display:flex; align-items:center; gap:0.4rem; cursor:pointer; margin:0;"><input type="checkbox" class="chk-publicar" data-id="${r.id}" ${r.publicarEnWeb ? "checked" : ""} style="width:1.05rem; height:1.05rem; margin:0; accent-color:var(--red);"></label></td>
+      <td class="no-abrir">${puedeDarEntrada() ? `<div class="acciones-renglon"><button type="button" class="btn small btn-entrada" data-id="${r.id}">＋ Entrada</button></div>` : ""}</td>
     </tr>`).join("");
 
-  body.querySelectorAll(".rep-row td:not(:last-child)").forEach(td => {
+  body.querySelectorAll(".rep-row td:not(.no-abrir)").forEach(td => {
     td.addEventListener("click", () => openRepuestoDetalle(Number(td.closest("tr").dataset.id)));
   });
+  body.querySelectorAll(".btn-entrada").forEach(btn => btn.addEventListener("click", () => abrirEntrada(Number(btn.dataset.id))));
   body.querySelectorAll(".chk-publicar").forEach(chk => {
     chk.addEventListener("click", (e) => e.stopPropagation());
     chk.addEventListener("change", async () => {
@@ -6427,6 +6693,7 @@ async function openRepuestoDetalle(id) {
   document.getElementById("repDetalleCantidad").textContent = r.cantidad + (r.requiereRevision ? " ⚠ revisar" : "");
   // SYNC-7B: ajuste manual por ledger (ajustar_stock). Admin directo, cajero con PIN; el mecánico no lo ve.
   document.getElementById("btnAjustarStock").style.display = finanzasNube() && ["admin", "cajero"].includes(currentUser?.rol) ? "" : "none";
+  document.getElementById("btnEntradaStock").style.display = puedeDarEntrada() ? "" : "none";
   document.getElementById("repDetallePrecio").textContent = money(r.precio);
   document.getElementById("repDetalleFotoWrap").innerHTML = r.foto ? `<img src="${r.foto}" style="width:100%; max-height:220px; object-fit:cover; border-radius:0.6rem; border:1px solid var(--border);">` : "";
   document.getElementById("modalRepuestoDetalle").classList.add("active");
@@ -6446,6 +6713,71 @@ document.getElementById("btnAjustarStock").addEventListener("click", async () =>
     renderInventario();
   }
 });
+/* 3.16 (cambio 8) · entrada de mercancía. Recibir lo que llegó es lo más común del inventario y antes solo se podía con
+   «Ajustar stock» (pensado para corregir errores) o cambiando la cantidad en Editar, y los dos pedían un motivo. Aquí no:
+   el motivo lo escribe el sistema. En modo nube viaja por el mismo ajustar_stock con delta (el servidor no tiene todavía una
+   acción propia de entrada, así que el cajero sigue necesitando el PIN); sin nube suma directo y lo anota en la auditoría. */
+function puedeDarEntrada() { return ["admin", "cajero"].includes(currentUser?.rol); }
+let entradaRepuestoId = null;
+function cantidadEntrada() { return Number(String(document.getElementById("entradaCantidad").value).replace(",", ".")); }
+async function pintarEntrada() {
+  const r = await DB.get("inventario", entradaRepuestoId);
+  if (!r) return;
+  const n = cantidadEntrada();
+  document.getElementById("entradaResultado").textContent = Number.isFinite(n) && n > 0
+    ? `Hay ${r.cantidad} → quedarán ${Number(r.cantidad) + n}` : `Hay ${r.cantidad}`;
+}
+async function abrirEntrada(id, cantidad = 1) {
+  const r = await DB.get("inventario", id);
+  if (!r) return;
+  entradaRepuestoId = id;
+  document.getElementById("entradaRepuesto").textContent = r.nombre + (r.modelo ? " · " + r.modelo : "");
+  document.getElementById("entradaCantidad").value = cantidad;
+  document.getElementById("entradaCosto").value = r.costoCompra || "";
+  document.getElementById("entradaNota").value = "";
+  document.getElementById("entradaError").textContent = "";
+  await pintarEntrada();
+  document.getElementById("modalRepuestoDetalle").classList.remove("active");
+  document.getElementById("modalEntrada").classList.add("active");
+}
+document.getElementById("entradaCantidad").addEventListener("input", pintarEntrada);
+[["btnEntradaMas", 1], ["btnEntradaMenos", -1]].forEach(([idBtn, paso]) => document.getElementById(idBtn).addEventListener("click", () => {
+  const n = cantidadEntrada();
+  document.getElementById("entradaCantidad").value = Math.max(1, (Number.isFinite(n) ? Math.round(n) : 0) + paso);
+  pintarEntrada();
+}));
+document.getElementById("btnCancelarEntrada").addEventListener("click", () => document.getElementById("modalEntrada").classList.remove("active"));
+document.getElementById("btnEntradaStock").addEventListener("click", () => abrirEntrada(repDetalleActualId));
+alHacerClicUnaVez(document.getElementById("btnGuardarEntrada"), async () => {
+  const error = document.getElementById("entradaError");
+  error.textContent = "";
+  const r = await DB.get("inventario", entradaRepuestoId);
+  if (!r) return;
+  const n = cantidadEntrada();
+  if (!Number.isFinite(n) || n <= 0) { error.textContent = "Escribe cuántos llegaron (1 o más)."; return; }
+  const textoCosto = String(document.getElementById("entradaCosto").value).trim();
+  const costo = textoCosto === "" ? null : Number(textoCosto.replace(",", "."));
+  if (costo !== null && (!Number.isFinite(costo) || costo < 0)) { error.textContent = "El costo no puede ser negativo."; return; }
+  const nota = document.getElementById("entradaNota").value.trim();
+  const antes = Number(r.cantidad) || 0;
+  const motivo = "Entrada de mercancía" + (nota ? ": " + nota : "");
+  if (finanzasNube()) {
+    if (!(await accionAutorizada((d) => syncFin.construir.ajusteStock(d), { inventarioUid: r.uid, delta: n, motivo }, ["inventario"], `Entrada registrada: quedan ${antes + n}`))) return;
+  } else {
+    await DB.save("inventario", { ...r, cantidad: antes + n });
+    await registrarAuditoria("entrada_stock", "inventario", r.id, `${r.nombre}: +${n} (${antes} → ${antes + n})${nota ? " · " + nota : ""}`);
+    toast(`Entrada registrada: quedan ${antes + n}`);
+  }
+  // el costo es dato del maestro (no del ledger de stock): se guarda aparte, sobre el registro ya bajado de la nube
+  if (costo !== null && costo !== Number(r.costoCompra || 0)) {
+    const fresco = await DB.get("inventario", r.id);
+    if (fresco) await DB.save("inventario", { ...fresco, costoCompra: costo });
+  }
+  markDirty();
+  document.getElementById("modalEntrada").classList.remove("active");
+  renderInventario();
+});
+
 document.getElementById("btnEditarRepuesto").addEventListener("click", async () => {
   const r = await DB.get("inventario", repDetalleActualId);
   if (!r) return;
@@ -6453,6 +6785,7 @@ document.getElementById("btnEditarRepuesto").addEventListener("click", async () 
   document.getElementById("repuestoNombre").value = r.nombre || "";
   document.getElementById("repuestoModelo").value = r.modelo || "";
   document.getElementById("repuestoCantidad").value = r.cantidad || 0;
+  marcarCantidadEditable(!finanzasNube());
   document.getElementById("repuestoPrecio").value = r.precio || 0;
   document.getElementById("repuestoCosto").value = r.costoCompra || 0;
   document.getElementById("repuestoStockMinimo").value = r.stockMinimo ?? 3;
@@ -6465,10 +6798,16 @@ document.getElementById("btnEditarRepuesto").addEventListener("click", async () 
 });
 
 let repuestoEditId = null;
+// en modo nube la cantidad de un repuesto que ya existe solo cambia con «＋ Entrada» o «Ajustar stock» (los dos van al ledger)
+function marcarCantidadEditable(si) {
+  document.getElementById("repuestoCantidad").readOnly = !si;
+  document.getElementById("repuestoCantidadNota").style.display = si ? "none" : "";
+}
 document.getElementById("btnNuevoRepuesto").addEventListener("click", async () => {
   repuestoEditId = null;
   ["repuestoNombre", "repuestoModelo", "repuestoPrecio", "repuestoCodigoBarras"].forEach(id => document.getElementById(id).value = "");
   document.getElementById("repuestoCantidad").value = 1;
+  marcarCantidadEditable(true);
   document.getElementById("repuestoCosto").value = 0;
   document.getElementById("repuestoStockMinimo").value = 3;
   document.getElementById("repuestoPublicarWeb").checked = false;
@@ -6494,6 +6833,22 @@ alHacerClicUnaVez(document.getElementById("btnGuardarRepuesto"), async () => {
   const foto = fotoFile ? await fotoLocal(fotoFile) : (repuestoEditId ? (await DB.get("inventario", repuestoEditId))?.foto : null);
   const precio = Number(document.getElementById("repuestoPrecio").value) || 0;
   const cantidad = Number(document.getElementById("repuestoCantidad").value) || 0;
+  if (!repuestoEditId) {
+    // 3.16 (cambio 8): si ya está registrado (mismo nombre y modelo, o mismo código de barras), sumar en vez de duplicar
+    const codigo = document.getElementById("repuestoCodigoBarras").value.trim();
+    const modelo = normalizarNombre(document.getElementById("repuestoModelo").value);
+    const existente = (await DB.getAll("inventario")).find((x) => (codigo && x.codigoBarras === codigo)
+      || (normalizarNombre(x.nombre) === normalizarNombre(nombre) && normalizarNombre(x.modelo) === modelo));
+    if (existente) {
+      const sumar = await showConfirm(`Ya tienes «${existente.nombre}»${existente.modelo ? " (" + existente.modelo + ")" : ""} con ${existente.cantidad}. ¿Sumarle lo que llegó en lugar de crear otro igual?`,
+        { titulo: "Este repuesto ya existe", textoOk: "Sumar al que existe", textoCancelar: "Volver" });
+      if (sumar) {
+        document.getElementById("modalRepuesto").classList.remove("active");
+        await abrirEntrada(existente.id, cantidad > 0 ? cantidad : 1);
+      }
+      return;
+    }
+  }
   const costoCompra = Number(document.getElementById("repuestoCosto").value) || 0;
   const stockMinimo = Number(document.getElementById("repuestoStockMinimo").value) || 0;
   if (precio < 0 || cantidad < 0 || costoCompra < 0 || stockMinimo < 0) {
@@ -8368,7 +8723,7 @@ alHacerClicUnaVez(document.getElementById("btnForzarActualizacion"), buscarActua
    fecha e identificador, para que al restaurarlo se sepa exactamente de dónde
    salió y si el esquema es compatible. */
 
-const VERSION_APP = "3.15.0";
+const VERSION_APP = "3.16.0";
 const VERSION_RESPALDO = 2; // formato del archivo, no de la app
 
 async function armarRespaldo() {

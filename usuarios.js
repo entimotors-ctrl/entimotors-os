@@ -38,11 +38,36 @@
       return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
     });
   }
-  /* Recibe TEXTO PLANO. toast() pinta su argumento como HTML, así que se escapa
-     aquí, una sola vez, justo antes de entregárselo: lo que dijo el servidor
-     nunca se convierte en marcado. */
-  function aviso(msg) { if (typeof toast === "function") toast(esc(msg), "off"); }
-  function bien(msg) { if (typeof toast === "function") toast(msg); }
+  /* Recibe TEXTO PLANO y lo entrega tal cual: desde 3.15.1 toast() (app.js) escapa
+     su argumento una sola vez, así que escapar también aquí lo haría DOS veces
+     («&amp;lt;»). Lo que dijo el servidor nunca se convierte en marcado. */
+  /* 3.16 (cambio 7): el resultado de una acción se queda en un recuadro fijo encima de la lista hasta «Entendido». Antes era solo un
+     toast de 3,4 s: tras eliminar a alguien la lista se repintaba igual y el aviso se iba antes de leerlo. Solo textContent. */
+  function avisoFijo(msg, tipo, accion) {
+    var el = document.getElementById("usuariosAvisoFijo");
+    if (!el) return;
+    el.className = "card aviso-fijo " + (tipo === "error" ? "aviso-error" : "aviso-ok");
+    el.textContent = "";
+    var p = document.createElement("p"); p.style.margin = "0 0 0.5rem"; p.textContent = msg; el.appendChild(p);
+    var fila = document.createElement("div"); fila.style.cssText = "display:flex; gap:0.5rem; flex-wrap:wrap;";
+    if (accion) {
+      var ir = document.createElement("button"); ir.type = "button"; ir.className = "btn primary small"; ir.textContent = accion.texto;
+      ir.addEventListener("click", function () { el.style.display = "none"; accion.hacer(); }); fila.appendChild(ir);
+    }
+    var ok = document.createElement("button"); ok.type = "button"; ok.className = "btn ghost small"; ok.textContent = "Entendido";
+    ok.addEventListener("click", function () { el.style.display = "none"; }); fila.appendChild(ok);
+    el.appendChild(fila);
+    el.style.display = "";
+    if (typeof el.scrollIntoView === "function") el.scrollIntoView({ block: "nearest" });
+  }
+  function aviso(msg) { if (typeof toast === "function") toast(msg, "off"); avisoFijo(msg, "error"); }
+  /* Sin PIN del propietario no se puede eliminar: se dice ANTES de empezar y se ofrece ir a Ajustes (texto fijo, sin datos del servidor). */
+  function avisoSinPin() {
+    var msg = "Primero configura el PIN del propietario en Ajustes. Sin él no se puede eliminar a nadie.";
+    if (typeof toast === "function") toast(msg, "off");
+    avisoFijo(msg, "error", { texto: "Ir a Ajustes", hacer: function () { if (typeof showView === "function") showView("ajustes"); } });
+  }
+  function bien(msg) { if (typeof toast === "function") toast(msg); avisoFijo(msg, "ok"); }
 
   /* Primera CADENA no vacía de la lista; un objeto anidado no se convierte a
      texto (saldría «[object Object]»). */
@@ -55,7 +80,8 @@
 
   /* Todas las llamadas pasan por aquí: una sola puerta para el token y para
      traducir los fallos a algo que se pueda leer. */
-  async function pedir(metodo, ruta, cuerpo) {
+  async function pedir(metodo, ruta, cuerpo) { return pedirApi(metodo, "/api/admin/usuarios" + (ruta || ""), cuerpo); }
+  async function pedirApi(metodo, rutaCompleta, cuerpo) {
     var base = baseApi();
     if (!base) return { ok: false, motivo: "sin-servidor" };
     if (!global.Auth || !Auth.estado().conSesion) return { ok: false, motivo: "sin-sesion" };
@@ -67,7 +93,7 @@
     var corta = new AbortController();
     var reloj = setTimeout(function () { corta.abort(); }, 20000);
     try {
-      var res = await fetch(base + "/api/admin/usuarios" + (ruta || ""), {
+      var res = await fetch(base + rutaCompleta, {
         method: metodo,
         headers: {
           "Content-Type": "application/json",
@@ -126,13 +152,16 @@
     if (!r.ok) { pintarMensaje(textoDeFallo(r)); return; }
 
     var us = (r.datos && r.datos.usuarios) || [];
-    var filas = us.map(function (u) {
+    // 3.16 (cambio 7): los eliminados se conservan (su historial lleva su nombre) pero ya no ocupan la lista del equipo
+    var activos = us.filter(function (u) { return !u.eliminado; });
+    var eliminados = us.filter(function (u) { return u.eliminado; });
+    var fila = function (u) {
       // 3.15 (Bloque 4): una cuenta ELIMINADA no tiene acciones (no se reactiva ni cambia de rol); su nombre queda en su historial
       var acciones = u.eliminado ? '<span class="hint">Usuario eliminado</span>'
         : u.esUsted || u.rol === "admin"
-        ? '<span class="hint">—</span>'
+        ? ""   // 3.16: celda vacía (en el teléfono la tarjeta la oculta; antes quedaba un «—» suelto)
         : '<div style="display:flex; gap:0.35rem; flex-wrap:wrap;">' +
-            '<select class="u-rol" data-id="' + esc(u.id) + '" style="padding:0.3rem 0.4rem;">' +
+            '<select class="u-rol" data-id="' + esc(u.id) + '" data-nombre="' + esc(u.nombre) + '" data-actual="' + esc(u.rol) + '" aria-label="Rol de ' + esc(u.nombre) + '" style="padding:0.3rem 0.4rem;">' +
               ROLES.map(function (x) {
                 return '<option value="' + x.valor + '"' + (u.rol === x.valor ? " selected" : "") + ">" + x.texto + "</option>";
               }).join("") +
@@ -148,13 +177,15 @@
               '" title="Genera un enlace de un solo uso para que esta persona elija una contraseña nueva">Generar enlace</button>' : "") +
           "</div>";
       return "<tr>" +
-        "<td>" + esc(u.nombre) + (u.esUsted ? ' <span class="hint">(tú)</span>' : "") + "</td>" +
-        "<td>" + esc(u.correo) + "</td>" +
-        "<td>" + (esc(u.telefono) || '<span class="hint">—</span>') + "</td>" +
-        "<td>" + esc(NOMBRE_ROL[u.rol] || u.rol) + "</td>" +
-        '<td>' + (u.eliminado ? '<span style="opacity:.65;">Eliminado</span>' : u.activo ? "Activo" : '<span style="opacity:.65;">Inactivo</span>') + "</td>" +
-        "<td>" + acciones + "</td></tr>";
-    }).join("");
+        '<td class="celda-principal">' + esc(u.nombre) + (u.esUsted ? ' <span class="hint">(tú)</span>' : "") + "</td>" +
+        '<td data-label="Correo">' + esc(u.correo) + "</td>" +
+        '<td data-label="Teléfono">' + (esc(u.telefono) || '<span class="hint">—</span>') + "</td>" +
+        '<td data-label="Rol">' + esc(NOMBRE_ROL[u.rol] || u.rol) + "</td>" +
+        '<td data-label="Estado">' + (u.eliminado ? '<span style="opacity:.65;">Eliminado</span>' : u.activo ? "Activo" : '<span style="opacity:.65;">Inactivo</span>') + "</td>" +
+        '<td class="u-acciones">' + acciones + "</td></tr>";
+    };
+    var cabecera = "<thead><tr><th>Nombre</th><th>Correo</th><th>Teléfono</th><th>Rol</th><th>Estado</th><th>Acciones</th></tr></thead>";
+    var filas = activos.map(fila).join("");
 
     /* «Nuevo usuario» va ANTES de la lista, no después: con unas pocas personas en el equipo la tarjeta caía por debajo del pliegue
        (y con ella el enlace generado, que se pinta en #nuResultado), y al pulsar el botón no pasaba nada a la vista. */
@@ -181,12 +212,12 @@
       '<div class="card" id="cardEnlaceRecuperacion" style="margin-bottom:1rem; display:none;"></div>' +
       '<div class="card">' +
         '<div style="display:flex; justify-content:space-between; align-items:center; gap:0.6rem; flex-wrap:wrap; margin-bottom:0.6rem;">' +
-          '<h3 class="font-display" style="font-size:0.95rem; margin:0;">Equipo · ' + us.length + "</h3>" +
+          '<h3 class="font-display" style="font-size:0.95rem; margin:0;">Equipo · ' + activos.length + "</h3>" +
           '<button class="btn primary small" id="btnNuevoUsuario">+ Nuevo usuario</button>' +
         "</div>" +
-        '<div class="table-scroll"><table><thead><tr>' +
-          "<th>Nombre</th><th>Correo</th><th>Teléfono</th><th>Rol</th><th>Estado</th><th>Acciones</th>" +
-        "</tr></thead><tbody>" + filas + "</tbody></table></div>" +
+        '<div class="table-scroll"><table class="tabla-tarjetas lista-equipo">' + cabecera + "<tbody>" + filas + "</tbody></table></div>" +
+        (eliminados.length ? '<details class="u-eliminados" style="margin-top:0.8rem;"><summary class="btn ghost small">Ver eliminados (' + eliminados.length + ")</summary>" +
+          '<div class="table-scroll" style="margin-top:0.6rem;"><table class="tabla-tarjetas">' + cabecera + "<tbody>" + eliminados.map(fila).join("") + "</tbody></table></div></details>" : "") +
         '<p class="hint" style="margin:0.6rem 0 0;">Eliminar usuario no borra su historial: la persona deja de poder entrar (en todos sus ' +
         "dispositivos), pero sus órdenes, ventas, caja, mensajes y bitácora se quedan como están, con su nombre. Pide el PIN del propietario.</p>" +
       "</div>";
@@ -309,6 +340,12 @@
       var ok = await showConfirm(texto, { titulo: "Eliminar usuario", textoOk: activo ? "Desasignar " + activo + " y eliminar" : "Eliminar usuario" });
       if (!ok) return;
       if (!global.PinUI) { r = { ok: false, motivo: "sin-pin-ui" }; aviso(textoPlanoDeFallo(r)); return; }
+      // 3.16: sin PIN configurado el flujo terminaba en un aviso de 3 s después de la confirmación; ahora se dice antes y a dónde ir
+      var pin = await pedirApi("GET", "/api/admin/pin/estado");
+      if (pin.ok && pin.datos && pin.datos.configurado === false) {
+        avisoSinPin();
+        return;
+      }
       var dev = await idDispositivo();
       var aut = await PinUI.autorizarAccion({ accion: "eliminar_usuario", rol: "admin", registroId: id, deviceId: dev });
       if (!aut || !aut.ok) return;   // PinUI ya explicó el motivo (PIN incorrecto, bloqueado, sin PIN configurado…)
@@ -331,8 +368,8 @@
         return;
       }
       var d = r.datos || {};
-      bien(nombre + " ya no puede entrar" + (d.sesiones_revocadas ? " (" + d.sesiones_revocadas + " sesión(es) cerrada(s))" : "") +
-        ". Su historial se conserva." + ((d.ordenes_desasignadas || []).length + (d.citas_desasignadas || []).length
+      bien(nombre + " eliminado · ya no puede entrar" + (d.sesiones_revocadas ? " (" + d.sesiones_revocadas + " sesión(es) cerrada(s))" : "") +
+        " · su historial se conserva." + ((d.ordenes_desasignadas || []).length + (d.citas_desasignadas || []).length
           ? " Quedaron sin asignar " + (d.ordenes_desasignadas || []).length + " orden(es) y " + (d.citas_desasignadas || []).length + " cita(s)." : ""));
       render();
     } finally { enCurso = false; if (boton) boton.disabled = false; }
@@ -347,7 +384,12 @@
 
     document.querySelectorAll(".u-rol").forEach(function (sel) {
       sel.addEventListener("change", async function () {
-        if (enCurso) return; enCurso = true;
+        if (enCurso) { sel.value = sel.dataset.actual; return; }
+        // 3.16: como las etapas de la orden en 3.15.1, el rol ya no se guarda al primer toque (en el teléfono se cambia sin querer)
+        var ok = typeof showConfirm === "function" && await showConfirm("¿Pasar a " + sel.dataset.nombre + " de " + (NOMBRE_ROL[sel.dataset.actual] || sel.dataset.actual) +
+          " a " + (NOMBRE_ROL[sel.value] || sel.value) + "?", { titulo: "Cambiar rol", textoOk: "Cambiar rol" });
+        if (!ok) { sel.value = sel.dataset.actual; return; }
+        enCurso = true;
         var r = await pedir("PATCH", "/" + sel.dataset.id, { rol: sel.value });
         enCurso = false;
         if (!r.ok) { aviso(textoPlanoDeFallo(r)); render(); return; }
@@ -444,7 +486,8 @@
       });
       var listoBtn = document.getElementById("btnListoUsuario");
       if (listoBtn) listoBtn.addEventListener("click", function () { render(); });
-      bien("Usuario creado");
+      // solo el aviso corto: el resultado (con el enlace) ya está a la vista en la tarjeta, y el recuadro fijo de arriba lo empujaría (OBS-8)
+      if (typeof toast === "function") toast("Usuario creado");
     });
   }
 

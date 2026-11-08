@@ -144,6 +144,20 @@
   button.btn.wa:hover { background: #1a7a4d; }
   button.btn.danger { color: var(--red); }
   button.btn.danger:hover { background: var(--red-soft); border-color: var(--red-border); }
+  /* 3.16: «botones» que no son <button> (la etiqueta que abre el selector de fotos y los desplegables <summary>): mismo aspecto.
+     Sin esto tomaban la regla general de <label> (texto gris pequeño) y en el teléfono no se reconocían como botones. */
+  label.btn, summary.btn {
+    display: inline-flex; align-items: center; justify-content: center; gap: 0.4rem; margin: 0;
+    border: 1px solid var(--border); background: var(--panel); color: var(--text); border-radius: 0.55rem;
+    padding: 0.55rem 1rem; font-weight: 600; font-size: 0.85rem; cursor: pointer; text-transform: none; letter-spacing: normal;
+  }
+  label.btn:hover, summary.btn:hover { border-color: var(--red-border); }
+  summary.btn.ghost { background: transparent; }
+  summary.btn.small { padding: 0.35rem 0.7rem; font-size: 0.78rem; }
+  summary.btn { list-style: none; }
+  summary.btn::-webkit-details-marker { display: none; }
+  summary.btn::before { content: "▸"; }
+  details[open] > summary.btn::before { content: "▾"; }
 
   /* ---- iconos SVG (sprite #i-*): heredan el color del texto; el acento rojo solo donde el contenedor lo pide ---- */
   svg.ic { width: 1em; height: 1em; flex: none; display: inline-block; vertical-align: -0.15em; overflow: visible; pointer-events: none; }
@@ -328,7 +342,8 @@
   .cot-vacia { padding: 0.9rem 0.7rem; text-align: center; color: var(--text-faint); font-size: 0.83rem; }
 
   /* 3.15 · Bloque 2: renglones separados por tipo (taller / repuestos del negocio / manuales / sin clasificar) */
-  .renglon-seccion { padding: 0.4rem 0.7rem; font-size: 0.72rem; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase;
+  /* solo el div de la lista de la cotización: aplicado también a <tr> lo volvía flex y rompía las columnas de la tabla */
+  div.renglon-seccion { padding: 0.4rem 0.7rem; font-size: 0.72rem; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase;
     color: var(--text-muted); background: var(--surface-2, rgba(127,127,127,0.08)); display: flex; justify-content: space-between; gap: 0.5rem; }
   .renglon-seccion + .cot-item-fila { border-top: none; }
   tr.renglon-seccion td { padding: 0.45rem 0.4rem; font-size: 0.72rem; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; color: var(--text-muted); }
@@ -344,6 +359,59 @@
   .tabla-renglones td .acciones { display: inline-flex; gap: 0.2rem; }
   @media (max-width: 560px) {
     .tabla-renglones th:nth-child(3), .tabla-renglones td:nth-child(3) { display: none; }
+  }
+
+  /* 3.16 · En el teléfono las tablas con acciones se ven como TARJETAS: una fila = una tarjeta, cada celda con su etiqueta
+     (data-label) y los botones a lo ancho, con texto. Antes la tabla era más ancha que la pantalla y los botones de editar/quitar
+     quedaban fuera de la vista sin que nada indicara que había que deslizarla. En PC se queda la tabla. */
+  .solo-telefono { display: none; }
+  /* 3.16 (cambio 6): mensajes del administrador fijos arriba de Mi Trabajo y franja de mensaje nuevo */
+  .mensaje-fijo { border-left: 4px solid var(--red); }
+  .input-oculto { display: none; }
+  .btn-fotos { width: 100%; cursor: pointer; }
+  #inputFotos:disabled + .btn-fotos, .btn-fotos:has(+ #inputFotos:disabled) { opacity: 0.5; pointer-events: none; }
+  /* 3.16 (cambio 7): resultado de las acciones de Usuarios y equipo, fijo hasta «Entendido» */
+  .aviso-fijo { margin-bottom: 1rem; border-left: 4px solid var(--green); }
+  .aviso-fijo.aviso-error { border-left-color: var(--red); }
+  @media (max-width: 600px) { .lista-equipo .u-acciones > div, .u-eliminados .u-acciones > div { width: 100%; } .u-acciones .btn, .u-acciones select { flex: 1 1 100%; } }
+  /* 3.16 (cambio 1): fotos del avance */
+  .prog-fotos { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 0.5rem; margin-bottom: 0.4rem; }
+  .prog-foto { position: relative; display: block; border: 1px solid var(--border); border-radius: 0.6rem; overflow: hidden; cursor: pointer; }
+  .prog-foto img { display: block; width: 100%; aspect-ratio: 1; object-fit: cover; background: var(--panel); }
+  .prog-foto input { position: absolute; top: 0.35rem; left: 0.35rem; width: 1.4rem; height: 1.4rem; margin: 0; }
+  .prog-foto-estado { display: block; font-size: 0.72rem; padding: 0.25rem 0.4rem; color: var(--text-muted); }
+  .prog-foto:has(input:checked) { border-color: var(--green); box-shadow: 0 0 0 2px var(--green); }
+  /* z-index por DEBAJO de las ventanas (.modal-bg: 40 y 60) para no tapar sus botones, y por encima del contenido */
+  #avisoMensajeNuevo { display: none; position: fixed; top: calc(0.6rem + env(safe-area-inset-top)); left: 0.6rem; right: 0.6rem; z-index: 35;
+    gap: 0.6rem; align-items: center; justify-content: space-between; flex-wrap: wrap; padding: 0.7rem 0.8rem; border-radius: var(--radius);
+    background: var(--bg-raise); border: 1px solid var(--red-border, var(--border)); box-shadow: var(--shadow); }
+  #avisoMensajeNuevo .aviso-msg-cuerpo { display: flex; flex-direction: column; gap: 0.2rem; min-width: 0; flex: 1 1 14rem; overflow-wrap: anywhere; }
+  #avisoMensajeNuevo .aviso-msg-acciones { display: flex; gap: 0.4rem; }
+  @media (max-width: 600px) {
+    .solo-telefono { display: inline; }
+    table.tabla-tarjetas, table.tabla-tarjetas tbody, table.tabla-tarjetas tr, table.tabla-tarjetas td { display: block; width: 100%; }
+    table.tabla-tarjetas thead { display: none; }
+    table.tabla-tarjetas tr { border: 1px solid var(--border); border-radius: 0.7rem; padding: 0.6rem 0.75rem; margin-bottom: 0.6rem; background: var(--bg-raise); }
+    table.tabla-tarjetas td, .tabla-renglones.tabla-tarjetas td:nth-child(3) { display: flex; justify-content: space-between; align-items: baseline;
+      gap: 0.75rem; border: 0; padding: 0.15rem 0; text-align: right; }
+    table.tabla-tarjetas td[data-label]::before { content: attr(data-label); color: var(--text-muted); font-size: 0.8rem; text-align: left; }
+    table.tabla-tarjetas tr { display: flex; flex-direction: column; }
+    table.tabla-tarjetas td.celda-principal { display: block; order: -1; text-align: left; font-weight: 600; padding-bottom: 0.3rem; overflow-wrap: anywhere; }
+    table.tabla-tarjetas td:empty { display: none; }
+    table.tabla-tarjetas tr.renglon-seccion { background: none; border: 0; border-radius: 0; padding: 0.3rem 0 0.1rem; margin: 0.8rem 0 0.3rem; }
+    table.tabla-tarjetas tr.renglon-seccion td { padding: 0; }
+    .acciones-renglon, .tabla-renglones td .acciones-renglon { display: flex; gap: 0.5rem; width: 100%; margin-top: 0.4rem; }
+    .acciones-renglon > button { flex: 1 1 0; justify-content: center; }
+    .cot-item-fila { flex-wrap: wrap; }
+    .cot-item-fila .acciones-renglon { flex-basis: 100%; }
+    .cot-item-fila .acciones-renglon button { border: 1px solid var(--border); border-radius: 0.5rem; color: var(--text); }
+  }
+  /* 3.16 · Con el dedo, todo lo que se toca mide al menos 44 px (pauta de accesibilidad táctil). Con ratón no cambia nada. */
+  @media (pointer: coarse) {
+    .btn, button.btn.small, .seg-opt, .cat-chip, select,
+    input:not([type=checkbox]):not([type=radio]):not([type=range]):not([type=file]) { min-height: 44px; }
+    .btn, .acciones button, .acciones-renglon button { min-width: 44px; min-height: 44px; }
+    .btn, .cat-chip { display: inline-flex; align-items: center; justify-content: center; }
   }
 
   .cot-totales { display: grid; gap: 0.25rem; margin-bottom: 0.9rem; font-size: 0.88rem; }
@@ -406,6 +474,8 @@
     cursor: pointer; box-shadow: var(--shadow); transition: transform .15s, background .15s;
   }
   #shell.active ~ #fabHome:not(.fab-hidden) { display: flex; }
+  /* 3.16: espacio al final de cada vista para que el botón no tape la última fila ni el carrito */
+  #shell.active .view { padding-bottom: calc(52px + 2.2rem + env(safe-area-inset-bottom)); }
   #fabHome:hover { background: var(--red-hover); }
   #fabHome:active { transform: scale(0.92); }
   @media print { #fabHome { display: none !important; } }
@@ -1234,11 +1304,12 @@
     <section class="view" id="view-mi-trabajo">
       <h2 class="font-display" style="margin-bottom:0.2rem;">Mi trabajo</h2>
       <p style="color:var(--text-muted); margin:0 0 1rem;" id="miTrabajoSub">Acceso para mecánicos.</p>
+      <div id="miTrabajoMensajesFijos"></div>
       <div class="card" id="miTrabajoAlcance" style="margin-bottom:1rem;">
         <p style="margin:0; color:var(--text-muted);">Aquí aparecen los trabajos que el administrador te asigna. Lo que avances se guarda aunque no haya señal y se envía solo al volver la red.</p>
       </div>
       <p class="hint" id="miTrabajoVivo" style="margin:-0.4rem 0 0.8rem;"></p>
-      <h3 class="font-display" style="font-size:0.95rem; margin:0 0 0.5rem;">Mensajes del administrador <span class="badge" id="miTrabajoMsgBadge" style="display:none;"></span></h3>
+      <h3 class="font-display" style="font-size:0.95rem; margin:0 0 0.5rem;">Historial de mensajes <span class="badge" id="miTrabajoMsgBadge" style="display:none;"></span></h3>
       <div id="miTrabajoMensajes" style="margin-bottom:1.2rem;"></div>
       <h3 class="font-display" style="font-size:0.95rem; margin:0 0 0.5rem;">Mis citas</h3>
       <div id="miTrabajoCitas"></div>
@@ -1361,8 +1432,9 @@
             <p id="detalleFalla" style="color:var(--text-muted); font-size:0.9rem; margin:0;"></p>
           </div>
           <div>
-            <label style="margin-bottom:0.3rem;">Agregar fotos</label>
-            <input type="file" id="inputFotos" accept="image/*" multiple>
+            <!-- 3.16: el selector nativo («Elegir archivos / Ningún archivo seleccionado») era pequeño y poco claro en el teléfono -->
+            <label for="inputFotos" class="btn btn-fotos">📷 Tomar o elegir fotos</label>
+            <input type="file" id="inputFotos" accept="image/*" multiple class="input-oculto">
           </div>
         </div>
         <div class="photos" id="detalleFotos"></div>
@@ -1407,7 +1479,7 @@
       </div>
       <div class="widget-row" id="clientesWidgetRow"></div>
       <div class="table-scroll">
-      <table>
+      <table class="tabla-tarjetas" data-etiquetas="auto" data-principal="1">
         <thead><tr><th></th><th>Cliente</th><th>Teléfono</th><th>Moto</th><th>Placa</th><th class="num">Km</th><th>Próx. mantenimiento</th><th></th></tr></thead>
         <tbody id="clientesBody"></tbody>
       </table>
@@ -1432,8 +1504,8 @@
       <div class="widget-row" id="inventarioWidgetRow"></div>
       <p class="hint">CSV esperado: <code>nombre,cantidad,precio,modelo</code> (con encabezado o sin él).</p>
       <div class="table-scroll">
-      <table>
-        <thead><tr><th>Repuesto</th><th>Modelo compatible</th><th class="num">Cantidad</th><th class="num">Precio</th><th>Publicado en la web</th></tr></thead>
+      <table class="tabla-tarjetas" data-etiquetas="auto" data-principal="0">
+        <thead><tr><th>Repuesto</th><th>Modelo compatible</th><th class="num">Cantidad</th><th class="num">Precio</th><th>Publicado en la web</th><th aria-label="Acciones"></th></tr></thead>
         <tbody id="inventarioBody"></tbody>
       </table>
       </div>
@@ -1536,7 +1608,7 @@
       <div class="widget-grid" id="rendimientoResumen"></div>
       <div class="card fin-table-card">
         <div class="table-scroll">
-        <table>
+        <table class="tabla-tarjetas" data-etiquetas="auto" data-principal="0">
           <thead><tr><th>Mecánico</th><th class="num">Pendientes</th><th class="num">Completados</th><th class="num">Producido</th><th class="num">Promedio</th></tr></thead>
           <tbody id="rendimientoBody"></tbody>
         </table>
@@ -1592,7 +1664,7 @@
       </div>
       <div class="card fin-table-card">
         <div class="table-scroll">
-        <table>
+        <table class="tabla-tarjetas" data-etiquetas="auto" data-principal="4">
           <thead><tr><th>Fecha</th><th>Tipo</th><th>Categoría</th><th>Método</th><th>Descripción</th><th class="num">Monto</th><th></th></tr></thead>
           <tbody id="movimientosBody"></tbody>
         </table>
@@ -1629,7 +1701,7 @@
         </div>
       </div>
       <div class="table-scroll">
-      <table>
+      <table class="tabla-tarjetas" data-etiquetas="auto" data-principal="0">
         <thead><tr><th>Cliente</th><th class="num">Facturas</th><th>Último crédito</th><th class="num">Total</th><th class="num">Abonado</th><th class="num">Saldo</th><th>Estado</th><th></th></tr></thead>
         <tbody id="creditosBody"></tbody>
       </table>
@@ -1644,6 +1716,7 @@
       <div class="view-head">
         <div><h2>Usuarios y equipo</h2><p>Quién entra al sistema y con qué rol. Las cuentas las protege el servidor; los datos de este dispositivo los controla la aplicación.</p></div>
       </div>
+      <div id="usuariosAvisoFijo" role="status" style="display:none;"></div>
       <div id="usuariosCuerpo"></div>
     </section>
 
@@ -1957,7 +2030,7 @@
     </div>
 
     <div class="table-scroll">
-      <table>
+      <table class="tabla-renglones tabla-tarjetas">
         <thead><tr><th>Ítem</th><th class="num">Cant.</th><th class="num">Precio</th><th class="num">Subtotal</th></tr></thead>
         <tbody id="cotDetItems"></tbody>
       </table>
@@ -1965,6 +2038,7 @@
     <div class="cot-totales" id="cotDetTotales"></div>
     <p class="hint" id="cotDetNotas" style="display:none;"></p>
     <p class="hint" id="cotDetConvertida" style="display:none;"></p>
+    <button type="button" class="btn primary small" id="btnCotAbrirOrden" style="display:none; margin-bottom:0.8rem;"></button>
 
     <div class="modal-actions" style="justify-content:flex-start; flex-wrap:wrap;">
       <button type="button" class="btn wa small" id="btnCotEnviarWA">📲 Enviar</button>
@@ -1975,7 +2049,7 @@
     <div class="modal-actions" style="justify-content:flex-start; flex-wrap:wrap;">
       <button type="button" class="btn primary small" id="btnCotAceptar">✅ Aceptó — crear orden</button>
       <button type="button" class="btn ghost small" id="btnCotRechazar">✕ No aceptó</button>
-      <button type="button" class="btn ghost small danger" id="btnCotEliminar">🗑</button>
+      <button type="button" class="btn ghost small danger" id="btnCotEliminar">🗑 Eliminar cotización</button>
     </div>
     <div class="modal-actions">
       <button class="btn ghost" id="btnCerrarCotDetalle">Cerrar</button>
@@ -2163,6 +2237,22 @@
   </div>
 </div>
 
+<!-- 3.16 (cambio 1): avance por WhatsApp con las fotos que el cliente todavía no recibió -->
+<div class="modal-bg" id="modalProgresoFotos">
+  <div class="modal">
+    <h3>Avance por WhatsApp</h3>
+    <p class="hint" id="progFotosTexto" style="margin-top:0;"></p>
+    <p class="hint" style="margin:0 0 0.4rem;">Vienen marcadas las fotos que el cliente todavía no recibió. Al enviar se abre el menú del teléfono: elige WhatsApp y el chat del cliente.</p>
+    <div class="prog-fotos" id="progFotosLista"></div>
+    <p class="hint" id="progFotosEstado" aria-live="polite"></p>
+    <div class="modal-actions" style="flex-wrap:wrap;">
+      <button class="btn ghost" id="btnProgFotosCerrar">Cancelar</button>
+      <button class="btn ghost" id="btnProgFotosSoloTexto">Solo el texto</button>
+      <button class="btn wa" id="btnProgFotosEnviar" disabled>Enviar por WhatsApp</button>
+    </div>
+  </div>
+</div>
+
 <!-- Modal: cobrar servicio suelto en TPV (sin inventario) -->
 <div class="modal-bg" id="modalServicioPOS">
   <div class="modal">
@@ -2224,7 +2314,8 @@
     <label>Nombre</label><input type="text" id="repuestoNombre">
     <label>Modelo compatible</label><input type="text" id="repuestoModelo" placeholder="Todos, o ej. CB190R">
     <div class="field-row" style="grid-template-columns:1fr 1fr;">
-      <div><label>Cantidad</label><input type="number" id="repuestoCantidad" value="1" min="0"></div>
+      <div><label>Cantidad</label><input type="number" id="repuestoCantidad" value="1" min="0">
+        <p class="hint" id="repuestoCantidadNota" style="display:none; margin:-0.5rem 0 0.8rem;">Para sumar mercancía usa «＋ Entrada»; para corregir un conteo, «Ajustar stock».</p></div>
       <div><label>Precio de venta (L.)</label><input type="number" id="repuestoPrecio" step="0.01" min="0"></div>
     </div>
     <div class="field-row" style="grid-template-columns:1fr 1fr;">
@@ -2264,7 +2355,32 @@
     <div class="modal-actions">
       <button class="btn ghost" id="btnCerrarRepuestoDetalle">Cerrar</button>
       <button class="btn ghost" id="btnAjustarStock" style="display:none;">Ajustar stock</button>
+      <button class="btn" id="btnEntradaStock" style="display:none;">＋ Entrada</button>
       <button class="btn primary" id="btnEditarRepuesto">Editar</button>
+    </div>
+  </div>
+</div>
+
+<!-- Modal: entrada de mercancía (3.16, cambio 8). Sumar lo que llegó NO es corregir un error: no pide motivo. -->
+<div class="modal-bg" id="modalEntrada">
+  <div class="modal">
+    <h3>＋ Entrada de mercancía</h3>
+    <p class="hint" style="margin-top:0;" id="entradaRepuesto"></p>
+    <label for="entradaCantidad">¿Cuántos llegaron?</label>
+    <div style="display:flex; gap:0.5rem; align-items:center; margin-bottom:0.9rem;">
+      <button type="button" class="btn" id="btnEntradaMenos" aria-label="Uno menos" style="min-width:3rem;">−</button>
+      <input type="number" id="entradaCantidad" value="1" min="1" inputmode="decimal" style="flex:1; margin:0; text-align:center; font-size:1.2rem;">
+      <button type="button" class="btn" id="btnEntradaMas" aria-label="Uno más" style="min-width:3rem;">+</button>
+    </div>
+    <p id="entradaResultado" style="font-weight:600; margin:0 0 0.9rem;"></p>
+    <label for="entradaCosto">Costo de compra de cada uno (L.) · opcional</label>
+    <input type="number" id="entradaCosto" step="0.01" min="0">
+    <label for="entradaNota">Nota · opcional</label>
+    <input type="text" id="entradaNota" maxlength="120" placeholder="Proveedor o número de factura">
+    <p class="aviso-error" id="entradaError" role="alert" style="color:var(--red); margin:0 0 0.6rem;"></p>
+    <div class="modal-actions">
+      <button class="btn ghost" id="btnCancelarEntrada">Cancelar</button>
+      <button class="btn primary" id="btnGuardarEntrada">Registrar entrada</button>
     </div>
   </div>
 </div>
@@ -2694,42 +2810,44 @@
 
 <!-- Declara si esta copia es el taller o «Mi Trabajo». Va primero: app.js lo
      lee al arrancar. Ver build-target.js. -->
-<script src="build-target.js?v=3.15.0"></script>
+<script src="build-target.js?v=3.16.0"></script>
 <!-- Capa de Supabase. Si supabase-config.js no existe o está sin rellenar, los
      cuatro se cargan igual y no hacen nada: la app sigue funcionando entera con
      IndexedDB, como hasta ahora. -->
-<script src="supabase-config.js?v=3.15.0"></script>
-<script src="supabase-client.js?v=3.15.0"></script>
-<script src="auth.js?v=3.15.0"></script>
-<script src="recovery.js?v=3.15.0"></script>
+<script src="supabase-config.js?v=3.16.0"></script>
+<script src="supabase-client.js?v=3.16.0"></script>
+<script src="auth.js?v=3.16.0"></script>
+<script src="recovery.js?v=3.16.0"></script>
 <!-- 3.15 (Bloque 3): día empresarial America/Tegucigalpa (hoy, caja del día, filtros). Antes de app.js. -->
-<script src="fecha-negocio.js?v=3.15.0"></script>
-<script src="finanzas-calc.js?v=3.15.0"></script>
+<script src="fecha-negocio.js?v=3.16.0"></script>
+<script src="finanzas-calc.js?v=3.16.0"></script>
+<script src="mensajes-fijos.js?v=3.16.0"></script>
+<script src="fotos-avance.js?v=3.16.0"></script>
 <!-- Núcleo de sincronización (SYNC-4) + mappers reales (SYNC-5). Apagado por
      defecto (ver sync-engine.js): sin ENTIMOTORS_SYNC.enabled === true, que
      app.js solo pone en true dentro de prepararModoNube() para una sesión de
      Supabase activa, no abren ninguna base ni hacen ninguna petición. -->
-<script src="sync-rest.js?v=3.15.0"></script>
-<script src="sync-db.js?v=3.15.0"></script>
-<script src="sync-engine.js?v=3.15.0"></script>
+<script src="sync-rest.js?v=3.16.0"></script>
+<script src="sync-db.js?v=3.16.0"></script>
+<script src="sync-engine.js?v=3.16.0"></script>
 <!-- 3.15 (Bloque 3): avisos en tiempo real (Supabase Realtime, Broadcast privado). Sin sesión de nube no abre nada. -->
-<script src="sync-realtime.js?v=3.15.0"></script>
-<script src="sync-mappers.js?v=3.15.0"></script>
-<script src="sync-fotos.js?v=3.15.0"></script>
+<script src="sync-realtime.js?v=3.16.0"></script>
+<script src="sync-mappers.js?v=3.16.0"></script>
+<script src="sync-fotos.js?v=3.16.0"></script>
 <!-- SYNC-7B: dinero y stock por RPC en modo nube (antes de app.js: prepararModoNube la arma) -->
-<script src="sync-finanzas.js?v=3.15.0"></script>
+<script src="sync-finanzas.js?v=3.16.0"></script>
 <!-- Autorización con PIN administrativo (SYNC-7, D-7): habla con el api-server, nunca con Supabase
      directo. Va antes de app.js porque prepararModoNube() la inicializa (PinUI.prepararInstancia). -->
-<script src="pin-ui.js?v=3.15.0"></script>
+<script src="pin-ui.js?v=3.16.0"></script>
 <!-- SYNC-10: importador 3.13 → nube (validación, vista previa, paquete atómico) -->
-<script src="import-313.js?v=3.15.0"></script>
+<script src="import-313.js?v=3.16.0"></script>
 <!-- el ?v= debe cambiar cada vez que se toque app.js (junto con CACHE_NAME en
      sw.js) — es la forma más universal de forzar que CUALQUIER navegador
      pida el archivo de nuevo aunque ya tenga guardada una copia vieja en su
      propio caché HTTP, sin depender de que respete el Service Worker. -->
-<script src="app.js?v=3.15.0"></script>
+<script src="app.js?v=3.16.0"></script>
 <!-- Pantalla «Usuarios y equipo»: habla con el api-server, no con IndexedDB.
      Va después de app.js porque solo se invoca al abrir esa vista. -->
-<script src="usuarios.js?v=3.15.0"></script>
+<script src="usuarios.js?v=3.16.0"></script>
 </body>
 </html>

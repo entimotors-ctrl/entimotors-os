@@ -2,7 +2,7 @@
 // cambiando la app todos los días, "caché primero" deja a los dispositivos ya
 // instalados atascados en una versión vieja para siempre — network-first evita
 // eso y de todos modos cae al caché cuando de verdad no hay señal.
-const CACHE_NAME = "entimotors-v3.15.0";
+const CACHE_NAME = "entimotors-v3.16.0";
 // La capa de Supabase va en el SHELL por el mismo motivo que app.js: index.html
 // la carga antes de arrancar, y sin ella la app tardaría o fallaría al abrirse
 // sin señal. config-local.js NO va aquí (es solo de desarrollo y no se publica)
@@ -10,22 +10,26 @@ const CACHE_NAME = "entimotors-v3.15.0";
 const SHELL = ["./", "./index.html",
   // build-target.js va en el SHELL a propósito: sin él, un arranque sin señal
   // no sabría qué producto es esta copia y asumiría el taller.
-  "./build-target.js?v=3.15.0",
-  "./supabase-config.js?v=3.15.0", "./supabase-client.js?v=3.15.0",
-  "./auth.js?v=3.15.0", "./recovery.js?v=3.15.0",
+  "./build-target.js?v=3.16.0",
+  "./supabase-config.js?v=3.16.0", "./supabase-client.js?v=3.16.0",
+  "./auth.js?v=3.16.0", "./recovery.js?v=3.16.0",
   // 3.15 (Bloque 3): día empresarial (Honduras) — index.html lo carga antes de app.js
-  "./fecha-negocio.js?v=3.15.0",
+  "./fecha-negocio.js?v=3.16.0",
   // 3.15 (Bloque 5): indicadores de efectivo sin red (cobrado / por cobrar / entregado sin cobrar) — index.html lo carga antes de app.js
-  "./finanzas-calc.js?v=3.15.0",
+  "./finanzas-calc.js?v=3.16.0",
+  // 3.16 (cambio 6): qué mensajes del administrador quedan fijos arriba en Mi Trabajo
+  "./mensajes-fijos.js?v=3.16.0",
+  // 3.16 (cambio 1): qué fotos del avance ya recibió el cliente
+  "./fotos-avance.js?v=3.16.0",
   // Núcleo de sincronización (SYNC-4) + mappers reales (SYNC-5) + fotos de Mi Trabajo (SYNC-6): mismo
   // motivo que la capa de Supabase, index.html los carga antes de app.js.
-  "./sync-rest.js?v=3.15.0", "./sync-db.js?v=3.15.0", "./sync-engine.js?v=3.15.0", "./sync-realtime.js?v=3.15.0", "./sync-mappers.js?v=3.15.0",
-  "./sync-fotos.js?v=3.15.0", "./sync-finanzas.js?v=3.15.0",
+  "./sync-rest.js?v=3.16.0", "./sync-db.js?v=3.16.0", "./sync-engine.js?v=3.16.0", "./sync-realtime.js?v=3.16.0", "./sync-mappers.js?v=3.16.0",
+  "./sync-fotos.js?v=3.16.0", "./sync-finanzas.js?v=3.16.0",
   // Autorización con PIN administrativo (SYNC-7): mismo motivo, index.html la carga antes de app.js.
-  "./pin-ui.js?v=3.15.0",
+  "./pin-ui.js?v=3.16.0",
   // Importador 3.13 → nube (SYNC-10): mismo motivo, index.html lo carga antes de app.js.
-  "./import-313.js?v=3.15.0",
-  "./app.js?v=3.15.0", "./usuarios.js?v=3.15.0",
+  "./import-313.js?v=3.16.0",
+  "./app.js?v=3.16.0", "./usuarios.js?v=3.16.0",
   "./manifest.json", "./icons/icon-192.png", "./icons/logo-watermark-doc.png"];
 
 // Librerías que convierten la factura en imagen/PDF para poder mandarla por
