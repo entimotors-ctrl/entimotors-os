@@ -3928,6 +3928,7 @@ async function renderPresupuestoStage(o, { anexar = false, soloLectura = false }
       <div style="display:flex; justify-content:space-between; margin-top:0.6rem; font-weight:600;">
         <span>Total</span><span id="itemsTotal" style="font-variant-numeric:tabular-nums;">${money(items.reduce((s, it) => s + it.cantidad * it.precio, 0))}</span>
       </div>
+      ${esMecanicoCuenta() ? "" : htmlFotosPresupuesto(o)}
       ${soloLectura
         ? `<p class="hint" style="margin:0.7rem 0 0;">La orden ya se cobró: para corregirla hay que anularla (PIN del propietario).</p>`
         : `<button class="btn small" id="btnAgregarItem" style="margin-top:0.7rem;">+ Agregar mano de obra o repuesto</button>
@@ -3941,6 +3942,7 @@ async function renderPresupuestoStage(o, { anexar = false, soloLectura = false }
       <td class="num">${soloLectura ? "" : `<span class="acciones acciones-renglon"><button type="button" class="btn ghost small" data-editar="${i}" title="Editar renglón" aria-label="Editar ${esc(it.nombre)}">✎<span class="solo-telefono"> Editar</span></button><button type="button" class="btn ghost small danger" data-quitar="${i}" title="Quitar ítem" aria-label="Quitar ${esc(it.nombre)}">🗑<span class="solo-telefono"> Quitar</span></button></span>`}</td>
     </tr>`, { cols: 5, colSub: 3 }) : `<tr><td colspan="5" style="color:var(--text-faint);">Sin ítems todavía</td></tr>`;
 
+  conectarFotosPresupuesto(o);
   if (soloLectura) return;
   document.getElementById("itemsBody").querySelectorAll("[data-editar]").forEach(btn => {
     btn.addEventListener("click", async () => {
@@ -4021,23 +4023,25 @@ async function pintarAprobacion(o) {
   else if (estado === "aprobado") box.innerHTML = `<p class="hint" style="margin:0;">Los repuestos del negocio ya salieron del inventario. Si cambias cantidades o productos, se ajusta solo la diferencia.</p>`;
   else box.innerHTML = `<p class="hint" style="margin-top:0;">No aprobado: no se descontó nada (lo que se hubiera descontado volvió al inventario).</p>
     <button class="btn" id="btnReabrirPresupuesto">Reabrir presupuesto</button>`;
+  // el aviso y su botón para escribirle al cliente son del Taller, no de Mi Trabajo
+  if (estado === "aprobado" && !esperando && !esMecanicoCuenta()) pintarPresupuestoModificado(o, est);
 
   document.getElementById("btnDescartarConflicto")?.addEventListener("click", async () => {
     await syncFin.descartarRechazo(rechazo.seq);
     pintarAprobacion(await DB.get("ordenes", o.id));
   });
-  document.getElementById("btnEnviarWA")?.addEventListener("click", async () => {
-    const ventanaWA = abrirVentanaWA();
-    const ord = await DB.get("ordenes", o.id);
-    const moto = await DB.get("motos", ord.motoId);
-    const cliente = await DB.get("clientes", ord.clienteId);
-    const total = (ord.items || []).reduce((s, it) => s + it.cantidad * it.precio, 0);
-    const lineas = (ord.items || []).map(it => `- ${it.nombre} x${it.cantidad}: ${money(it.cantidad * it.precio)}`).join("\n");
-    const texto = `Hola ${cliente.nombre}, este es el presupuesto para tu ${moto.marca} ${moto.modelo} (orden #${ord.id}):\n\n${lineas}\n\nTotal: ${money(total)}\n\n¿Lo aprobamos para empezar la reparación?`;
-    const sent = navegarWA(ventanaWA, cliente.telefono, texto);
-    if (!sent) return;
-    await updateOrder(o.id, x => { x.aprobacion = { via: "whatsapp", en: Date.now() }; });
-    pintarAprobacion(await DB.get("ordenes", o.id));
+  document.getElementById("btnEnviarWA")?.addEventListener("click", () => {
+    // sincrónico hasta abrir WhatsApp (usa lo que openOrder dejó en currentOrderCache): el toque sigue vigente
+    const { o: ord, moto, cliente } = currentOrderCache;
+    const texto = textoPresupuesto(ord, moto, cliente);
+    const marcarEnviado = async () => {
+      await updateOrder(o.id, x => { x.aprobacion = { via: "whatsapp", en: Date.now() }; });
+      pintarAprobacion(await DB.get("ordenes", o.id));
+    };
+    // 3.16.1 (cambio 10): con fotos del presupuesto que el cliente no ha visto, se mandan junto con el texto
+    if (fotosPresupuestoNuevas(ord).length) { abrirProgresoFotos(ord, cliente, texto, ord.fotosPresupuesto, opcionesFotosPresupuesto(ord, marcarEnviado)); return; }
+    if (!navegarWA(abrirVentanaWA(), cliente.telefono, texto)) return;
+    marcarEnviado();
     toast(`WhatsApp abierto con el presupuesto para ${cliente.nombre} — falta pulsar enviar`);
   });
   const decidir = (decision) => async (ev) => {
@@ -4070,12 +4074,106 @@ async function pintarAprobacion(o) {
         });
         toast(decision === "aprobar" ? "Aprobado en el local" : decision === "rechazar" ? "Marcado como no aprobado" : "Presupuesto reabierto");
       }
+      // 3.16.1 (cambio 9): lo aprobado ahora es la referencia; rechazar o reabrir la borra
+      const tras = await DB.get("ordenes", o.id);
+      if (tras) guardarPresupuestoComunicado(tras, estadoPresupuesto(tras) === "aprobado" ? tras.items : null);
       openOrder(o.id);
     } finally { btn.disabled = false; }
   };
   document.getElementById("btnAprobarLocal")?.addEventListener("click", decidir("aprobar"));
   document.getElementById("btnRechazarPresupuesto")?.addEventListener("click", decidir("rechazar"));
   document.getElementById("btnReabrirPresupuesto")?.addEventListener("click", decidir("reabrir"));
+}
+
+/* 3.16.1 (cambio 9) · presupuesto modificado DESPUÉS de aprobarlo. Quitar, agregar o cambiar un renglón de un presupuesto
+   aprobado se guardaba sin decir nada, y el cliente se quedaba con el presupuesto viejo. Ahora se compara con lo último que
+   el cliente vio (lo aprobado, o el último presupuesto actualizado que se le mandó) y, si cambió, se avisa con «antes / ahora»
+   y un botón para mandarle el nuevo. La referencia vive en ESTE dispositivo (localStorage), como la marca de fotos enviadas. */
+const CLAVE_PRESUPUESTO_COMUNICADO = "enti_presupuesto_comunicado";
+const firmaPresupuesto = (items) => JSON.stringify((items || []).map((it) => [it.nombre, Number(it.cantidad), Number(it.precio)]));
+const totalPresupuesto = (items) => (items || []).reduce((s, it) => s + it.cantidad * it.precio, 0);
+function presupuestosComunicados() {
+  try { return JSON.parse(localStorage.getItem(CLAVE_PRESUPUESTO_COMUNICADO) || "{}") || {}; } catch (e) { return {}; }
+}
+function presupuestoComunicadoDe(o) { return presupuestosComunicados()[llaveFotosAvance(o)] || null; }
+function guardarPresupuestoComunicado(o, items) {
+  try {
+    const m = presupuestosComunicados(), llave = llaveFotosAvance(o);
+    if (items) m[llave] = { firma: firmaPresupuesto(items), total: totalPresupuesto(items), en: Date.now() }; else delete m[llave];
+    localStorage.setItem(CLAVE_PRESUPUESTO_COMUNICADO, JSON.stringify(m));
+  } catch (e) { /* sin almacenamiento: el aviso simplemente no aparece */ }
+}
+function textoPresupuesto(o, moto, cliente, antes) {
+  const lineas = (o.items || []).map((it) => `- ${it.nombre} x${it.cantidad}: ${money(it.cantidad * it.precio)}`).join("\n");
+  const total = money(totalPresupuesto(o.items));
+  return antes
+    ? `Hola ${cliente.nombre}, actualizamos el presupuesto de tu ${moto.marca} ${moto.modelo} (orden #${o.id}):\n\n${lineas}\n\nTotal: ${total} (antes ${money(antes.total)})\n\nCualquier duda, aquí estamos.`
+    : `Hola ${cliente.nombre}, este es el presupuesto para tu ${moto.marca} ${moto.modelo} (orden #${o.id}):\n\n${lineas}\n\nTotal: ${total}\n\n¿Lo aprobamos para empezar la reparación?`;
+}
+function pintarPresupuestoModificado(o, est) {
+  const ref = presupuestoComunicadoDe(o);
+  // primera vez que este dispositivo ve la orden aprobada: lo que hay es lo que el cliente aprobó
+  if (!ref) { guardarPresupuestoComunicado(o, o.items); return; }
+  if (ref.firma === firmaPresupuesto(o.items)) return;
+  est.insertAdjacentHTML("beforeend", `<div class="presupuesto-aviso" id="presupuestoModificado">
+      <b>✏️ El presupuesto cambió después de aprobarlo.</b> Antes ${money(ref.total)}, ahora ${money(totalPresupuesto(o.items))}.
+      Mándale al cliente el presupuesto nuevo para que lo tenga.
+      <div style="display:flex; gap:0.5rem; flex-wrap:wrap; margin-top:0.6rem;">
+        <button type="button" class="btn wa" id="btnEnviarPresupuestoNuevo">Enviar presupuesto actualizado por WhatsApp</button>
+        <button type="button" class="btn ghost" id="btnPresupuestoYaAvisado">Ya se lo dije</button>
+      </div></div>`);
+  document.getElementById("btnEnviarPresupuestoNuevo").addEventListener("click", () => {
+    const { o: ord, moto, cliente } = currentOrderCache;
+    const texto = textoPresupuesto(ord, moto, cliente, ref);
+    const listo = () => { guardarPresupuestoComunicado(ord, ord.items); document.getElementById("presupuestoModificado")?.remove(); };
+    if (fotosPresupuestoNuevas(ord).length) { abrirProgresoFotos(ord, cliente, texto, ord.fotosPresupuesto, opcionesFotosPresupuesto(ord, listo)); return; }
+    if (!navegarWA(abrirVentanaWA(), cliente.telefono, texto)) return;
+    listo();
+    toast(`WhatsApp abierto con el presupuesto actualizado para ${cliente.nombre} — falta pulsar enviar`);
+  });
+  document.getElementById("btnPresupuestoYaAvisado").addEventListener("click", () => {
+    guardarPresupuestoComunicado(o, o.items);
+    document.getElementById("presupuestoModificado")?.remove();
+  });
+}
+
+/* 3.16.1 (cambio 10) · fotos del presupuesto (la pieza dañada, el repuesto nuevo…) para que el cliente las vea. Van aparte de las
+   fotos del avance (o.fotosPresupuesto, en este dispositivo como las demás fotos del Taller) y se mandan con el presupuesto por el
+   menú de compartir, sin repetir las ya enviadas (marca propia «presupuesto:<orden>»). */
+const llaveFotosPresupuesto = (o) => "presupuesto:" + llaveFotosAvance(o);
+const fotosPresupuestoNuevas = (o) => FotosAvance.pendientes(o.fotosPresupuesto || [], FotosAvance.enviadasDe(llaveFotosPresupuesto(o)));
+function opcionesFotosPresupuesto(o, alEnviar) {
+  return { llave: llaveFotosPresupuesto(o), titulo: "Presupuesto por WhatsApp", tituloCompartir: `Presupuesto de la orden #${o.id}`, archivo: `presupuesto-orden-${o.id}`, alEnviar };
+}
+function htmlFotosPresupuesto(o) {
+  const fotos = o.fotosPresupuesto || [];
+  return `<div id="presupuestoFotos" style="margin-top:0.9rem;">
+      <b style="display:block; margin-bottom:0.2rem;">Fotos del presupuesto</b>
+      <p class="hint" style="margin:0 0 0.5rem;">La pieza dañada, el repuesto nuevo… Se mandan junto con el presupuesto por WhatsApp.</p>
+      ${fotos.length ? `<div class="prog-fotos">${fotos.map((src, i) => `<div class="prog-foto"><img src="${esc(src)}" alt="Foto ${i + 1} del presupuesto">
+        <button type="button" class="btn ghost small danger" data-quitar-foto-presu="${i}" aria-label="Quitar la foto ${i + 1}" style="width:100%; border-radius:0;">Quitar</button></div>`).join("")}</div>` : ""}
+      <label class="btn" for="inputFotosPresupuesto" style="cursor:pointer;">📷 Fotos para el presupuesto</label>
+      <input type="file" id="inputFotosPresupuesto" accept="image/*" multiple style="display:none;">
+    </div>`;
+}
+function conectarFotosPresupuesto(o) {
+  const input = document.getElementById("inputFotosPresupuesto");
+  if (!input) return;
+  input.addEventListener("change", async (e) => {
+    const files = Array.from(e.target.files || []);
+    if (!files.length) return;
+    const urls = await Promise.all(files.map(fotoLocal));
+    await updateOrder(o.id, (x) => { x.fotosPresupuesto = (x.fotosPresupuesto || []).concat(urls); });
+    e.target.value = "";
+    toast(files.length === 1 ? "Foto agregada al presupuesto" : `${files.length} fotos agregadas al presupuesto`);
+    openOrder(o.id);
+  });
+  document.querySelectorAll("#presupuestoFotos [data-quitar-foto-presu]").forEach((btn) => btn.addEventListener("click", async () => {
+    if (!(await showConfirm("La foto se quita del presupuesto.", { titulo: "¿Quitar la foto?", textoOk: "Quitar" }))) return;
+    const i = Number(btn.dataset.quitarFotoPresu);
+    await updateOrder(o.id, (x) => { (x.fotosPresupuesto || []).splice(i, 1); });
+    openOrder(o.id);
+  }));
 }
 
 /* ---- autocompletado genérico: buscar cliente por nombre o placa ---- */
@@ -4821,11 +4919,16 @@ function dataUrlABlob(url) {
   return new Blob([bytes], { type: tipo });
 }
 
-function abrirProgresoFotos(o, cliente, texto, fotos) {
-  const enviadas = FotosAvance.enviadasDe(llaveFotosAvance(o));
-  const ctx = { o, cliente, texto, fotos: fotos.map((src) => ({ src, clave: FotosAvance.claveFoto(src), enviada: false, archivo: null, error: false })) };
+/* 3.16.1: la misma ventana sirve para el presupuesto (cambio 10) con `opciones` = { llave, titulo, tituloCompartir, archivo, alEnviar }. */
+function abrirProgresoFotos(o, cliente, texto, fotos, opciones = {}) {
+  const llave = opciones.llave || llaveFotosAvance(o);
+  const enviadas = FotosAvance.enviadasDe(llave);
+  const ctx = { o, cliente, texto, llave, alEnviar: opciones.alEnviar || null, tituloCompartir: opciones.tituloCompartir || `Avance de la orden #${o.id}`,
+    archivo: opciones.archivo || `avance-orden-${o.id}`,
+    fotos: fotos.map((src) => ({ src, clave: FotosAvance.claveFoto(src), enviada: false, archivo: null, error: false })) };
   ctx.fotos.forEach((f) => { f.enviada = enviadas.includes(f.clave); });
   progresoFotos = ctx;
+  document.getElementById("progFotosTitulo").textContent = opciones.titulo || "Avance por WhatsApp";
   document.getElementById("progFotosTexto").textContent = texto;
   const lista = document.getElementById("progFotosLista");
   lista.innerHTML = ctx.fotos.map((f, i) => `
@@ -4854,7 +4957,7 @@ async function prepararArchivosProgreso(ctx) {
         if (img && progresoFotos === ctx) img.src = URL.createObjectURL(blob);
       }
       const ext = (blob.type.split("/")[1] || "jpg").replace("jpeg", "jpg");
-      f.archivo = new File([blob], `avance-orden-${ctx.o.id}-${i + 1}.${ext}`, { type: blob.type || "image/jpeg" });
+      f.archivo = new File([blob], `${ctx.archivo}-${i + 1}.${ext}`, { type: blob.type || "image/jpeg" });
     } catch (e) { f.error = true; }
   }));
   if (progresoFotos === ctx) pintarEstadoProgresoFotos();
@@ -4892,12 +4995,12 @@ document.getElementById("btnProgFotosEnviar").addEventListener("click", () => {
   // ni un solo await antes de share(): el navegador solo lo permite mientras el toque sigue vigente
   if (navigator.canShare?.({ files })) {
     navigator.clipboard?.writeText(ctx.texto).catch(() => {});   // en iPhone WhatsApp a veces descarta el texto: queda para pegarlo
-    navigator.share({ files, text: ctx.texto, title: `Avance de la orden #${ctx.o.id}` })
+    navigator.share({ files, text: ctx.texto, title: ctx.tituloCompartir })
       .then(() => {
-        const llave = llaveFotosAvance(ctx.o);
-        FotosAvance.guardar(llave, FotosAvance.marcar(FotosAvance.enviadasDe(llave), elegidas.map((f) => f.src)));
+        FotosAvance.guardar(ctx.llave, FotosAvance.marcar(FotosAvance.enviadasDe(ctx.llave), elegidas.map((f) => f.src)));
         cerrarProgresoFotos();
-        toast(`Avance enviado · ${files.length} foto${files.length === 1 ? "" : "s"} (el texto también quedó copiado)`);
+        if (ctx.alEnviar) ctx.alEnviar();
+        toast(`Enviado · ${files.length} foto${files.length === 1 ? "" : "s"} (el texto también quedó copiado)`);
       })
       .catch((err) => {
         if (err?.name === "AbortError") return;   // canceló el menú: no se marca nada
@@ -4917,8 +5020,9 @@ document.getElementById("btnProgFotosEnviar").addEventListener("click", () => {
 document.getElementById("btnProgFotosSoloTexto").addEventListener("click", () => {
   const ctx = progresoFotos;
   if (!ctx) return;
-  navegarWA(abrirVentanaWA(), ctx.cliente.telefono, ctx.texto);
+  if (!navegarWA(abrirVentanaWA(), ctx.cliente.telefono, ctx.texto)) return;
   cerrarProgresoFotos();
+  if (ctx.alEnviar) ctx.alEnviar();
 });
 document.getElementById("btnProgFotosCerrar").addEventListener("click", cerrarProgresoFotos);
 
@@ -7579,20 +7683,30 @@ async function renderFinanzas() {
   const metodoLabel = { efectivo: "Efectivo", transferencia: "Transferencia", tarjeta: "Tarjeta" };
   // 3.15 (Bloque 7): por tramos (ver verMasLista)
   body.innerHTML = filtrados.slice(0, limiteLista("movimientos")).map(m => `
-    <tr>
+    <tr data-mov-id="${m.id}" style="cursor:pointer;">
       <td>${FechaNegocio.fecha(m.fechaISO)}</td>
       <td><span class="pill ${m.tipo === "ingreso" ? "entregado" : "reparacion"}">${m.tipo === "ingreso" ? "Ingreso" : "Egreso"}</span></td>
       <td>${esc(m.categoria)}</td>
       <td>${esc(metodoLabel[m.metodoPago] || "—")}</td>
       <td>${esc(m.descripcion || "")}</td>
       <td class="num">${money(m.monto)}</td>
-      <td class="num">${finanzasNube() ? accionesCajaNube(m, revertidos, ventasPorId) : movimientoEsBorrable(m)
+      <td class="num no-abrir">${finanzasNube() ? accionesCajaNube(m, revertidos, ventasPorId) : movimientoEsBorrable(m)
         ? `<button type="button" class="btn ghost small danger" data-eliminar-movi="${m.id}" title="Eliminar" aria-label="Eliminar movimiento">🗑</button>`
         : `<span class="mov-ligado" title="${esc(motivoNoBorrable(m))}">🔒</span>`}</td>
     </tr>`).join("") + verMasLista("movimientos", filtrados.length, { columnas: 7 });
   conectarVerMas(body, "movimientos", renderFinanzas);
   if (finanzasNube()) conectarAccionesCajaNube(body, ventasPorId);
-  body.querySelectorAll("[data-eliminar-movi]").forEach(btn => {
+  else conectarEliminarMovimiento(body);
+  // 3.16.1 (cambio 11): tocar un movimiento abre su detalle (las acciones de la última columna siguen funcionando aparte)
+  body.querySelectorAll("tr[data-mov-id] td:not(.no-abrir)").forEach(td => td.addEventListener("click", () =>
+    abrirMovimiento(Number(td.closest("tr").dataset.movId), revertidos, ventasPorId)));
+
+  await renderFinanzasCharts(datos);
+  await renderRendimiento(desde, hasta, datos);
+}
+
+function conectarEliminarMovimiento(cont) {
+  cont.querySelectorAll("[data-eliminar-movi]").forEach(btn => {
     btn.addEventListener("click", () => {
       requestAdminCode(async () => {
         const id = Number(btn.dataset.eliminarMovi);
@@ -7613,10 +7727,62 @@ async function renderFinanzas() {
       });
     });
   });
-
-  await renderFinanzasCharts(datos);
-  await renderRendimiento(desde, hasta, datos);
 }
+
+/* 3.16.1 (cambio 11) · detalle de un movimiento de caja. Antes tocar una línea no hacía nada y las ligadas solo mostraban 🔒 (la
+   explicación iba en un title, que en el teléfono no se ve), así que no había forma de ver la factura desde Finanzas. Ahora: los datos,
+   de dónde viene, «Ver factura» según el origen (ticket de la venta, factura del crédito, o la orden, que tiene la suya) y cómo se
+   corrige, con las MISMAS acciones de la fila (en la nube nada se borra ni se edita: se revierte o se anula con motivo). */
+let movFactura = null;
+async function abrirMovimiento(id, revertidos, ventasPorId) {
+  const m = await DB.get("caja_movimientos", id);
+  if (!m) return;
+  const venta = m.ventaId != null ? await DB.get("ventas_rapidas", m.ventaId) : null;
+  const credito = m.ventaId == null && m.creditoId != null ? await DB.get("creditos", m.creditoId) : null;
+  const nube = finanzasNube();
+  const metodo = { efectivo: "Efectivo", transferencia: "Transferencia", tarjeta: "Tarjeta" }[m.metodoPago] || "—";
+  let origen = "Movimiento manual de caja", corregir, factura = null, textoFactura = "";
+  if (m.ventaId != null) {
+    origen = `Venta rápida #${m.ventaId}`;
+    corregir = nube ? "Si la venta estuvo mal, usa «Anular» o «Devolver»: el stock vuelve y la caja queda compensada (pide motivo)." : "Para corregirla hay que deshacer la venta, no la línea de caja.";
+    if (venta) { factura = () => imprimirTicketPOS(venta.id, venta, abrirVentanaImpresion()); textoFactura = "🧾 Ver ticket de la venta"; }
+  } else if (m.idAbono != null || m.creditoId != null) {
+    origen = `Abono del crédito #${m.creditoId ?? "?"}`;
+    corregir = "Los abonos se corrigen desde Créditos.";
+    if (credito) { factura = () => imprimirFacturaCredito(credito, abrirVentanaImpresion()); textoFactura = "🧾 Ver factura del crédito"; }
+  } else if (m.ordenId != null) {
+    origen = `Cobro de la orden #${m.ordenId}`;
+    corregir = `Para corregir un cobro se anula la orden #${m.ordenId} desde su detalle (pide el PIN del propietario). Su factura está en la orden.`;
+    factura = () => { cerrarMovimiento(); openOrder(m.ordenId); };
+    textoFactura = `🧾 Abrir la orden #${m.ordenId} y su factura`;
+  } else {
+    corregir = nube ? "En la caja nada se borra ni se edita: se revierte con un motivo y queda en el historial. Si el monto estaba mal, revierte este y registra uno nuevo."
+      : "Puedes eliminarlo (pide el código de administrador).";
+  }
+  const fila = (t, v) => `<div style="display:flex; justify-content:space-between; gap:1rem; padding:0.35rem 0; border-bottom:1px solid var(--line);"><span style="color:var(--text-muted);">${t}</span><span style="text-align:right;">${v}</span></div>`;
+  document.getElementById("movDetalle").innerHTML = `
+    <div style="display:flex; align-items:center; gap:0.6rem; margin-bottom:0.6rem;">
+      <span class="pill ${m.tipo === "ingreso" ? "entregado" : "reparacion"}">${m.tipo === "ingreso" ? "Ingreso" : "Egreso"}</span>
+      <b style="font-size:1.4rem; font-variant-numeric:tabular-nums;">${money(m.monto)}</b></div>
+    ${fila("Fecha", esc(FechaNegocio.fecha(m.fechaISO)))}${fila("Categoría", esc(m.categoria || "—"))}${fila("Método", esc(metodo))}
+    ${fila("Descripción", esc(m.descripcion || "—"))}${fila("Viene de", esc(origen))}
+    <p class="hint" style="margin:0.7rem 0 0;">${esc(corregir)}</p>`;
+  movFactura = factura;
+  const btn = document.getElementById("btnMovVerFactura");
+  btn.style.display = factura ? "" : "none"; btn.textContent = textoFactura;
+  const acc = document.getElementById("movAcciones");
+  acc.innerHTML = nube ? accionesCajaNube(m, revertidos, ventasPorId)
+    : movimientoEsBorrable(m) ? `<button type="button" class="btn danger" data-eliminar-movi="${m.id}">🗑 Eliminar movimiento</button>` : "";
+  if (nube) conectarAccionesCajaNube(acc, ventasPorId); else conectarEliminarMovimiento(acc);
+  acc.querySelectorAll(".mov-ligado").forEach((x) => x.remove());   // en el detalle la explicación ya está escrita
+  document.getElementById("modalMovimiento").classList.add("active");
+}
+function cerrarMovimiento() { movFactura = null; document.getElementById("modalMovimiento").classList.remove("active"); }
+document.getElementById("btnMovCerrar").addEventListener("click", cerrarMovimiento);
+// sincrónico: imprimir necesita el toque todavía vigente
+document.getElementById("btnMovVerFactura").addEventListener("click", () => { if (movFactura) movFactura(); });
+// una acción (revertir, anular, devolver, eliminar) abre su propia ventana: esta se cierra antes
+document.getElementById("movAcciones").addEventListener("click", (e) => { if (e.target.closest("button")) document.getElementById("modalMovimiento").classList.remove("active"); }, true);
 
 /* SYNC-7B · caja en modo nube: nada se borra. Un movimiento manual se REVIERTE (reversar_caja); el de una venta se
    corrige desde la venta (anular = reversar_venta, devolución parcial = registrar_devolucion); los de crédito u
@@ -8723,7 +8889,7 @@ alHacerClicUnaVez(document.getElementById("btnForzarActualizacion"), buscarActua
    fecha e identificador, para que al restaurarlo se sepa exactamente de dónde
    salió y si el esquema es compatible. */
 
-const VERSION_APP = "3.16.0";
+const VERSION_APP = "3.16.1";
 const VERSION_RESPALDO = 2; // formato del archivo, no de la app
 
 async function armarRespaldo() {
